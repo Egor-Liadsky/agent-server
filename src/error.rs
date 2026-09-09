@@ -119,7 +119,7 @@ impl ApiError {
     /// он может содержать внутренний адрес или ключ.
     pub fn from_agent_error(err: &anyhow::Error) -> Self {
         match err.downcast_ref::<AgentError>() {
-            Some(AgentError::Timeout) => Self {
+            Some(AgentError::Timeout { .. }) => Self {
                 status: StatusCode::GATEWAY_TIMEOUT,
                 code: "upstream_timeout",
                 message: "провайдер модели не ответил в отведённое время".to_string(),
@@ -160,6 +160,17 @@ impl ApiError {
                 request_id: None,
             },
             Some(AgentError::MissingApiKey { .. }) => Self::internal(format!("{err:#}")),
+            // Ошибки клиентской стороны сервиса (отказ политики, лимит,
+            // неверный запрос, отказ аутентификации) в вызове провайдера не
+            // возникают: они появляются у потребителя контракта `/v1`.
+            Some(AgentError::PolicyRejected { code, reason, .. }) => {
+                Self::policy_rejected(code.clone(), reason.clone())
+            }
+            Some(AgentError::RateLimited { .. }) => Self::rate_limited(),
+            Some(AgentError::InvalidRequest { message, .. }) => {
+                Self::invalid_request(message.clone())
+            }
+            Some(AgentError::Unauthorized { .. }) => Self::internal(format!("{err:#}")),
             None => Self::internal(format!("{err:#}")),
         }
     }

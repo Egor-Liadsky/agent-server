@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 agentcore = { git = "https://github.com/Egor-Liadsky/agent-cli", branch = "main" }
+agentupstream = { git = "https://github.com/Egor-Liadsky/agent-cli", branch = "main" }
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"

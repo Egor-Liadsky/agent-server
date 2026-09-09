@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "agentcore"
 version = "0.1.0"
-source = "git+https://github.com/Egor-Liadsky/agent-cli?branch=main#97fa54b412a0b53bb409db694676e745282aa8a6"
+source = "git+https://github.com/Egor-Liadsky/agent-cli?branch=main#e86ba2aae5799171ed6784d5b0c49a62fc6a62b6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -22,6 +22,7 @@ name = "agentd"
 version = "0.1.0"
 dependencies = [
  "agentcore",
+ "agentupstream",
  "anyhow",
  "async-trait",
  "axum",
@@ -34,6 +35,19 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "agentupstream"
+version = "0.1.0"
+source = "git+https://github.com/Egor-Liadsky/agent-cli?branch=main#e86ba2aae5799171ed6784d5b0c49a62fc6a62b6"
+dependencies = [
+ "agentcore",
+ "anyhow",
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

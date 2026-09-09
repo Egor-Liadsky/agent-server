@@ -1,10 +1,12 @@
 //! Общее состояние сервиса: конфигурация и единственный клиент провайдера.
 
 use crate::config::AgentdConfig;
-use agentcore::agent::HttpAgent;
-use agentcore::config::Config;
+use agentcore::agent::{Agent, AgentReply, Message, OllamaAgent};
+use agentcore::config::{ChatSettings, Config, Provider};
 use agentcore::logging::ExchangeLog;
+use agentupstream::UpstreamAgent;
 use anyhow::Result;
+use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -21,7 +23,7 @@ pub fn agent_creations() -> usize {
 pub struct AppState {
     pub config: Arc<AgentdConfig>,
     /// Один клиент на весь процесс: соединения к провайдеру переиспользуются.
-    pub agent: Arc<HttpAgent>,
+    pub agent: Arc<ServiceAgent>,
 }
 
 impl AppState {
@@ -34,20 +36,48 @@ impl AppState {
     }
 }
 
-fn build_agent(config: &AgentdConfig) -> Result<HttpAgent> {
+/// Выбор провайдера по настройкам запроса. Диспетчеризация живёт в сервисе:
+/// набор доступных провайдеров задаётся его зависимостями, а облачный код
+/// лежит в отдельном крейте `agentupstream`.
+pub struct ServiceAgent {
+    cloud: UpstreamAgent,
+    local: OllamaAgent,
+}
+
+#[async_trait]
+impl Agent for ServiceAgent {
+    async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply> {
+        match settings.provider {
+            Provider::Cloud => self.cloud.ask(history, settings).await,
+            Provider::Ollama => self.local.ask(history, settings).await,
+        }
+    }
+}
+
+fn build_agent(config: &AgentdConfig) -> Result<ServiceAgent> {
     AGENT_CREATIONS.fetch_add(1, Ordering::SeqCst);
     // Журнал обмена в сервисе выключен: диалоги пишет structured logging,
     // а файлы JSONL внутри контейнера некуда складывать.
+    // Ключ и адрес провайдера принадлежат сервису и берутся из его
+    // переменных окружения, а не из пользовательского конфига клиента.
     let core_config = Config {
-        api_key: Some(config.upstream_api_key.clone()),
-        base_url: Some(config.upstream_base_url.clone()),
         model: Some(config.model.clone()),
         ..Config::default()
     };
     // Таймаут провайдера живёт на клиенте ядра: его истечение даёт
     // типизированный `AgentError::Timeout`, а не безымянное зависание.
-    HttpAgent::from_config(&core_config, Arc::new(ExchangeLog::disabled()))?
-        .with_request_timeout(config.request_timeout)
+    let log = Arc::new(ExchangeLog::disabled());
+    Ok(ServiceAgent {
+        cloud: UpstreamAgent::new(
+            config.upstream_api_key.clone(),
+            config.upstream_base_url.clone(),
+            config.model.clone(),
+            log.clone(),
+        )
+        .with_request_timeout(config.request_timeout)?,
+        local: OllamaAgent::from_config(&core_config, log)?
+            .with_request_timeout(config.request_timeout)?,
+    })
 }
 
 /// Тесты, создающие состояние, выполняются по очереди: счётчик созданий
