@@ -1,0 +1,6 @@
+target
+.git
+.gitignore
+# Локальный [patch] на соседний каталог: в образе ядро берётся из git.
+.cargo
+README.md
