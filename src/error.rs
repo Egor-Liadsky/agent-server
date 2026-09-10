@@ -110,6 +110,33 @@ impl ApiError {
         )
     }
 
+    /// Чат не существует, недоступен клиенту или идентификатор неверного
+    /// вида — все три исхода неотличимы (specs/chat-api, «Чужой чат
+    /// неотличим от несуществующего»).
+    pub fn chat_not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "chat_not_found", "чат не найден")
+    }
+
+    /// Отказ хранилища. Клиенту уходит общее сообщение, подробности —
+    /// только в журнал.
+    pub fn storage_error(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "storage_error",
+            message: "хранилище временно недоступно".to_string(),
+            log_detail: Some(detail.into()),
+            request_id: None,
+        }
+    }
+
+    pub fn from_store_error(err: crate::store::StoreError) -> Self {
+        match err {
+            crate::store::StoreError::NotFound => Self::chat_not_found(),
+            crate::store::StoreError::InvalidCursor => Self::invalid_request("неизвестный курсор"),
+            crate::store::StoreError::Backend(err) => Self::storage_error(format!("{err:#}")),
+        }
+    }
+
     pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
         self.request_id = Some(request_id.into());
         self

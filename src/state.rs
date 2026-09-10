@@ -7,6 +7,7 @@ use agentcore::logging::ExchangeLog;
 use agentupstream::UpstreamAgent;
 use anyhow::Result;
 use async_trait::async_trait;
+use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -24,14 +25,30 @@ pub struct AppState {
     pub config: Arc<AgentdConfig>,
     /// Один клиент на весь процесс: соединения к провайдеру переиспользуются.
     pub agent: Arc<ServiceAgent>,
+    pub db: SqlitePool,
+    /// Временный каталог тестовой базы. Держится здесь, чтобы не удалиться
+    /// раньше последнего клона состояния; удаляется вместе с последним.
+    #[cfg(test)]
+    _test_db_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 impl AppState {
-    pub fn new(config: AgentdConfig) -> Result<Self> {
+    /// Открывает хранилище и собирает состояние. Непригодная база — фатальная
+    /// ошибка старта, как и отсутствующий ключ провайдера.
+    pub async fn new(config: AgentdConfig) -> Result<Self> {
         let agent = build_agent(&config)?;
+        let db = crate::store::open_pool(
+            &config.db_path,
+            config.db_max_connections,
+            config.db_busy_timeout_ms,
+        )
+        .await?;
         Ok(Self {
             config: Arc::new(config),
             agent: Arc::new(agent),
+            db,
+            #[cfg(test)]
+            _test_db_dir: None,
         })
     }
 }
@@ -90,18 +107,40 @@ pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(test)]
 impl AppState {
-    pub fn for_tests() -> Self {
+    pub async fn for_tests() -> Self {
         Self::with_env(&[
             (crate::config::API_KEY_VAR, "test-key-value"),
             ("AGENTD_UPSTREAM_BASE_URL", "http://127.0.0.1:1"),
             ("AGENTD_MODEL", "test-model"),
         ])
+        .await
     }
 
     /// Состояние по набору переменных окружения — так тест задаёт ровно то,
-    /// что проверяет, не трогая окружение процесса.
-    pub fn with_env(pairs: &[(&str, &str)]) -> Self {
-        Self::new(crate::config::config_from(pairs).expect("конфигурация")).expect("состояние")
+    /// что проверяет, не трогая окружение процесса. Каждый вызов открывает
+    /// свою временную базу: тесты не делят файл и не оставляют его после
+    /// себя (задача 8.3).
+    pub async fn with_env(pairs: &[(&str, &str)]) -> Self {
+        let dir = tempfile::tempdir().expect("временный каталог для базы теста");
+        let db_path = dir.path().join("agentd.db");
+        let mut owned: Vec<(String, String)> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        // Явно заданный в pairs AGENTD_DB_PATH (тест намеренно делит базу
+        // между двумя состояниями) не переопределяется временным путём.
+        if !owned.iter().any(|(key, _)| key == "AGENTD_DB_PATH") {
+            owned.push((
+                "AGENTD_DB_PATH".to_string(),
+                db_path.to_str().expect("путь к тестовой базе").to_string(),
+            ));
+        }
+        let map: std::collections::HashMap<String, String> = owned.into_iter().collect();
+        let config = crate::config::AgentdConfig::from_source(&move |key| map.get(key).cloned())
+            .expect("конфигурация");
+        let mut state = Self::new(config).await.expect("состояние");
+        // Каталог живёт, пока жив хотя бы один клон состояния, и удаляется
+        // вместе с последним — тест не оставляет файл базы на диске.
+        state._test_db_dir = Some(Arc::new(dir));
+        state
     }
 }
 
@@ -129,7 +168,7 @@ mod tests {
     async fn agent_is_created_once_for_many_requests() {
         let _guard = test_lock();
         let before = agent_creations();
-        let state = AppState::for_tests();
+        let state = AppState::for_tests().await;
         let created = agent_creations() - before;
 
         call_healthz(state.clone()).await;

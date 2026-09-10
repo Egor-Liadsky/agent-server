@@ -1,14 +1,18 @@
 //! Сборка HTTP-приложения: маршруты, слои и обработчики.
 
-use crate::dto::{ChatRequest, ChatResponse, ModelsResponse};
+use crate::dto::{
+    ChatDto, ChatRequest, ChatResponse, ChatWithMessagesResponse, CreateChatRequest, GetChatQuery,
+    ListChatsQuery, ListChatsResponse, MessageView, ModelsResponse, UpdateChatRequest,
+};
 use crate::error::ApiError;
-use crate::middleware::{assign_request_id, authenticate, normalize_errors, ClientId, RequestId};
+use crate::middleware::{assign_request_id, authenticate, normalize_errors, ClientId, Owner, RequestId};
+use crate::store;
 use crate::telemetry::{log_exchange, ExchangeRecord};
 use crate::state::AppState;
 use agentcore::agent::Message;
 use agentcore::config::{ChatSettings, Provider};
 use agentcore::pipeline::{Pipeline, PipelineOutcome, RequestContext};
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -21,19 +25,34 @@ use tower::{BoxError, ServiceBuilder};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
+/// История для вызова модели читается целиком: обычная переписка укладывается
+/// в этот предел с большим запасом, а бесконечный рост чата — вне области
+/// изменения (design.md, non-goal «ретеншен, обрезка истории»).
+const MAX_HISTORY_MESSAGES: u32 = 100_000;
+const DEFAULT_CHATS_LIMIT: u32 = 50;
+const MAX_CHATS_LIMIT: u32 = 200;
+const DEFAULT_MESSAGES_LIMIT: u32 = 200;
+const MAX_MESSAGES_LIMIT: u32 = 500;
+const DEFAULT_CHAT_TITLE: &str = "Новый чат";
+const MAX_CHAT_TITLE_LEN: usize = 200;
+
 /// Живость процесса. Никаких обращений к провайдеру: эндпоинт отвечает,
 /// пока жив сам процесс.
 async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Готовность: ключ провайдера задан и базовый адрес разбирается.
+/// Готовность: конфигурация валидна и хранилище отвечает на проверочный
+/// запрос. `healthz` выше сюда намеренно не заходит: живость процесса не
+/// должна зависеть от базы.
 async fn readyz(State(state): State<AppState>) -> Response {
-    if state.config.is_ready() {
-        (StatusCode::OK, "ready").into_response()
-    } else {
-        ApiError::not_ready().into_response()
+    if !state.config.is_ready() {
+        return ApiError::not_ready().into_response();
     }
+    if crate::store::ping(&state.db).await.is_err() {
+        return ApiError::not_ready().into_response();
+    }
+    (StatusCode::OK, "ready").into_response()
 }
 
 async fn models(State(state): State<AppState>) -> Json<ModelsResponse> {
@@ -82,16 +101,16 @@ fn history_from(request: &ChatRequest) -> Result<Vec<Message>, ApiError> {
     }
 }
 
-fn settings_from(state: &AppState, request: ChatRequest) -> Result<ChatSettings, ApiError> {
-    let defaults = ChatSettings {
+/// Настройки сервиса по умолчанию для нового чата или разового запроса без
+/// чата: только заданная сервисом модель, всё остальное — умолчания ядра.
+fn server_defaults(state: &AppState) -> ChatSettings {
+    ChatSettings {
         model: Some(state.config.model.clone()),
         ..ChatSettings::default()
-    };
-    let settings = match request.settings {
-        Some(dto) => dto.apply_to(defaults).map_err(ApiError::invalid_request)?,
-        None => defaults,
-    };
+    }
+}
 
+fn validate_settings(state: &AppState, settings: &ChatSettings) -> Result<(), ApiError> {
     let model = settings
         .model
         .clone()
@@ -106,7 +125,48 @@ fn settings_from(state: &AppState, request: ChatRequest) -> Result<ChatSettings,
             "провайдер ollama не настроен на этом сервисе",
         ));
     }
+    Ok(())
+}
+
+/// Накладывает необязательный DTO настроек поверх базовых значений и
+/// проверяет результат. `base` — умолчания сервиса при создании чата или
+/// разовом запросе без чата, сохранённые настройки чата — при работе с
+/// существующим чатом.
+fn merge_settings(
+    state: &AppState,
+    base: ChatSettings,
+    dto: Option<crate::dto::ChatSettingsDto>,
+) -> Result<ChatSettings, ApiError> {
+    let settings = match dto {
+        Some(dto) => dto.apply_to(base).map_err(ApiError::invalid_request)?,
+        None => base,
+    };
+    validate_settings(state, &settings)?;
     Ok(settings)
+}
+
+fn validate_title(title: Option<String>) -> Result<Option<String>, ApiError> {
+    match title {
+        None => Ok(None),
+        Some(title) => {
+            let trimmed = title.trim();
+            if trimmed.is_empty() || trimmed.chars().count() > MAX_CHAT_TITLE_LEN {
+                return Err(ApiError::invalid_request(format!(
+                    "заголовок чата должен быть непустым и не длиннее {MAX_CHAT_TITLE_LEN} символов"
+                )));
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+}
+
+fn message_from_stored(message: store::ChatMessage) -> Message {
+    Message {
+        role: message.role,
+        content: message.content,
+        reasoning: message.reasoning,
+        meta: message.meta,
+    }
 }
 
 /// Текст запроса для журнала: он записывается только при включённом
@@ -127,6 +187,7 @@ fn prompt_preview(body: &serde_json::Value) -> String {
 async fn chat(
     State(state): State<AppState>,
     Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
     client: Option<Extension<ClientId>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
@@ -137,7 +198,7 @@ async fn chat(
     let log_content = state.config.log_content;
     let prompt = prompt_preview(&body);
 
-    let result = handle_chat(state, request_id.clone(), body).await;
+    let result = handle_chat(state, request_id.clone(), owner, body).await;
     let duration_ms = started_at.elapsed().as_millis() as u64;
 
     match result {
@@ -175,6 +236,7 @@ async fn chat(
 async fn handle_chat(
     state: AppState,
     request_id: String,
+    owner: String,
     body: serde_json::Value,
 ) -> Result<ChatResponse, ApiError> {
     if contains_api_key(&body) {
@@ -185,22 +247,107 @@ async fn handle_chat(
     let request: ChatRequest = serde_json::from_value(body)
         .map_err(|err| ApiError::invalid_request(format!("тело запроса не разобрано: {err}")))?;
 
+    match request.chat_id.clone() {
+        Some(chat_id) => handle_chat_in_existing(state, request_id, owner, chat_id, request).await,
+        None => handle_chat_without_storage(state, request_id, request).await,
+    }
+}
+
+/// `POST /v1/chat` без `chat_id`: поведение не меняется — история приходит в
+/// теле, ничего не пишется в хранилище (specs/chat-api, «Разовый вызов без
+/// чата сохраняется»).
+async fn handle_chat_without_storage(
+    state: AppState,
+    request_id: String,
+    request: ChatRequest,
+) -> Result<ChatResponse, ApiError> {
     let history = history_from(&request)?;
-    let settings = settings_from(&state, request)?;
+    let settings = merge_settings(&state, server_defaults(&state), request.settings)?;
     let model = settings
         .model
         .clone()
         .unwrap_or_else(|| state.config.model.clone());
 
-    // Вся логика стадий живёт в конвейере: обработчик только собирает
-    // контекст и отображает исход в HTTP.
     let pipeline = Pipeline::new(state.agent.clone());
     let context = RequestContext::new(request_id.clone(), history, settings);
+    let (reply, policy) = run_pipeline(&pipeline, context, &request_id).await?;
+    Ok(ChatResponse::new(request_id, model, &reply, policy))
+}
 
+/// `POST /v1/chat` с `chat_id`: история берётся из хранилища, клиент
+/// присылает только новое сообщение, обмен пишется одной транзакцией после
+/// успешного ответа модели (specs/chat-api, «Диалог в существующем чате»;
+/// design.md, решение 9).
+async fn handle_chat_in_existing(
+    state: AppState,
+    request_id: String,
+    owner: String,
+    chat_id: String,
+    request: ChatRequest,
+) -> Result<ChatResponse, ApiError> {
+    if request.messages.is_some() {
+        return Err(ApiError::invalid_request(
+            "поле messages вместе с chat_id не принимается: история берётся из чата",
+        ));
+    }
+    let prompt = request
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .ok_or_else(|| ApiError::invalid_request("для chat_id обязательно поле prompt"))?
+        .to_string();
+
+    let defaults = server_defaults(&state);
+    let chat = store::load_chat(&state.db, &owner, &chat_id, &defaults)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    let settings = merge_settings(&state, chat.settings.clone(), request.settings)?;
+    let model = settings
+        .model
+        .clone()
+        .unwrap_or_else(|| state.config.model.clone());
+
+    let stored = store::load_messages(&state.db, &chat_id, 0, MAX_HISTORY_MESSAGES)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    let user_message = Message::user(prompt);
+    let mut history: Vec<Message> = stored.messages.into_iter().map(message_from_stored).collect();
+    history.push(user_message.clone());
+
+    let pipeline = Pipeline::new(state.agent.clone());
+    let context = RequestContext::new(request_id.clone(), history, settings);
+    let (reply, policy) = run_pipeline(&pipeline, context, &request_id).await?;
+
+    let mut assistant_meta = reply.meta.clone();
+    if assistant_meta.model.is_none() {
+        assistant_meta.model = reply.model.clone().or_else(|| Some(model.clone()));
+    }
+    let (_, assistant_row) = store::append_exchange(
+        &state.db,
+        &owner,
+        &chat_id,
+        store::NewMessage::from_message(user_message),
+        store::NewMessage {
+            role: agentcore::agent::Role::Assistant,
+            content: reply.content.clone(),
+            reasoning: reply.reasoning.clone(),
+            meta: Some(assistant_meta),
+        },
+    )
+    .await
+    .map_err(ApiError::from_store_error)?;
+
+    Ok(ChatResponse::new(request_id, model, &reply, policy).with_chat(chat_id, assistant_row.seq))
+}
+
+async fn run_pipeline(
+    pipeline: &Pipeline,
+    context: RequestContext,
+    request_id: &str,
+) -> Result<(agentcore::agent::AgentReply, agentcore::pipeline::PolicyLog), ApiError> {
     match pipeline.run(context).await {
-        Ok(PipelineOutcome::Completed { reply, policy }) => {
-            Ok(ChatResponse::new(request_id, model, &reply, policy))
-        }
+        Ok(PipelineOutcome::Completed { reply, policy }) => Ok((reply, policy)),
         Ok(PipelineOutcome::Rejected {
             stage, code, reason, ..
         }) => {
@@ -208,6 +355,164 @@ async fn handle_chat(
             Err(ApiError::policy_rejected(code, reason))
         }
         Err(err) => Err(ApiError::from_agent_error(&err)),
+    }
+}
+
+// --- Управление чатами ---
+
+async fn create_chat(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Json(body): Json<CreateChatRequest>,
+) -> Response {
+    match handle_create_chat(state, owner, body).await {
+        Ok(dto) => (StatusCode::CREATED, Json(dto)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_create_chat(
+    state: AppState,
+    owner: String,
+    body: CreateChatRequest,
+) -> Result<ChatDto, ApiError> {
+    let title = validate_title(body.title)?.unwrap_or_else(|| DEFAULT_CHAT_TITLE.to_string());
+    let settings = merge_settings(&state, server_defaults(&state), body.settings)?;
+    let chat = store::create_chat(&state.db, &owner, &title, &settings)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(ChatDto::from(chat))
+}
+
+fn clamp_query_error(limit: u32, max: u32) -> Result<(), ApiError> {
+    if limit == 0 || limit > max {
+        return Err(ApiError::invalid_request(format!(
+            "limit должен быть в диапазоне от 1 до {max}"
+        )));
+    }
+    Ok(())
+}
+
+async fn list_chats_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Query(query): Query<ListChatsQuery>,
+) -> Response {
+    match handle_list_chats(state, owner, query).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_list_chats(
+    state: AppState,
+    owner: String,
+    query: ListChatsQuery,
+) -> Result<ListChatsResponse, ApiError> {
+    let limit = query.limit.unwrap_or(DEFAULT_CHATS_LIMIT);
+    clamp_query_error(limit, MAX_CHATS_LIMIT)?;
+    let defaults = server_defaults(&state);
+    let page = store::list_chats(&state.db, &owner, limit, query.cursor.as_deref(), &defaults)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(ListChatsResponse {
+        chats: page.chats.into_iter().map(ChatDto::from).collect(),
+        next_cursor: page.next_cursor,
+    })
+}
+
+async fn get_chat_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+    Query(query): Query<GetChatQuery>,
+) -> Response {
+    match handle_get_chat(state, owner, id, query).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_get_chat(
+    state: AppState,
+    owner: String,
+    id: String,
+    query: GetChatQuery,
+) -> Result<ChatWithMessagesResponse, ApiError> {
+    let limit = query.limit.unwrap_or(DEFAULT_MESSAGES_LIMIT);
+    clamp_query_error(limit, MAX_MESSAGES_LIMIT)?;
+    let after = query.after.unwrap_or(0);
+    let defaults = server_defaults(&state);
+    let chat = store::load_chat(&state.db, &owner, &id, &defaults)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    let page = store::load_messages(&state.db, &id, after, limit)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(ChatWithMessagesResponse {
+        chat: ChatDto::from(chat),
+        messages: page.messages.into_iter().map(MessageView::from).collect(),
+        next_after: page.next_after,
+    })
+}
+
+async fn patch_chat_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateChatRequest>,
+) -> Response {
+    match handle_patch_chat(state, owner, id, body).await {
+        Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_patch_chat(
+    state: AppState,
+    owner: String,
+    id: String,
+    body: UpdateChatRequest,
+) -> Result<ChatDto, ApiError> {
+    if body.title.is_none() && body.settings.is_none() {
+        return Err(ApiError::invalid_request(
+            "тело изменения чата должно задавать title, settings или оба поля",
+        ));
+    }
+    let title = validate_title(body.title)?;
+
+    let defaults = server_defaults(&state);
+    let settings = match body.settings {
+        Some(dto) => {
+            let chat = store::load_chat(&state.db, &owner, &id, &defaults)
+                .await
+                .map_err(ApiError::from_store_error)?;
+            Some(merge_settings(&state, chat.settings, Some(dto))?)
+        }
+        None => None,
+    };
+
+    let updated = store::update_chat(&state.db, &owner, &id, title.as_deref(), settings.as_ref(), &defaults)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(ChatDto::from(updated))
+}
+
+async fn delete_chat_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+) -> Response {
+    match store::delete_chat(&state.db, &owner, &id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => ApiError::from_store_error(err)
+            .with_request_id(request_id)
+            .into_response(),
     }
 }
 
@@ -231,6 +536,11 @@ pub fn router(state: AppState) -> Router {
     let v1 = Router::new()
         .route("/chat", post(chat))
         .route("/models", get(models))
+        .route("/chats", post(create_chat).get(list_chats_handler))
+        .route(
+            "/chats/{id}",
+            get(get_chat_handler).patch(patch_chat_handler).delete(delete_chat_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,

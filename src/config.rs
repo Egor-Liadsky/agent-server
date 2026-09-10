@@ -11,6 +11,9 @@ pub const DEFAULT_MODEL: &str = "deepseek-chat";
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_CONCURRENCY: usize = 16;
+pub const DEFAULT_DB_PATH: &str = "agentd.db";
+pub const DEFAULT_DB_MAX_CONNECTIONS: u32 = 5;
+pub const DEFAULT_DB_BUSY_TIMEOUT_MS: u64 = 5000;
 
 pub const API_KEY_VAR: &str = "AGENTD_UPSTREAM_API_KEY";
 
@@ -48,6 +51,10 @@ pub struct AgentdConfig {
     pub log_target: LogTarget,
     /// Писать ли в журнал тексты промптов и ответов.
     pub log_content: bool,
+    /// Путь к файлу базы SQLite.
+    pub db_path: String,
+    pub db_max_connections: u32,
+    pub db_busy_timeout_ms: u64,
 }
 
 impl AgentdConfig {
@@ -130,6 +137,17 @@ impl AgentdConfig {
                 }
             },
             log_content: parse_bool(get("AGENTD_LOG_CONTENT"))?,
+            db_path: get("AGENTD_DB_PATH").unwrap_or_else(|| DEFAULT_DB_PATH.to_string()),
+            db_max_connections: parse_nonzero(
+                get("AGENTD_DB_MAX_CONNECTIONS"),
+                "AGENTD_DB_MAX_CONNECTIONS",
+                DEFAULT_DB_MAX_CONNECTIONS,
+            )?,
+            db_busy_timeout_ms: parse_nonzero(
+                get("AGENTD_DB_BUSY_TIMEOUT_MS"),
+                "AGENTD_DB_BUSY_TIMEOUT_MS",
+                DEFAULT_DB_BUSY_TIMEOUT_MS,
+            )?,
         })
     }
 
@@ -170,6 +188,19 @@ fn parse_number<T: std::str::FromStr>(value: Option<String>, name: &str, default
             .parse()
             .map_err(|_| anyhow::anyhow!("не удалось разобрать {name}: {value}")),
     }
+}
+
+/// Как `parse_number`, но нулевое значение тоже считается ошибкой:
+/// нулевой пул соединений или нулевой `busy_timeout` не имеют смысла.
+fn parse_nonzero<T>(value: Option<String>, name: &str, default: T) -> Result<T>
+where
+    T: std::str::FromStr + PartialEq + Default,
+{
+    let parsed = parse_number(value, name, default)?;
+    if parsed == T::default() {
+        bail!("{name} не может быть нулём");
+    }
+    Ok(parsed)
 }
 
 fn parse_bool(value: Option<String>) -> Result<bool> {
@@ -229,6 +260,53 @@ mod tests {
         assert_eq!(config.log_format, LogFormat::Json);
         assert_eq!(config.log_target, LogTarget::Stdout);
         assert!(!config.log_content);
+        assert_eq!(config.db_path, DEFAULT_DB_PATH);
+        assert_eq!(config.db_max_connections, DEFAULT_DB_MAX_CONNECTIONS);
+        assert_eq!(config.db_busy_timeout_ms, DEFAULT_DB_BUSY_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn db_variables_are_applied() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_DB_PATH", "/tmp/custom.db"),
+            ("AGENTD_DB_MAX_CONNECTIONS", "3"),
+            ("AGENTD_DB_BUSY_TIMEOUT_MS", "1000"),
+        ])
+        .expect("конфигурация");
+        assert_eq!(config.db_path, "/tmp/custom.db");
+        assert_eq!(config.db_max_connections, 3);
+        assert_eq!(config.db_busy_timeout_ms, 1000);
+    }
+
+    #[test]
+    fn non_numeric_db_max_connections_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_DB_MAX_CONNECTIONS", "много"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_DB_MAX_CONNECTIONS"));
+    }
+
+    #[test]
+    fn zero_db_max_connections_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_DB_MAX_CONNECTIONS", "0"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_DB_MAX_CONNECTIONS"));
+    }
+
+    #[test]
+    fn zero_db_busy_timeout_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_DB_BUSY_TIMEOUT_MS", "0"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_DB_BUSY_TIMEOUT_MS"));
     }
 
     #[test]

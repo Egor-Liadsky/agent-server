@@ -1,0 +1,51 @@
+schema: spec-driven
+
+context: |
+  Language: ru
+  All artifacts must be written in ru.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+
+  Проект: `agentd` — HTTP-сервис на Rust (edition 2024, axum, tokio),
+  единственный крейт в корне репозитория, исходники в `src/`.
+  Ядро `agentcore` и облачный провайдер `agentupstream` подключены
+  git-зависимостью от соседнего репозитория `agent-cli`; локально их
+  подменяет `.cargo/config.toml` с секцией `[patch]` (файл в `.gitignore`).
+  Правка ядра идёт в `agent-cli` и попадает сюда только после пуша в `main`.
+
+  Конвенции сервиса:
+  - конфигурация только из переменных окружения с префиксом `AGENTD_`;
+    ключ провайдера принадлежит сервису, тело запроса с полем `api_key`
+    отклоняется `400`;
+  - эндпоинты `POST /v1/chat`, `GET /v1/models`, `GET /healthz`,
+    `GET /readyz`; ошибки — единым конвертом
+    `{ "error": { "code", "message", "request_id" } }` с заголовком
+    `x-request-id`;
+  - секреты в журнале маскируются, тексты промптов и ответов пишутся только
+    при `AGENTD_LOG_CONTENT=true`;
+  - тесты в `src/tests.rs` под `#[cfg(test)]`, провайдер подменяется
+    `wiremock`; проверка изменений — `cargo test`;
+  - документация и комментарии в коде на русском, сообщения коммитов на
+    английском в повелительном наклонении; README обновляется тем же
+    изменением, что и поведение, команды, переменные окружения.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing

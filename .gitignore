@@ -10,3 +10,9 @@ debug
 
 .idea/
 .DS_Store
+
+.env
+
+agentd.db
+agentd.db-wal
+agentd.db-shm

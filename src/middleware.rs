@@ -21,6 +21,13 @@ pub struct ClientId(pub String);
 
 pub const ANONYMOUS_CLIENT: &str = "anonymous";
 
+/// Владелец чатов — необратимый отпечаток клиентского токена (или
+/// `store::ANONYMOUS_OWNER` при выключенной аутентификации). В отличие от
+/// `ClientId`, тут не маскированный текст для журнала, а значение колонки
+/// `owner` в хранилище.
+#[derive(Debug, Clone)]
+pub struct Owner(pub String);
+
 pub fn request_id_of(request: &Request) -> String {
     request
         .extensions()
@@ -84,6 +91,9 @@ pub async fn authenticate(
         request
             .extensions_mut()
             .insert(ClientId(ANONYMOUS_CLIENT.to_string()));
+        request
+            .extensions_mut()
+            .insert(Owner(crate::store::ANONYMOUS_OWNER.to_string()));
         return next.run(request).await;
     }
     let request_id = request_id_of(&request);
@@ -109,6 +119,11 @@ pub async fn authenticate(
             .with_request_id(request_id)
             .into_response();
     }
+    // Отпечаток считается с исходного токена: ClientId ниже хранит уже
+    // маскированное значение только для журнала.
+    request
+        .extensions_mut()
+        .insert(Owner(crate::store::owner_fingerprint(&presented)));
     request
         .extensions_mut()
         .insert(ClientId(crate::config::mask(&presented)));

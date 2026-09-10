@@ -4,6 +4,7 @@ mod dto;
 mod error;
 mod middleware;
 mod state;
+mod store;
 mod telemetry;
 
 #[cfg(test)]
@@ -26,7 +27,13 @@ async fn main() -> anyhow::Result<()> {
     telemetry::init(&config);
 
     let listen_addr = config.listen_addr;
-    let state = AppState::new(config)?;
+    let state = match AppState::new(config).await {
+        Ok(state) => state,
+        Err(err) => {
+            eprintln!("agentd: {err:#}");
+            std::process::exit(1);
+        }
+    };
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     tracing::info!(%listen_addr, "сервис принимает запросы");

@@ -1,5 +1,6 @@
 //! Типы запроса и ответа контракта `/v1`.
 
+use crate::store;
 use agentcore::agent::{AgentReply, Message, MessageMeta, Role};
 use agentcore::config::{
     ChatSettings, Provider, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode,
@@ -16,6 +17,10 @@ pub struct ChatRequest {
     pub messages: Option<Vec<MessageDto>>,
     #[serde(default)]
     pub settings: Option<ChatSettingsDto>,
+    /// Чат, в который пишется обмен. Заданный вместе с `messages` — `400`
+    /// (см. `POST /v1/chat` в specs/chat-api).
+    #[serde(default)]
+    pub chat_id: Option<String>,
     /// Произвольные данные клиента: принимаются и на вызов модели не влияют.
     #[serde(default)]
     #[allow(dead_code)]
@@ -162,6 +167,13 @@ pub struct ChatResponse {
     pub timing: TimingDto,
     /// Результаты стадий конвейера. Присутствует всегда, даже когда пуст.
     pub policy: PolicyLog,
+    /// Чат, в который записан обмен. `null` — запрос без `chat_id`, история
+    /// нигде не сохранена (specs/chat-api, «Разовый вызов без чата»).
+    #[serde(default)]
+    pub chat_id: Option<String>,
+    /// Номер сохранённого ответа модели в чате.
+    #[serde(default)]
+    pub seq: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -210,11 +222,139 @@ impl ChatResponse {
             usage: UsageDto::from(&reply.meta),
             timing: TimingDto::from(&reply.meta),
             policy,
+            chat_id: None,
+            seq: None,
         }
+    }
+
+    pub fn with_chat(mut self, chat_id: String, seq: i64) -> Self {
+        self.chat_id = Some(chat_id);
+        self.seq = Some(seq);
+        self
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelsResponse {
     pub models: Vec<String>,
+}
+
+// --- Управление чатами ---
+
+/// Представление чата. `ChatSettings` сериализуется собственным `Serialize`
+/// ядра — тем же форматом, каким принимается в `settings` запросов.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatDto {
+    pub id: String,
+    pub title: String,
+    pub settings: ChatSettings,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub message_count: i64,
+}
+
+impl From<store::Chat> for ChatDto {
+    fn from(chat: store::Chat) -> Self {
+        Self {
+            id: chat.id,
+            title: chat.title,
+            settings: chat.settings,
+            created_at: chat.created_at,
+            updated_at: chat.updated_at,
+            message_count: chat.message_count,
+        }
+    }
+}
+
+/// Сообщение чата в ответах на чтение. Поля телеметрии заполнены только у
+/// ответов модели (specs/chat-storage, «Полнота сохраняемого сообщения»).
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageView {
+    pub seq: i64,
+    pub role: RoleDto,
+    pub content: String,
+    pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<TimingDto>,
+}
+
+impl From<store::ChatMessage> for MessageView {
+    fn from(message: store::ChatMessage) -> Self {
+        let role = match message.role {
+            Role::User => RoleDto::User,
+            Role::Assistant => RoleDto::Assistant,
+        };
+        let (reasoning, model, usage, timing) = if matches!(message.role, Role::Assistant) {
+            let usage = message.meta.as_ref().map(UsageDto::from);
+            let timing = message.meta.as_ref().map(TimingDto::from);
+            let model = message.meta.as_ref().and_then(|meta| meta.model.clone());
+            (message.reasoning, model, usage, timing)
+        } else {
+            (None, None, None, None)
+        };
+        Self {
+            seq: message.seq,
+            role,
+            content: message.content,
+            created_at: message.created_at,
+            reasoning,
+            model,
+            usage,
+            timing,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CreateChatRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub settings: Option<ChatSettingsDto>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpdateChatRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub settings: Option<ChatSettingsDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListChatsQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetChatQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub after: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListChatsResponse {
+    pub chats: Vec<ChatDto>,
+    pub next_cursor: Option<String>,
+}
+
+/// Чат вместе со страницей его сообщений: поля чата на верхнем уровне
+/// объекта (specs/chat-api, «Чтение чата с сообщениями»).
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatWithMessagesResponse {
+    #[serde(flatten)]
+    pub chat: ChatDto,
+    pub messages: Vec<MessageView>,
+    pub next_after: Option<i64>,
 }
