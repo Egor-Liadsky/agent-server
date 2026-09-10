@@ -58,6 +58,18 @@ impl MessageDto {
     }
 }
 
+/// Различает «поле не задано» и «поле задано как null»: первое оставляет
+/// значение чата прежним, второе снимает его. Без двойного `Option` эти два
+/// случая в serde неразличимы (specs/chat-message-api, «Настройки чата
+/// задаются целиком»).
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ChatSettingsDto {
     #[serde(default)]
@@ -72,16 +84,20 @@ pub struct ChatSettingsDto {
     pub experts: Option<Vec<String>>,
     #[serde(default)]
     pub response_format: Option<ResponseFormatDto>,
+    /// Включает и выключает кастомный формат ответа. Незаданное поле
+    /// оставляет режим чата прежним.
     #[serde(default)]
-    pub temperature: Option<f32>,
-    #[serde(default)]
-    pub top_p: Option<f32>,
-    #[serde(default)]
-    pub top_k: Option<u32>,
-    #[serde(default)]
-    pub frequency_penalty: Option<f32>,
-    #[serde(default)]
-    pub presence_penalty: Option<f32>,
+    pub custom_response_mode: Option<bool>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub temperature: Option<Option<f32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub top_p: Option<Option<f32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub top_k: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub frequency_penalty: Option<Option<f32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub presence_penalty: Option<Option<f32>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -141,15 +157,25 @@ impl ChatSettingsDto {
         if let Some(format) = self.response_format {
             defaults.response_format = format.into_format();
             // Формат ответа действует только в кастомном режиме, поэтому
-            // заданный клиентом формат этот режим и включает.
+            // заданный клиентом формат этот режим и включает. Явное поле
+            // custom_response_mode ниже может его же и выключить.
             defaults.custom_response_mode = true;
         }
+        if let Some(custom_response_mode) = self.custom_response_mode {
+            defaults.custom_response_mode = custom_response_mode;
+        }
+        // Заданное значение подменяет прежнее, явный null снимает его, а
+        // отсутствие поля оставляет как было.
         let sampling = SamplingParams {
-            temperature: self.temperature.or(defaults.sampling.temperature),
-            top_p: self.top_p.or(defaults.sampling.top_p),
-            top_k: self.top_k.or(defaults.sampling.top_k),
-            frequency_penalty: self.frequency_penalty.or(defaults.sampling.frequency_penalty),
-            presence_penalty: self.presence_penalty.or(defaults.sampling.presence_penalty),
+            temperature: self.temperature.unwrap_or(defaults.sampling.temperature),
+            top_p: self.top_p.unwrap_or(defaults.sampling.top_p),
+            top_k: self.top_k.unwrap_or(defaults.sampling.top_k),
+            frequency_penalty: self
+                .frequency_penalty
+                .unwrap_or(defaults.sampling.frequency_penalty),
+            presence_penalty: self
+                .presence_penalty
+                .unwrap_or(defaults.sampling.presence_penalty),
         };
         defaults.sampling = sampling;
         Ok(defaults)
@@ -325,6 +351,82 @@ pub struct UpdateChatRequest {
     pub title: Option<String>,
     #[serde(default)]
     pub settings: Option<ChatSettingsDto>,
+}
+
+/// Готовое сообщение для дозаписи в чат. Роль и текст обязательны,
+/// остальное — телеметрия, которую клиент получил от локальной модели сам
+/// (specs/chat-message-api, «Дозапись готовых сообщений в чат»).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewMessageDto {
+    pub role: RoleDto,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<TimingDto>,
+}
+
+impl NewMessageDto {
+    /// Телеметрия и рассуждение имеют смысл только у ответа модели: у
+    /// реплики пользователя их нет, как и в `MessageView` на чтении.
+    pub fn into_new_message(self) -> store::NewMessage {
+        let role = Role::from(self.role);
+        if matches!(role, Role::User) {
+            return store::NewMessage {
+                role,
+                content: self.content,
+                reasoning: None,
+                meta: None,
+            };
+        }
+
+        let usage = self.usage.unwrap_or_default();
+        let timing = self.timing.unwrap_or_default();
+        let meta = MessageMeta {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            duration_ms: timing.duration_ms,
+            sent_at: timing.sent_at,
+            received_at: timing.received_at,
+            model: self.model,
+        };
+        // Пустая телеметрия не пишется: иначе у реплики без метрик в
+        // хранилище появился бы объект из одних отсутствующих полей.
+        let has_telemetry = meta.prompt_tokens.is_some()
+            || meta.completion_tokens.is_some()
+            || meta.total_tokens.is_some()
+            || meta.reasoning_tokens.is_some()
+            || meta.duration_ms.is_some()
+            || meta.sent_at.is_some()
+            || meta.received_at.is_some()
+            || meta.model.is_some();
+        store::NewMessage {
+            role,
+            content: self.content,
+            reasoning: self.reasoning,
+            meta: has_telemetry.then_some(meta),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendMessagesRequest {
+    pub messages: Vec<NewMessageDto>,
+}
+
+/// Ответ дозаписи: назначенные хранилищем номера сообщений в том же
+/// порядке, в котором они переданы, и идентификатор запроса.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendMessagesResponse {
+    pub request_id: String,
+    pub chat_id: String,
+    pub seqs: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

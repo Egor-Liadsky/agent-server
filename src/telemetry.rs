@@ -73,14 +73,23 @@ pub fn init(config: &AgentdConfig) {
     }
 }
 
+/// Перехват журнала для тестов: подписчик пишет в буфер, а тест читает из
+/// него текст записи. Живёт здесь, а не в модуле тестов, потому что тем же
+/// перехватом проверяются записи обработчиков (`src/tests.rs`).
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub mod capture {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
+    pub struct Capture(pub Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        pub fn text(&self) -> String {
+            let bytes = self.0.lock().expect("буфер").clone();
+            String::from_utf8(bytes).expect("текст журнала")
+        }
+    }
 
     impl Write for Capture {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -100,6 +109,12 @@ mod tests {
             self.clone()
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::capture::Capture;
 
     fn captured(record: ExchangeRecord<'_>) -> String {
         let capture = Capture::default();
@@ -108,8 +123,7 @@ mod tests {
             .with_writer(capture.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, || log_exchange(record));
-        let bytes = capture.0.lock().expect("буфер").clone();
-        String::from_utf8(bytes).expect("текст журнала")
+        capture.text()
     }
 
     fn record() -> ExchangeRecord<'static> {

@@ -122,7 +122,7 @@ fn request_with_messages_is_parsed() {
     assert_eq!(messages[1].content, "ответ");
     let settings = request.settings.expect("настройки");
     assert_eq!(settings.model.as_deref(), Some("model-a"));
-    assert_eq!(settings.temperature, Some(0.3));
+    assert_eq!(settings.temperature, Some(Some(0.3)));
 }
 
 #[test]
@@ -1162,4 +1162,495 @@ async fn enabling_authentication_hides_anonymous_chats() {
     )
     .await;
     assert_eq!(read.status, StatusCode::NOT_FOUND);
+}
+
+// --- Дозапись готовых сообщений (POST /v1/chats/{id}/messages) ---
+
+fn append(chat_id: &str, body: serde_json::Value, token: Option<&str>) -> Request<Body> {
+    request(
+        "POST",
+        &format!("/v1/chats/{chat_id}/messages"),
+        Some(body),
+        token,
+    )
+}
+
+fn exchange_body() -> serde_json::Value {
+    serde_json::json!({
+        "messages": [
+            { "role": "user", "content": "вопрос локальной модели" },
+            {
+                "role": "assistant",
+                "content": "ответ локальной модели",
+                "reasoning": "рассуждение",
+                "model": "llama3",
+                "usage": { "prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18, "reasoning_tokens": 3 },
+                "timing": { "duration_ms": 120, "sent_at": 1000, "received_at": 1001 }
+            }
+        ]
+    })
+}
+
+// 1.3 — дозапись не обращается к провайдеру
+
+#[tokio::test]
+async fn append_succeeds_without_reachable_provider() {
+    let _guard = test_lock();
+    // for_tests направляет провайдера на 127.0.0.1:1: доступного апстрима у
+    // этого состояния нет вовсе, поэтому успех означает, что дозапись к
+    // провайдеру не ходит.
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+
+    let sent = send(state, append(&id, exchange_body(), None)).await;
+    assert_eq!(sent.status, StatusCode::CREATED, "тело: {}", sent.body);
+    assert_eq!(sent.body["chat_id"], id);
+    assert_eq!(sent.body["seqs"], serde_json::json!([1, 2]));
+    assert!(sent.body["request_id"].is_string());
+}
+
+#[tokio::test]
+async fn appended_text_is_not_filtered_by_pipeline() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let text = "  текст с краевыми пробелами и словом обход политики  ";
+
+    let sent = send(
+        state.clone(),
+        append(
+            &id,
+            serde_json::json!({ "messages": [{ "role": "user", "content": text }] }),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::CREATED, "тело: {}", sent.body);
+
+    let read = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(read.body["messages"][0]["content"], text);
+}
+
+// 1.2 — валидация тела дозаписи
+
+#[tokio::test]
+async fn append_with_api_key_field_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+
+    let sent = send(
+        state.clone(),
+        append(
+            &id,
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "вопрос", "api_key": "sk-secret" }]
+            }),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "invalid_request");
+
+    let read = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(read.body["messages"], serde_json::json!([]));
+}
+
+// 1.4 — отказы дозаписи
+
+#[tokio::test]
+async fn append_with_empty_messages_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+
+    let sent = send(
+        state,
+        append(&id, serde_json::json!({ "messages": [] }), None),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn append_with_unknown_role_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+
+    let sent = send(
+        state,
+        append(
+            &id,
+            serde_json::json!({ "messages": [{ "role": "system", "content": "вопрос" }] }),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn append_to_foreign_and_missing_chat_look_identical() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_MODEL", "model-a"),
+        ("AGENTD_CLIENT_TOKENS", "token-a,token-b"),
+    ])
+    .await;
+    let created = create_chat(state.clone(), Some("token-a"), serde_json::json!({})).await;
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+
+    let foreign = send(state.clone(), append(&id, exchange_body(), Some("token-b"))).await;
+    let missing = send(
+        state.clone(),
+        append("00000000-0000-0000-0000-000000000000", exchange_body(), Some("token-b")),
+    )
+    .await;
+
+    assert_eq!(foreign.status, StatusCode::NOT_FOUND, "тело: {}", foreign.body);
+    assert_eq!(missing.status, StatusCode::NOT_FOUND, "тело: {}", missing.body);
+    assert_eq!(foreign.body["error"]["code"], missing.body["error"]["code"]);
+    assert_eq!(foreign.body["error"]["message"], missing.body["error"]["message"]);
+
+    // История владельца от чужой попытки не изменилась.
+    let read = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, Some("token-a")),
+    )
+    .await;
+    assert_eq!(read.body["messages"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn append_error_envelope_carries_request_id() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let sent = send(
+        state,
+        append("00000000-0000-0000-0000-000000000000", exchange_body(), None),
+    )
+    .await;
+
+    assert_eq!(sent.status, StatusCode::NOT_FOUND, "тело: {}", sent.body);
+    let envelope: ErrorEnvelope = serde_json::from_value(sent.body).expect("конверт");
+    assert!(!sent.request_id_header.is_empty());
+    assert_eq!(envelope.error.request_id, sent.request_id_header);
+}
+
+// 1.5 — дозаписанное читается и поднимает чат в списке
+
+#[tokio::test]
+async fn appended_messages_are_readable_with_telemetry_and_lift_chat() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let first = create_chat(state.clone(), None, serde_json::json!({ "title": "Первый" })).await;
+    let second = create_chat(state.clone(), None, serde_json::json!({ "title": "Второй" })).await;
+    let first_id = first.body["id"].as_str().expect("идентификатор чата").to_string();
+    let second_id = second.body["id"].as_str().expect("идентификатор чата").to_string();
+
+    // Время изменения хранится в секундах, поэтому оба чата, созданные в
+    // одну секунду, различаются в списке только по идентификатору. Чтобы
+    // подъём чата от дозаписи был наблюдаем, обе метки сдвигаются в прошлое.
+    for (id, updated_at) in [(&first_id, 1000), (&second_id, 2000)] {
+        sqlx::query("UPDATE chats SET updated_at = ? WHERE id = ?")
+            .bind(updated_at)
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .expect("подготовка времени изменения");
+    }
+    let before = send(state.clone(), request("GET", "/v1/chats", None, None)).await;
+    assert_eq!(before.body["chats"][0]["id"], second_id);
+
+    let appended = send(state.clone(), append(&first_id, exchange_body(), None)).await;
+    assert_eq!(appended.status, StatusCode::CREATED, "тело: {}", appended.body);
+
+    let read = send(
+        state.clone(),
+        request("GET", &format!("/v1/chats/{first_id}"), None, None),
+    )
+    .await;
+    let messages = read.body["messages"].as_array().expect("сообщения");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "вопрос локальной модели");
+    assert_eq!(messages[0]["seq"], 1);
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["seq"], 2);
+    assert_eq!(messages[1]["reasoning"], "рассуждение");
+    assert_eq!(messages[1]["model"], "llama3");
+    assert_eq!(messages[1]["usage"]["total_tokens"], 18);
+    assert_eq!(messages[1]["timing"]["duration_ms"], 120);
+    assert_eq!(read.body["message_count"], 2);
+
+    let list = send(state, request("GET", "/v1/chats", None, None)).await;
+    let chats = list.body["chats"].as_array().expect("список чатов");
+    assert_eq!(chats[0]["id"], first_id, "дозапись поднимает чат в списке");
+    assert_eq!(chats[1]["id"], second_id);
+}
+
+// 1.6 — приватность текстов дозаписи
+
+#[test]
+fn append_log_records_counts_without_message_text() {
+    let _guard = test_lock();
+    let capture = crate::telemetry::capture::Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(capture.clone())
+        .finish();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    // Перехват журнала ставится вокруг блокирующего вызова: подписчик
+    // задаётся на текущий поток, а не на задачу.
+    tracing::subscriber::with_default(subscriber, || {
+        runtime.block_on(async {
+            let state = AppState::for_tests().await;
+            let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+            let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+            let sent = send(state, append(&id, exchange_body(), None)).await;
+            assert_eq!(sent.status, StatusCode::CREATED, "тело: {}", sent.body);
+            id
+        })
+    });
+
+    let output = capture.text();
+    assert!(output.contains("сообщения дозаписаны в чат"), "нет записи: {output}");
+    assert!(output.contains("\"messages\":2"), "нет числа сообщений: {output}");
+    assert!(
+        !output.contains("вопрос локальной модели") && !output.contains("ответ локальной модели"),
+        "текст сообщений попал в журнал: {output}"
+    );
+}
+
+// --- Настройки чата с локальным провайдером ---
+
+// 1.8 — чат с провайдером ollama создаётся и меняется при ненастроенном Ollama
+
+fn local_settings(model: &str) -> serde_json::Value {
+    serde_json::json!({ "provider": "ollama", "model": model })
+}
+
+#[tokio::test]
+async fn local_chat_is_stored_without_server_ollama() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_MODEL", "model-a"),
+    ])
+    .await;
+
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "title": "Локальный", "settings": local_settings("llama3") }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "тело: {}", created.body);
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    assert_eq!(created.body["settings"]["provider"], "ollama");
+    assert_eq!(created.body["settings"]["model"], "llama3");
+
+    let read = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(read.body["settings"]["provider"], "ollama");
+    assert_eq!(read.body["settings"]["model"], "llama3");
+}
+
+#[tokio::test]
+async fn local_chat_model_can_be_changed_without_allowlist() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_MODEL", "model-a"),
+    ])
+    .await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": local_settings("llama3") }),
+    )
+    .await;
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+
+    let patched = send(
+        state,
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": local_settings("qwen2") })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+    assert_eq!(patched.body["settings"]["model"], "qwen2");
+}
+
+// 1.9 — вызов модели в локальном чате остаётся невозможным
+
+#[tokio::test]
+async fn call_in_local_chat_is_rejected_without_server_ollama() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_MODEL", "model-a"),
+    ])
+    .await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": local_settings("llama3") }),
+    )
+    .await;
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "привет" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "invalid_request");
+    assert!(
+        sent.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ollama"),
+        "причина не названа: {}",
+        sent.body
+    );
+
+    let read = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(read.body["messages"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn cloud_chat_model_outside_allowlist_is_still_rejected() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_MODEL", "model-a"),
+    ])
+    .await;
+
+    let sent = create_chat(
+        state,
+        None,
+        serde_json::json!({ "settings": { "provider": "cloud", "model": "model-x" } }),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "invalid_request");
+}
+
+// 1.10 — настройки чата задаются целиком
+
+#[tokio::test]
+async fn explicit_null_clears_sampling_parameter() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "temperature": 0.7, "top_p": 0.9 } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    assert_eq!(created.body["settings"]["sampling"]["temperature"], 0.7);
+
+    let patched = send(
+        state,
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "temperature": null } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+    assert!(
+        patched.body["settings"]["sampling"]["temperature"].is_null(),
+        "температура не сброшена: {}",
+        patched.body
+    );
+    assert_eq!(
+        patched.body["settings"]["sampling"]["top_p"], 0.9,
+        "незаданное поле изменилось: {}",
+        patched.body
+    );
+}
+
+#[tokio::test]
+async fn custom_response_mode_can_be_switched_off() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({
+            "settings": { "response_format": { "description": "только JSON", "max_length": 500 } }
+        }),
+    )
+    .await;
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    assert_eq!(created.body["settings"]["custom_response_mode"], true);
+
+    let patched = send(
+        state,
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "custom_response_mode": false } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+    assert_eq!(patched.body["settings"]["custom_response_mode"], false);
+    // Сам формат остаётся сохранённым: выключен режим, а не описание.
+    assert_eq!(patched.body["settings"]["response_format"]["description"], "только JSON");
+}
+
+#[tokio::test]
+async fn omitted_settings_fields_stay_unchanged() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({
+            "settings": { "temperature": 0.4, "reasoning": "step-by-step", "experts": ["аналитик"] }
+        }),
+    )
+    .await;
+    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+
+    let patched = send(
+        state,
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "model": "test-model" } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+    assert_eq!(patched.body["settings"]["model"], "test-model");
+    assert_eq!(patched.body["settings"]["sampling"]["temperature"], 0.4);
+    assert_eq!(patched.body["settings"]["experts"], serde_json::json!(["аналитик"]));
 }

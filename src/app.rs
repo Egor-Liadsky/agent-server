@@ -1,8 +1,9 @@
 //! Сборка HTTP-приложения: маршруты, слои и обработчики.
 
 use crate::dto::{
-    ChatDto, ChatRequest, ChatResponse, ChatWithMessagesResponse, CreateChatRequest, GetChatQuery,
-    ListChatsQuery, ListChatsResponse, MessageView, ModelsResponse, UpdateChatRequest,
+    AppendMessagesRequest, AppendMessagesResponse, ChatDto, ChatRequest, ChatResponse,
+    ChatWithMessagesResponse, CreateChatRequest, GetChatQuery, ListChatsQuery, ListChatsResponse,
+    MessageView, ModelsResponse, UpdateChatRequest,
 };
 use crate::error::ApiError;
 use crate::middleware::{assign_request_id, authenticate, normalize_errors, ClientId, Owner, RequestId};
@@ -35,6 +36,9 @@ const DEFAULT_MESSAGES_LIMIT: u32 = 200;
 const MAX_MESSAGES_LIMIT: u32 = 500;
 const DEFAULT_CHAT_TITLE: &str = "Новый чат";
 const MAX_CHAT_TITLE_LEN: usize = 200;
+/// Предел одной дозаписи: обмен с локальной моделью — это две реплики, а
+/// запас нужен только на повтор после неудачи, не на выгрузку истории.
+const MAX_APPEND_MESSAGES: usize = 100;
 
 /// Живость процесса. Никаких обращений к провайдеру: эндпоинт отвечает,
 /// пока жив сам процесс.
@@ -110,7 +114,19 @@ fn server_defaults(state: &AppState) -> ChatSettings {
     }
 }
 
-fn validate_settings(state: &AppState, settings: &ChatSettings) -> Result<(), ApiError> {
+/// Проверка настроек перед вызовом модели: белый список моделей и наличие
+/// своего адреса Ollama — про то, что сервис собирается вызывать сам.
+fn validate_settings_for_call(state: &AppState, settings: &ChatSettings) -> Result<(), ApiError> {
+    if settings.provider == Provider::Ollama {
+        // Локальную модель пользователя сервис вызвать не может: без своего
+        // адреса Ollama диалог в таком чате идёт мимо сервиса.
+        if state.config.ollama_url.is_none() {
+            return Err(ApiError::invalid_request(
+                "провайдер ollama не настроен на этом сервисе",
+            ));
+        }
+        return Ok(());
+    }
     let model = settings
         .model
         .clone()
@@ -120,12 +136,19 @@ fn validate_settings(state: &AppState, settings: &ChatSettings) -> Result<(), Ap
             "модель {model} не разрешена конфигурацией сервиса"
         )));
     }
-    if settings.provider == Provider::Ollama && state.config.ollama_url.is_none() {
-        return Err(ApiError::invalid_request(
-            "провайдер ollama не настроен на этом сервисе",
-        ));
-    }
     Ok(())
+}
+
+/// Проверка настроек перед сохранением в чате. Чат с локальным провайдером
+/// обслуживает клиент, а сервис для него — только хранилище, поэтому ни
+/// белый список моделей, ни свой адрес Ollama к нему не применяются
+/// (specs/chat-message-api, «Настройки чата с локальным провайдером
+/// принимаются на хранение»).
+fn validate_settings_for_storage(state: &AppState, settings: &ChatSettings) -> Result<(), ApiError> {
+    if settings.provider == Provider::Ollama {
+        return Ok(());
+    }
+    validate_settings_for_call(state, settings)
 }
 
 /// Накладывает необязательный DTO настроек поверх базовых значений и
@@ -136,13 +159,25 @@ fn merge_settings(
     state: &AppState,
     base: ChatSettings,
     dto: Option<crate::dto::ChatSettingsDto>,
+    purpose: SettingsPurpose,
 ) -> Result<ChatSettings, ApiError> {
     let settings = match dto {
         Some(dto) => dto.apply_to(base).map_err(ApiError::invalid_request)?,
         None => base,
     };
-    validate_settings(state, &settings)?;
+    match purpose {
+        SettingsPurpose::Call => validate_settings_for_call(state, &settings)?,
+        SettingsPurpose::Storage => validate_settings_for_storage(state, &settings)?,
+    }
     Ok(settings)
+}
+
+/// Зачем проверяются настройки: сервис собирается вызвать модель сам или
+/// только сохранить настройки чата.
+#[derive(Debug, Clone, Copy)]
+enum SettingsPurpose {
+    Call,
+    Storage,
 }
 
 fn validate_title(title: Option<String>) -> Result<Option<String>, ApiError> {
@@ -262,7 +297,7 @@ async fn handle_chat_without_storage(
     request: ChatRequest,
 ) -> Result<ChatResponse, ApiError> {
     let history = history_from(&request)?;
-    let settings = merge_settings(&state, server_defaults(&state), request.settings)?;
+    let settings = merge_settings(&state, server_defaults(&state), request.settings, SettingsPurpose::Call)?;
     let model = settings
         .model
         .clone()
@@ -302,7 +337,7 @@ async fn handle_chat_in_existing(
     let chat = store::load_chat(&state.db, &owner, &chat_id, &defaults)
         .await
         .map_err(ApiError::from_store_error)?;
-    let settings = merge_settings(&state, chat.settings.clone(), request.settings)?;
+    let settings = merge_settings(&state, chat.settings.clone(), request.settings, SettingsPurpose::Call)?;
     let model = settings
         .model
         .clone()
@@ -378,7 +413,7 @@ async fn handle_create_chat(
     body: CreateChatRequest,
 ) -> Result<ChatDto, ApiError> {
     let title = validate_title(body.title)?.unwrap_or_else(|| DEFAULT_CHAT_TITLE.to_string());
-    let settings = merge_settings(&state, server_defaults(&state), body.settings)?;
+    let settings = merge_settings(&state, server_defaults(&state), body.settings, SettingsPurpose::Storage)?;
     let chat = store::create_chat(&state.db, &owner, &title, &settings)
         .await
         .map_err(ApiError::from_store_error)?;
@@ -491,7 +526,7 @@ async fn handle_patch_chat(
             let chat = store::load_chat(&state.db, &owner, &id, &defaults)
                 .await
                 .map_err(ApiError::from_store_error)?;
-            Some(merge_settings(&state, chat.settings, Some(dto))?)
+            Some(merge_settings(&state, chat.settings, Some(dto), SettingsPurpose::Storage)?)
         }
         None => None,
     };
@@ -500,6 +535,78 @@ async fn handle_patch_chat(
         .await
         .map_err(ApiError::from_store_error)?;
     Ok(ChatDto::from(updated))
+}
+
+/// `POST /v1/chats/{id}/messages`: дозапись готовых реплик. Провайдер и
+/// стадии конвейера здесь не участвуют — ответ модели клиент получил сам
+/// (specs/chat-message-api).
+async fn append_messages_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    match handle_append_messages(state, request_id.clone(), owner, id, body).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_append_messages(
+    state: AppState,
+    request_id: String,
+    owner: String,
+    chat_id: String,
+    body: serde_json::Value,
+) -> Result<AppendMessagesResponse, ApiError> {
+    if contains_api_key(&body) {
+        return Err(ApiError::invalid_request(
+            "ключ провайдера задаёт сервис: поле api_key в запросе не принимается",
+        ));
+    }
+    let request: AppendMessagesRequest = serde_json::from_value(body)
+        .map_err(|err| ApiError::invalid_request(format!("тело запроса не разобрано: {err}")))?;
+
+    if request.messages.is_empty() {
+        return Err(ApiError::invalid_request(
+            "поле messages должно содержать хотя бы одно сообщение",
+        ));
+    }
+    if request.messages.len() > MAX_APPEND_MESSAGES {
+        return Err(ApiError::invalid_request(format!(
+            "за одну дозапись принимается не больше {MAX_APPEND_MESSAGES} сообщений"
+        )));
+    }
+    for message in &request.messages {
+        if message.content.trim().is_empty() {
+            return Err(ApiError::invalid_request(
+                "текст сообщения не должен быть пустым",
+            ));
+        }
+    }
+
+    let count = request.messages.len();
+    let messages: Vec<store::NewMessage> = request
+        .messages
+        .into_iter()
+        .map(crate::dto::NewMessageDto::into_new_message)
+        .collect();
+
+    let rows = store::append_messages(&state.db, &owner, &chat_id, messages)
+        .await
+        .map_err(ApiError::from_store_error)?;
+
+    // Тексты сообщений в журнал не попадают: их запись включает только
+    // AGENTD_LOG_CONTENT, и у дозаписи нет обмена с провайдером, который
+    // журнал обмена мог бы описать.
+    tracing::info!(%request_id, chat_id = %chat_id, messages = count, "сообщения дозаписаны в чат");
+
+    Ok(AppendMessagesResponse {
+        request_id,
+        chat_id,
+        seqs: rows.into_iter().map(|row| row.seq).collect(),
+    })
 }
 
 async fn delete_chat_handler(
@@ -541,6 +648,7 @@ pub fn router(state: AppState) -> Router {
             "/chats/{id}",
             get(get_chat_handler).patch(patch_chat_handler).delete(delete_chat_handler),
         )
+        .route("/chats/{id}/messages", post(append_messages_handler))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,

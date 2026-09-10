@@ -61,7 +61,6 @@ impl From<sqlx::Error> for StoreError {
 #[derive(Debug, Clone)]
 pub struct Chat {
     pub id: String,
-    pub owner: String,
     pub title: String,
     pub settings: ChatSettings,
     pub created_at: i64,
@@ -186,7 +185,6 @@ fn chat_from_row(row: &sqlx::sqlite::SqliteRow, defaults: &ChatSettings) -> Resu
     let settings_raw: String = row.try_get("settings")?;
     let settings = parse_settings(&settings_raw, &id, defaults);
     Ok(Chat {
-        owner: row.try_get("owner")?,
         title: row.try_get("title")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -222,7 +220,6 @@ pub async fn create_chat(
 
     Ok(Chat {
         id,
-        owner: owner.to_string(),
         title: title.to_string(),
         settings: settings.clone(),
         created_at: now,
@@ -454,6 +451,29 @@ pub async fn append_exchange(
     user_message: NewMessage,
     assistant_message: NewMessage,
 ) -> Result<(ChatMessage, ChatMessage), StoreError> {
+    let mut rows = append_messages(pool, owner, chat_id, vec![user_message, assistant_message]).await?;
+    let assistant_row = rows.pop().expect("две записанные реплики обмена");
+    let user_row = rows.pop().expect("две записанные реплики обмена");
+    Ok((user_row, assistant_row))
+}
+
+/// Дописывает готовые сообщения в конец чата одной транзакцией
+/// `BEGIN IMMEDIATE`: либо в чате появляются все сообщения списка, либо ни
+/// одно. Номера `seq` назначает хранилище, порядок сохраняется тот же, в
+/// котором сообщения переданы. Провайдер здесь не участвует: содержимое
+/// пришло готовым (specs/chat-message-api).
+pub async fn append_messages(
+    pool: &SqlitePool,
+    owner: &str,
+    chat_id: &str,
+    messages: Vec<NewMessage>,
+) -> Result<Vec<ChatMessage>, StoreError> {
+    if messages.is_empty() {
+        return Err(StoreError::Backend(anyhow::anyhow!(
+            "дозапись пустого списка сообщений: вызывающий код обязан отклонить такой запрос раньше"
+        )));
+    }
+
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     let exists = sqlx::query("SELECT 1 FROM chats WHERE id = ? AND owner = ?")
@@ -472,8 +492,11 @@ pub async fn append_exchange(
         .await?;
 
     let now = now_secs();
-    let user_row = insert_message(&mut *tx, chat_id, max_seq + 1, &user_message, now).await?;
-    let assistant_row = insert_message(&mut *tx, chat_id, max_seq + 2, &assistant_message, now).await?;
+    let mut rows = Vec::with_capacity(messages.len());
+    for (offset, message) in messages.iter().enumerate() {
+        let seq = max_seq + 1 + offset as i64;
+        rows.push(insert_message(&mut *tx, chat_id, seq, message, now).await?);
+    }
 
     sqlx::query("UPDATE chats SET updated_at = ? WHERE id = ?")
         .bind(now)
@@ -482,7 +505,7 @@ pub async fn append_exchange(
         .await?;
 
     tx.commit().await?;
-    Ok((user_row, assistant_row))
+    Ok(rows)
 }
 
 async fn insert_message(
@@ -769,6 +792,137 @@ mod tests {
         let stored_assistant = &loaded.messages[1];
         assert_eq!(stored_assistant.reasoning.as_deref(), Some("рассуждение"));
         assert_eq!(stored_assistant.meta.as_ref().unwrap().total_tokens, Some(18));
+    }
+
+    // --- 1.1 Дозапись готовых сообщений ---
+
+    #[tokio::test]
+    async fn append_messages_keeps_request_order_and_lifts_chat() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        // Заведомо старое время изменения: иначе рост updated_at не отличить
+        // от исходного значения — обе метки в секундах и совпадут.
+        sqlx::query("UPDATE chats SET updated_at = 1000 WHERE id = ?")
+            .bind(&chat.id)
+            .execute(&pool)
+            .await
+            .expect("подготовка времени изменения");
+
+        let meta = MessageMeta {
+            completion_tokens: Some(5),
+            total_tokens: Some(9),
+            duration_ms: Some(42),
+            model: Some("model-local".to_string()),
+            ..MessageMeta::default()
+        };
+        let rows = append_messages(
+            &pool,
+            "owner-1",
+            &chat.id,
+            vec![
+                new_message(Role::User, "вопрос"),
+                NewMessage {
+                    role: Role::Assistant,
+                    content: "ответ".to_string(),
+                    reasoning: Some("рассуждение".to_string()),
+                    meta: Some(meta),
+                },
+            ],
+        )
+        .await
+        .expect("дозапись");
+
+        assert_eq!(rows.iter().map(|row| row.seq).collect::<Vec<_>>(), vec![1, 2]);
+
+        let loaded = load_messages(&pool, &chat.id, 0, 10).await.expect("чтение");
+        assert_eq!(loaded.messages[0].content, "вопрос");
+        assert_eq!(loaded.messages[1].content, "ответ");
+        assert_eq!(loaded.messages[1].meta.as_ref().unwrap().duration_ms, Some(42));
+
+        let reloaded = load_chat(&pool, "owner-1", &chat.id, &defaults).await.expect("чат");
+        assert_eq!(reloaded.message_count, 2);
+        assert!(reloaded.updated_at > 1000);
+    }
+
+    #[tokio::test]
+    async fn append_messages_after_existing_history_continues_numbering() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        append_messages(&pool, "owner-1", &chat.id, vec![new_message(Role::User, "первое")])
+            .await
+            .expect("первая дозапись");
+
+        let rows = append_messages(
+            &pool,
+            "owner-1",
+            &chat.id,
+            vec![
+                new_message(Role::Assistant, "второе"),
+                new_message(Role::User, "третье"),
+            ],
+        )
+        .await
+        .expect("вторая дозапись");
+
+        assert_eq!(rows.iter().map(|row| row.seq).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn append_messages_rolls_back_when_second_insert_fails() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        // Отказ хранилища ровно на втором сообщении списка: триггер живёт
+        // только в тестовой базе и ломает вставку, когда в чате уже есть
+        // одно сообщение этой же транзакции.
+        sqlx::query(
+            "CREATE TRIGGER fail_on_second_message BEFORE INSERT ON messages \
+             WHEN (SELECT COUNT(*) FROM messages WHERE chat_id = NEW.chat_id) = 1 \
+             BEGIN SELECT RAISE(ABORT, 'сбой на втором сообщении'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("создание триггера");
+
+        let result = append_messages(
+            &pool,
+            "owner-1",
+            &chat.id,
+            vec![
+                new_message(Role::User, "вопрос"),
+                new_message(Role::Assistant, "ответ"),
+            ],
+        )
+        .await;
+
+        assert!(matches!(result, Err(StoreError::Backend(_))));
+
+        let loaded = load_messages(&pool, &chat.id, 0, 10).await.expect("чтение");
+        assert!(
+            loaded.messages.is_empty(),
+            "после отказа на втором сообщении в чате не должно остаться ни одного"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_messages_to_foreign_chat_is_not_found() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+
+        let result = append_messages(
+            &pool,
+            "owner-2",
+            &chat.id,
+            vec![new_message(Role::User, "вопрос")],
+        )
+        .await;
+
+        assert!(matches!(result, Err(StoreError::NotFound)));
+        let loaded = load_messages(&pool, &chat.id, 0, 10).await.expect("чтение");
+        assert!(loaded.messages.is_empty());
     }
 
     // --- 3.6 Конкурентная запись ---
