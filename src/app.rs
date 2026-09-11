@@ -78,6 +78,61 @@ fn contains_api_key(value: &serde_json::Value) -> bool {
     }
 }
 
+/// Приближённая оценка размера истории в токенах: точного токенизатора
+/// провайдера (`deepseek-chat` через `agentupstream`, либо Ollama) у сервиса
+/// нет, поэтому размер оценивается по длине текста, а не подсчитывается
+/// точно (design.md, решение «Оценка размера — по длине текста»).
+fn estimate_tokens(history: &[Message]) -> u32 {
+    let chars: usize = history
+        .iter()
+        .map(|message| role_str(&message.role).len() + message.content.chars().count())
+        .sum();
+    (chars as u64).div_ceil(4) as u32
+}
+
+fn role_str(role: &agentcore::agent::Role) -> &'static str {
+    match role {
+        agentcore::agent::Role::User => "user",
+        agentcore::agent::Role::Assistant => "assistant",
+    }
+}
+
+/// Эффективный лимит контекстного окна на этот запрос: клиентское поле может
+/// только сузить операторский лимит по умолчанию (specs/context-limit,
+/// «Клиентское сужение лимита на один запрос»).
+fn effective_context_limit(
+    operator_default: Option<u32>,
+    client_value: Option<u32>,
+) -> Result<Option<u32>, ApiError> {
+    match (operator_default, client_value) {
+        (None, None) => Ok(None),
+        (Some(default), None) => Ok(Some(default)),
+        (Some(default), Some(client)) if client <= default => Ok(Some(client)),
+        (Some(default), Some(_client)) => Err(ApiError::context_limit_invalid(format!(
+            "max_context_tokens не может превышать операторский лимит {default}"
+        ))),
+        (None, Some(_client)) => Err(ApiError::context_limit_invalid(
+            "max_context_tokens задан, но операторский лимит контекстного окна не настроен",
+        )),
+    }
+}
+
+/// Проверка эффективного лимита перед вызовом конвейера: если оценка размера
+/// истории превышает лимит, запрос отклоняется до обращения к провайдеру
+/// (specs/context-limit, «Отказ при превышении эффективного лимита»).
+fn check_context_limit(history: &[Message], limit: Option<u32>) -> Result<(), ApiError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let estimated = estimate_tokens(history);
+    if estimated > limit {
+        return Err(ApiError::context_limit_exceeded(format!(
+            "оценка размера истории ({estimated} токенов, приближённо) превышает лимит контекстного окна ({limit})"
+        )));
+    }
+    Ok(())
+}
+
 fn history_from(request: &ChatRequest) -> Result<Vec<Message>, ApiError> {
     let prompt = request
         .prompt
@@ -303,6 +358,9 @@ async fn handle_chat_without_storage(
         .clone()
         .unwrap_or_else(|| state.config.model.clone());
 
+    let limit = effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
+    check_context_limit(&history, limit)?;
+
     let pipeline = Pipeline::new(state.agent.clone());
     let context = RequestContext::new(request_id.clone(), history, settings);
     let (reply, policy) = run_pipeline(&pipeline, context, &request_id).await?;
@@ -349,6 +407,9 @@ async fn handle_chat_in_existing(
     let user_message = Message::user(prompt);
     let mut history: Vec<Message> = stored.messages.into_iter().map(message_from_stored).collect();
     history.push(user_message.clone());
+
+    let limit = effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
+    check_context_limit(&history, limit)?;
 
     let pipeline = Pipeline::new(state.agent.clone());
     let context = RequestContext::new(request_id.clone(), history, settings);
@@ -679,4 +740,47 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(assign_request_id))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+#[cfg(test)]
+mod context_limit_tests {
+    use super::*;
+
+    #[test]
+    fn estimate_tokens_rounds_up_at_boundaries() {
+        // "user" (4 символа) + пустое содержимое = 4 символа -> ceil(4/4) = 1.
+        assert_eq!(estimate_tokens(&[Message::user("")]), 1);
+        // "user" (4) + 1 символ содержимого = 5 символов -> ceil(5/4) = 2.
+        assert_eq!(estimate_tokens(&[Message::user("a")]), 2);
+        // "user" (4) + 4 символа содержимого = 8 символов -> ceil(8/4) = 2,
+        // граница деления без остатка не должна округляться лишний раз.
+        assert_eq!(estimate_tokens(&[Message::user("abcd")]), 2);
+        assert_eq!(estimate_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn effective_context_limit_without_operator_default_or_client_value_is_none() {
+        assert_eq!(effective_context_limit(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn effective_context_limit_uses_operator_default_without_client_value() {
+        assert_eq!(effective_context_limit(Some(100), None).unwrap(), Some(100));
+    }
+
+    #[test]
+    fn effective_context_limit_accepts_narrower_client_value() {
+        assert_eq!(effective_context_limit(Some(100), Some(50)).unwrap(), Some(50));
+        assert_eq!(effective_context_limit(Some(100), Some(100)).unwrap(), Some(100));
+    }
+
+    #[test]
+    fn effective_context_limit_rejects_wider_client_value() {
+        assert!(effective_context_limit(Some(100), Some(101)).is_err());
+    }
+
+    #[test]
+    fn effective_context_limit_rejects_client_value_without_operator_default() {
+        assert!(effective_context_limit(None, Some(50)).is_err());
+    }
 }

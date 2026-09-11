@@ -264,6 +264,101 @@ async fn chat_returns_reply_from_provider() {
     assert_eq!(sent.body["request_id"], sent.request_id_header);
 }
 
+// --- 5.4b Лимит контекстного окна ---
+
+#[tokio::test]
+async fn no_configured_or_client_limit_reaches_provider() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+
+    let state = state_with_provider(&server, &[]).await;
+    let sent = send(state, post_chat(serde_json::json!({ "prompt": "привет" }))).await;
+
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+}
+
+#[tokio::test]
+async fn client_limit_narrower_than_operator_default_is_accepted() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+
+    let state = state_with_provider(&server, &[("AGENTD_MAX_CONTEXT_TOKENS", "1000")]).await;
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "prompt": "привет",
+            "settings": { "max_context_tokens": 500 }
+        })),
+    )
+    .await;
+
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+}
+
+#[tokio::test]
+async fn client_limit_wider_than_operator_default_is_rejected() {
+    let _guard = test_lock();
+    let state = state_with_provider(
+        &MockServer::start().await,
+        &[("AGENTD_MAX_CONTEXT_TOKENS", "1000")],
+    )
+    .await;
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "prompt": "привет",
+            "settings": { "max_context_tokens": 1001 }
+        })),
+    )
+    .await;
+
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "context_limit_invalid");
+}
+
+#[tokio::test]
+async fn client_limit_without_operator_default_is_rejected() {
+    let _guard = test_lock();
+    let state = state_with_provider(&MockServer::start().await, &[]).await;
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "prompt": "привет",
+            "settings": { "max_context_tokens": 500 }
+        })),
+    )
+    .await;
+
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "context_limit_invalid");
+}
+
+#[tokio::test]
+async fn history_exceeding_effective_limit_is_rejected_without_calling_provider() {
+    let _guard = test_lock();
+    // Апстрим без смонтированных ожиданий: обращение к нему обвалило бы тест.
+    let server = MockServer::start().await;
+    let state = state_with_provider(&server, &[("AGENTD_MAX_CONTEXT_TOKENS", "1")]).await;
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({ "prompt": "привет, как дела сегодня?" })),
+    )
+    .await;
+
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "context_limit_exceeded");
+}
+
 // --- 5.5 Служебные эндпоинты ---
 
 #[tokio::test]
@@ -945,6 +1040,211 @@ async fn settings_override_in_chat_call_does_not_persist() {
 
     let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
     assert_ne!(loaded.body["settings"]["sampling"]["temperature"], 0.9);
+}
+
+// --- Лимит контекста сохраняется в настройках чата ---
+
+#[tokio::test]
+async fn patch_max_context_tokens_persists() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "max_context_tokens": 4000 } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+    assert_eq!(patched.body["settings"]["max_context_tokens"], 4000);
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["settings"]["max_context_tokens"], 4000);
+}
+
+#[tokio::test]
+async fn patch_null_max_context_tokens_clears_stored_limit() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "max_context_tokens": 4000 } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+
+    let cleared = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "max_context_tokens": null } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "тело: {}", cleared.body);
+    assert!(cleared.body["settings"]["max_context_tokens"].is_null());
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert!(loaded.body["settings"]["max_context_tokens"].is_null());
+}
+
+#[tokio::test]
+async fn patch_without_max_context_tokens_field_keeps_stored_value() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "max_context_tokens": 4000 } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+
+    let renamed = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "temperature": 0.3 } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(renamed.status, StatusCode::OK, "тело: {}", renamed.body);
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["settings"]["max_context_tokens"], 4000);
+}
+
+#[tokio::test]
+async fn chat_call_without_override_uses_stored_chat_limit() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    // Никаких смонтированных ожиданий: запрос отклоняется до обращения к
+    // апстриму, обращение к нему обвалило бы тест.
+    let state = state_with_provider(&server, &[("AGENTD_MAX_CONTEXT_TOKENS", "1000")]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "max_context_tokens": 1 } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "prompt": "привет, как дела сегодня?"
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "context_limit_exceeded");
+}
+
+#[tokio::test]
+async fn chat_call_override_does_not_change_stored_chat_limit() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_MAX_CONTEXT_TOKENS", "1000")]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "max_context_tokens": 500 } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "prompt": "привет",
+            "settings": { "max_context_tokens": 200 }
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["settings"]["max_context_tokens"], 500);
+}
+
+#[tokio::test]
+async fn chat_call_with_stored_limit_above_operator_default_is_rejected() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    // Никаких смонтированных ожиданий: запрос отклоняется до обращения к
+    // апстриму, обращение к нему обвалило бы тест.
+    let state = state_with_provider(&server, &[("AGENTD_MAX_CONTEXT_TOKENS", "1000")]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "max_context_tokens": 2000 } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "prompt": "привет"
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "context_limit_invalid");
 }
 
 // 6.5 — модель чата вне белого списка

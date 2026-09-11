@@ -55,6 +55,9 @@ pub struct AgentdConfig {
     pub db_path: String,
     pub db_max_connections: u32,
     pub db_busy_timeout_ms: u64,
+    /// Операторский лимит контекстного окна по умолчанию, в токенах.
+    /// `None` — проверка размера истории не выполняется.
+    pub max_context_tokens: Option<u32>,
 }
 
 impl AgentdConfig {
@@ -148,6 +151,10 @@ impl AgentdConfig {
                 "AGENTD_DB_BUSY_TIMEOUT_MS",
                 DEFAULT_DB_BUSY_TIMEOUT_MS,
             )?,
+            max_context_tokens: parse_optional_positive(
+                get("AGENTD_MAX_CONTEXT_TOKENS"),
+                "AGENTD_MAX_CONTEXT_TOKENS",
+            )?,
         })
     }
 
@@ -201,6 +208,24 @@ where
         bail!("{name} не может быть нулём");
     }
     Ok(parsed)
+}
+
+/// Необязательное положительное целое: не задано — `None`, задано, но не
+/// положительное целое — фатальная ошибка старта, как для прочих числовых
+/// переменных `AGENTD_*`.
+fn parse_optional_positive(value: Option<String>, name: &str) -> Result<Option<u32>> {
+    match value {
+        None => Ok(None),
+        Some(value) => {
+            let parsed: u32 = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("не удалось разобрать {name}: {value}"))?;
+            if parsed == 0 {
+                bail!("{name} не может быть нулём");
+            }
+            Ok(Some(parsed))
+        }
+    }
 }
 
 fn parse_bool(value: Option<String>) -> Result<bool> {
@@ -263,6 +288,37 @@ mod tests {
         assert_eq!(config.db_path, DEFAULT_DB_PATH);
         assert_eq!(config.db_max_connections, DEFAULT_DB_MAX_CONNECTIONS);
         assert_eq!(config.db_busy_timeout_ms, DEFAULT_DB_BUSY_TIMEOUT_MS);
+        assert_eq!(config.max_context_tokens, None);
+    }
+
+    #[test]
+    fn max_context_tokens_is_applied() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_MAX_CONTEXT_TOKENS", "8000"),
+        ])
+        .expect("конфигурация");
+        assert_eq!(config.max_context_tokens, Some(8000));
+    }
+
+    #[test]
+    fn non_numeric_max_context_tokens_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_MAX_CONTEXT_TOKENS", "много"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_MAX_CONTEXT_TOKENS"));
+    }
+
+    #[test]
+    fn zero_max_context_tokens_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_MAX_CONTEXT_TOKENS", "0"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_MAX_CONTEXT_TOKENS"));
     }
 
     #[test]

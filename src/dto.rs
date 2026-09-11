@@ -98,6 +98,14 @@ pub struct ChatSettingsDto {
     pub frequency_penalty: Option<Option<f32>>,
     #[serde(default, deserialize_with = "double_option")]
     pub presence_penalty: Option<Option<f32>>,
+    /// Лимит контекстного окна чата. Незаданное поле оставляет сохранённый
+    /// лимит чата прежним, явный `null` снимает его, число — задаёт
+    /// (сохраняется при `PATCH`, наравне с параметрами сэмплирования).
+    /// `POST /v1/chat` использует это же поле как разовое переопределение
+    /// поверх сохранённого лимита, не сохраняя его (specs/context-limit,
+    /// «Разовое переопределение лимита на один запрос»).
+    #[serde(default, deserialize_with = "double_option")]
+    pub max_context_tokens: Option<Option<u32>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -178,6 +186,9 @@ impl ChatSettingsDto {
                 .unwrap_or(defaults.sampling.presence_penalty),
         };
         defaults.sampling = sampling;
+        defaults.max_context_tokens = self
+            .max_context_tokens
+            .unwrap_or(defaults.max_context_tokens);
         Ok(defaults)
     }
 }

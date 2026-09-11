@@ -51,6 +51,18 @@ impl ApiError {
         )
     }
 
+    /// Клиент передал `settings.max_context_tokens`, превышающее операторский
+    /// лимит по умолчанию (или заданное при отсутствующем операторском
+    /// лимите).
+    pub fn context_limit_invalid(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "context_limit_invalid", message)
+    }
+
+    /// Оценка размера истории превышает эффективный лимит контекстного окна.
+    pub fn context_limit_exceeded(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "context_limit_exceeded", message)
+    }
+
     pub fn payload_too_large() -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,
