@@ -66,6 +66,8 @@ pub struct Chat {
     pub created_at: i64,
     pub updated_at: i64,
     pub message_count: i64,
+    /// Ветка, активная для новых сообщений и умалчиваемого чтения истории.
+    pub active_branch: String,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +191,7 @@ fn chat_from_row(row: &sqlx::sqlite::SqliteRow, defaults: &ChatSettings) -> Resu
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         message_count: row.try_get::<i64, _>("message_count").unwrap_or(0),
+        active_branch: row.try_get("active_branch")?,
         id,
         settings,
     })
@@ -205,6 +208,8 @@ pub async fn create_chat(
     let settings_json = serde_json::to_string(settings)
         .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать настройки: {err}")))?;
 
+    let mut tx = pool.begin().await?;
+
     sqlx::query(
         "INSERT INTO chats (id, owner, title, settings, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?)",
@@ -215,8 +220,19 @@ pub async fn create_chat(
     .bind(&settings_json)
     .bind(now)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+
+    // Каждый чат сразу получает корневую ветку и её же — активной
+    // (specs/chat-branching, «У чата есть ветки и активная ветка»).
+    let root_branch = insert_root_branch(&mut tx, &id, now).await?;
+    sqlx::query("UPDATE chats SET active_branch = ? WHERE id = ?")
+        .bind(&root_branch)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
 
     Ok(Chat {
         id,
@@ -225,14 +241,33 @@ pub async fn create_chat(
         created_at: now,
         updated_at: now,
         message_count: 0,
+        active_branch: root_branch,
     })
+}
+
+async fn insert_root_branch(
+    tx: &mut sqlx::SqliteConnection,
+    chat_id: &str,
+    now: i64,
+) -> Result<String, StoreError> {
+    let branch_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO chat_branches (id, chat_id, parent_id, fork_seq, name, created_at) \
+         VALUES (?, ?, NULL, NULL, 'root', ?)",
+    )
+    .bind(&branch_id)
+    .bind(chat_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    Ok(branch_id)
 }
 
 /// Чат по владельцу и идентификатору. Владелец входит в условие выборки:
 /// чужой чат и несуществующий неотличимы (design.md, решение 7).
 pub async fn load_chat(pool: &SqlitePool, owner: &str, id: &str, defaults: &ChatSettings) -> Result<Chat, StoreError> {
     let row = sqlx::query(
-        "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, \
+        "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, \
                 (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
          FROM chats c WHERE c.id = ? AND c.owner = ?",
     )
@@ -344,7 +379,7 @@ pub async fn list_chats(
     let rows = match &after {
         Some((updated_at, id)) => {
             sqlx::query(
-                "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, \
+                "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, \
                         (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
                  FROM chats c WHERE c.owner = ? \
                    AND (c.updated_at < ? OR (c.updated_at = ? AND c.id < ?)) \
@@ -360,7 +395,7 @@ pub async fn list_chats(
         }
         None => {
             sqlx::query(
-                "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, \
+                "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, \
                         (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
                  FROM chats c WHERE c.owner = ? \
                  ORDER BY c.updated_at DESC, c.id DESC LIMIT ?",
@@ -392,29 +427,106 @@ pub async fn list_chats(
 pub struct MessagePage {
     pub messages: Vec<ChatMessage>,
     pub next_after: Option<i64>,
+    /// Ветка, чья история отдана.
+    pub branch_id: String,
 }
 
-/// Сообщения чата, отдаваемые по возрастанию `seq`. Ответственность за
-/// проверку владения чатом лежит на вызывающем коде.
-pub async fn load_messages(
+/// Ветка чата с числом собственных сообщений (специфика хранилища —
+/// `store::Branch` отличается от одноимённого типа в `agentclient`).
+#[derive(Debug, Clone)]
+pub struct Branch {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub fork_seq: Option<i64>,
+    pub name: String,
+    pub message_count: i64,
+    pub active: bool,
+}
+
+/// Одна ветка цепочки родителей — без числа сообщений: используется только
+/// для сборки истории, а не для показа списка веток.
+struct BranchLink {
+    id: String,
+    parent_id: Option<String>,
+    fork_seq: Option<i64>,
+}
+
+async fn load_branch_link(
     pool: &SqlitePool,
     chat_id: &str,
-    after: i64,
-    limit: u32,
-) -> Result<MessagePage, StoreError> {
-    let fetch_limit = i64::from(limit) + 1;
-    let rows = sqlx::query(
-        "SELECT seq, role, content, reasoning, meta, created_at FROM messages \
-         WHERE chat_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
-    )
-    .bind(chat_id)
-    .bind(after)
-    .bind(fetch_limit)
-    .fetch_all(pool)
-    .await?;
+    branch_id: &str,
+) -> Result<BranchLink, StoreError> {
+    let row = sqlx::query("SELECT id, parent_id, fork_seq FROM chat_branches WHERE id = ? AND chat_id = ?")
+        .bind(branch_id)
+        .bind(chat_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+    Ok(BranchLink {
+        id: row.try_get("id")?,
+        parent_id: row.try_get("parent_id")?,
+        fork_seq: row.try_get("fork_seq")?,
+    })
+}
 
+/// Цепочка веток от корня до `branch_id` включительно. Ограничена
+/// `max_depth`: длиннее — фатальная ошибка хранилища, а не бесконечный
+/// подъём по `parent_id` (specs/context-strategies, design.md решение 4).
+async fn branch_chain(
+    pool: &SqlitePool,
+    chat_id: &str,
+    branch_id: &str,
+    max_depth: u32,
+) -> Result<Vec<BranchLink>, StoreError> {
+    let mut chain = vec![load_branch_link(pool, chat_id, branch_id).await?];
+    loop {
+        let parent_id = match &chain.last().expect("цепочка не пуста").parent_id {
+            Some(id) => id.clone(),
+            None => break,
+        };
+        if chain.len() as u32 >= max_depth {
+            return Err(StoreError::Backend(anyhow::anyhow!(
+                "цепочка веток чата {chat_id} длиннее операторского потолка {max_depth}"
+            )));
+        }
+        chain.push(load_branch_link(pool, chat_id, &parent_id).await?);
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+async fn branch_messages_upto(
+    pool: &SqlitePool,
+    branch_id: &str,
+    upto_seq: Option<i64>,
+) -> Result<Vec<ChatMessage>, StoreError> {
+    let rows = match upto_seq {
+        Some(upto) => {
+            sqlx::query(
+                "SELECT seq, role, content, reasoning, meta, created_at FROM messages \
+                 WHERE branch_id = ? AND seq <= ? ORDER BY seq ASC",
+            )
+            .bind(branch_id)
+            .bind(upto)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                "SELECT seq, role, content, reasoning, meta, created_at FROM messages \
+                 WHERE branch_id = ? ORDER BY seq ASC",
+            )
+            .bind(branch_id)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    rows_to_messages(&rows)
+}
+
+fn rows_to_messages(rows: &[sqlx::sqlite::SqliteRow]) -> Result<Vec<ChatMessage>, StoreError> {
     let mut messages = Vec::with_capacity(rows.len());
-    for row in &rows {
+    for row in rows {
         let role: String = row.try_get("role")?;
         let meta: Option<String> = row.try_get("meta")?;
         let meta = meta
@@ -430,15 +542,306 @@ pub async fn load_messages(
             created_at: row.try_get("created_at")?,
         });
     }
+    Ok(messages)
+}
 
-    let next_after = if messages.len() > limit as usize {
-        messages.truncate(limit as usize);
-        messages.last().map(|message| message.seq)
-    } else {
-        None
+/// История ветки: сообщения родительских веток до их точек ветвления, затем
+/// собственные сообщения ветки — без пагинации (specs/chat-branching,
+/// «История собирается по цепочке ветки»). Используется и для чтения чата
+/// клиентом, и для сборки контекста стратегией `branching`.
+pub async fn load_branch_history(
+    pool: &SqlitePool,
+    chat_id: &str,
+    branch_id: &str,
+    max_depth: u32,
+) -> Result<Vec<ChatMessage>, StoreError> {
+    let chain = branch_chain(pool, chat_id, branch_id, max_depth).await?;
+    let mut messages = Vec::new();
+    for (index, link) in chain.iter().enumerate() {
+        let upto = chain.get(index + 1).and_then(|child| child.fork_seq);
+        // Только последнее звено (сама ветка) не режется по fork_seq
+        // потомка — им и заканчивается цепочка.
+        let upto = if index + 1 == chain.len() { None } else { upto };
+        messages.extend(branch_messages_upto(pool, &link.id, upto).await?);
+    }
+    Ok(messages)
+}
+
+/// Сообщения чата, отдаваемые по возрастанию `seq`. `branch_id` — явно
+/// запрошенная ветка, `None` — активная ветка чата
+/// (specs/chat-branching, «Чтение истории учитывает ветку»). Ветка без
+/// родителей (обычный случай — единственная ветка чата) читается постранично
+/// как раньше; ветка с предками отдаётся целиком одной страницей — сценарии
+/// ветвления короткие, а постраничный курсор через разные пространства
+/// `seq` родителя и потомка усложнил бы контракт без практической пользы
+/// (design.md, «Non-Goals»).
+pub async fn load_messages(
+    pool: &SqlitePool,
+    chat_id: &str,
+    after: i64,
+    limit: u32,
+    branch_id: Option<&str>,
+    max_branch_depth: u32,
+) -> Result<MessagePage, StoreError> {
+    let target_branch = match branch_id {
+        Some(id) => id.to_string(),
+        None => active_branch_of(pool, chat_id).await?,
+    };
+    let link = load_branch_link(pool, chat_id, &target_branch).await?;
+
+    if link.parent_id.is_none() {
+        // Ветка без родителей: обычная постраничная выдача по seq, как до
+        // появления веток.
+        let fetch_limit = i64::from(limit) + 1;
+        let rows = sqlx::query(
+            "SELECT seq, role, content, reasoning, meta, created_at FROM messages \
+             WHERE branch_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+        )
+        .bind(&target_branch)
+        .bind(after)
+        .bind(fetch_limit)
+        .fetch_all(pool)
+        .await?;
+
+        let mut messages = rows_to_messages(&rows)?;
+        let next_after = if messages.len() > limit as usize {
+            messages.truncate(limit as usize);
+            messages.last().map(|message| message.seq)
+        } else {
+            None
+        };
+
+        return Ok(MessagePage {
+            messages,
+            next_after,
+            branch_id: target_branch,
+        });
+    }
+
+    let messages = load_branch_history(pool, chat_id, &target_branch, max_branch_depth).await?;
+    Ok(MessagePage {
+        messages,
+        next_after: None,
+        branch_id: target_branch,
+    })
+}
+
+async fn active_branch_of(pool: &SqlitePool, chat_id: &str) -> Result<String, StoreError> {
+    sqlx::query_scalar("SELECT active_branch FROM chats WHERE id = ?")
+        .bind(chat_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(StoreError::NotFound)
+}
+
+/// Ветки чата с числом собственных сообщений и признаком активной
+/// (specs/chat-branching, «Ветки перечисляются и переключаются»).
+pub async fn list_branches(pool: &SqlitePool, owner: &str, chat_id: &str) -> Result<Vec<Branch>, StoreError> {
+    let active_branch: Option<String> =
+        sqlx::query_scalar("SELECT active_branch FROM chats WHERE id = ? AND owner = ?")
+            .bind(chat_id)
+            .bind(owner)
+            .fetch_optional(pool)
+            .await?;
+    let active_branch = active_branch.ok_or(StoreError::NotFound)?;
+
+    let rows = sqlx::query(
+        "SELECT b.id, b.chat_id, b.parent_id, b.fork_seq, b.name, b.created_at, \
+                (SELECT COUNT(*) FROM messages m WHERE m.branch_id = b.id) AS message_count \
+         FROM chat_branches b WHERE b.chat_id = ? ORDER BY b.created_at ASC",
+    )
+    .bind(chat_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            let id: String = row.try_get("id")?;
+            Ok(Branch {
+                active: id == active_branch,
+                id,
+                parent_id: row.try_get("parent_id")?,
+                fork_seq: row.try_get("fork_seq")?,
+                name: row.try_get("name")?,
+                message_count: row.try_get("message_count")?,
+            })
+        })
+        .collect()
+}
+
+/// Ветка от указанного сообщения активной ветки чата — точки ветвления.
+/// Сообщение, которого нет в активной ветке, — `StoreError::NotFound`
+/// (specs/chat-branching, «Ветка создаётся от выбранного сообщения»).
+pub async fn create_branch(
+    pool: &SqlitePool,
+    owner: &str,
+    chat_id: &str,
+    from_seq: i64,
+    name: &str,
+) -> Result<Branch, StoreError> {
+    let mut tx = pool.begin().await?;
+
+    let active_branch: Option<String> =
+        sqlx::query_scalar("SELECT active_branch FROM chats WHERE id = ? AND owner = ?")
+            .bind(chat_id)
+            .bind(owner)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let active_branch = match active_branch {
+        Some(branch) => branch,
+        None => {
+            tx.rollback().await?;
+            return Err(StoreError::NotFound);
+        }
     };
 
-    Ok(MessagePage { messages, next_after })
+    let fork_point_exists: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM messages WHERE branch_id = ? AND seq = ?",
+    )
+    .bind(&active_branch)
+    .bind(from_seq)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if fork_point_exists.is_none() {
+        tx.rollback().await?;
+        return Err(StoreError::NotFound);
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_secs();
+    sqlx::query(
+        "INSERT INTO chat_branches (id, chat_id, parent_id, fork_seq, name, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(chat_id)
+    .bind(&active_branch)
+    .bind(from_seq)
+    .bind(name)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(Branch {
+        id,
+        parent_id: Some(active_branch),
+        fork_seq: Some(from_seq),
+        name: name.to_string(),
+        message_count: 0,
+        active: false,
+    })
+}
+
+/// Переключает активную ветку чата. Ветка чужого чата или отсутствующая
+/// ветка — `StoreError::NotFound`.
+pub async fn activate_branch(
+    pool: &SqlitePool,
+    owner: &str,
+    chat_id: &str,
+    branch_id: &str,
+) -> Result<(), StoreError> {
+    let owns_chat: Option<i64> = sqlx::query_scalar("SELECT 1 FROM chats WHERE id = ? AND owner = ?")
+        .bind(chat_id)
+        .bind(owner)
+        .fetch_optional(pool)
+        .await?;
+    if owns_chat.is_none() {
+        return Err(StoreError::NotFound);
+    }
+    let branch_exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM chat_branches WHERE id = ? AND chat_id = ?")
+            .bind(branch_id)
+            .bind(chat_id)
+            .fetch_optional(pool)
+            .await?;
+    if branch_exists.is_none() {
+        return Err(StoreError::NotFound);
+    }
+
+    sqlx::query("UPDATE chats SET active_branch = ?, updated_at = ? WHERE id = ?")
+        .bind(branch_id)
+        .bind(now_secs())
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Факт чата — пара «ключ-значение» стратегии `facts`
+/// (specs/context-facts, «Факты хранятся отдельно от сообщений»).
+#[derive(Debug, Clone)]
+pub struct Fact {
+    pub key: String,
+    pub value: String,
+    pub through_seq: i64,
+    pub updated_at: i64,
+}
+
+/// Все факты чата, в порядке ключа — детерминированный порядок важен для
+/// сборки блока фактов в промпте (specs/context-facts).
+pub async fn load_facts(pool: &SqlitePool, chat_id: &str) -> Result<Vec<Fact>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT key, value, through_seq, updated_at FROM chat_facts WHERE chat_id = ? ORDER BY key ASC",
+    )
+    .bind(chat_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(Fact {
+                key: row.try_get("key")?,
+                value: row.try_get("value")?,
+                through_seq: row.try_get("through_seq")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .collect()
+}
+
+/// Задаёт значение факта, заменяя прежнее у существующего ключа
+/// (specs/context-facts, «Факты читаются и правятся вручную»).
+pub async fn set_fact(
+    pool: &SqlitePool,
+    chat_id: &str,
+    key: &str,
+    value: &str,
+    through_seq: i64,
+) -> Result<Fact, StoreError> {
+    let now = now_secs();
+    sqlx::query(
+        "INSERT INTO chat_facts (chat_id, key, value, through_seq, updated_at) \
+         VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT (chat_id, key) DO UPDATE SET \
+             value = excluded.value, through_seq = excluded.through_seq, updated_at = excluded.updated_at",
+    )
+    .bind(chat_id)
+    .bind(key)
+    .bind(value)
+    .bind(through_seq)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(Fact {
+        key: key.to_string(),
+        value: value.to_string(),
+        through_seq,
+        updated_at: now,
+    })
+}
+
+/// Удаляет факт по ключу. Отсутствующий ключ — `StoreError::NotFound`.
+pub async fn delete_fact(pool: &SqlitePool, chat_id: &str, key: &str) -> Result<(), StoreError> {
+    let result = sqlx::query("DELETE FROM chat_facts WHERE chat_id = ? AND key = ?")
+        .bind(chat_id)
+        .bind(key)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
 }
 
 /// Записывает обмен (сообщение пользователя и ответ модели) одной
@@ -476,18 +879,25 @@ pub async fn append_messages(
 
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
-    let exists = sqlx::query("SELECT 1 FROM chats WHERE id = ? AND owner = ?")
-        .bind(chat_id)
-        .bind(owner)
-        .fetch_optional(&mut *tx)
-        .await?;
-    if exists.is_none() {
-        tx.rollback().await?;
-        return Err(StoreError::NotFound);
-    }
+    let active_branch: Option<String> = sqlx::query_scalar(
+        "SELECT active_branch FROM chats WHERE id = ? AND owner = ?",
+    )
+    .bind(chat_id)
+    .bind(owner)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let active_branch = match active_branch {
+        Some(branch) => branch,
+        None => {
+            tx.rollback().await?;
+            return Err(StoreError::NotFound);
+        }
+    };
 
-    let max_seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM messages WHERE chat_id = ?")
-        .bind(chat_id)
+    // seq растёт внутри ветки, а не всего чата: у новой ветки собственная
+    // нумерация с единицы (design.md, решение 3).
+    let max_seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM messages WHERE branch_id = ?")
+        .bind(&active_branch)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -495,7 +905,7 @@ pub async fn append_messages(
     let mut rows = Vec::with_capacity(messages.len());
     for (offset, message) in messages.iter().enumerate() {
         let seq = max_seq + 1 + offset as i64;
-        rows.push(insert_message(&mut *tx, chat_id, seq, message, now).await?);
+        rows.push(insert_message(&mut *tx, chat_id, &active_branch, seq, message, now).await?);
     }
 
     sqlx::query("UPDATE chats SET updated_at = ? WHERE id = ?")
@@ -563,6 +973,7 @@ pub async fn save_summary(
 async fn insert_message(
     tx: &mut sqlx::SqliteConnection,
     chat_id: &str,
+    branch_id: &str,
     seq: i64,
     message: &NewMessage,
     now: i64,
@@ -576,11 +987,12 @@ async fn insert_message(
         .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать телеметрию: {err}")))?;
 
     sqlx::query(
-        "INSERT INTO messages (id, chat_id, seq, role, content, reasoning, meta, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (id, chat_id, branch_id, seq, role, content, reasoning, meta, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(chat_id)
+    .bind(branch_id)
     .bind(seq)
     .bind(role_to_str(message.role))
     .bind(&message.content)
@@ -791,12 +1203,12 @@ mod tests {
             .expect("обмен");
         }
 
-        let first = load_messages(&pool, &chat.id, 0, 4).await.expect("первая часть");
+        let first = load_messages(&pool, &chat.id, 0, 4, None, 8).await.expect("первая часть");
         assert_eq!(first.messages.len(), 4);
         assert_eq!(first.messages.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
         assert_eq!(first.next_after, Some(4));
 
-        let second = load_messages(&pool, &chat.id, 4, 20)
+        let second = load_messages(&pool, &chat.id, 4, 20, None, 8)
             .await
             .expect("остаток");
         assert_eq!(second.messages.len(), 6);
@@ -839,7 +1251,7 @@ mod tests {
         assert_eq!(user.seq, 1);
         assert_eq!(assistant.seq, 2);
 
-        let loaded = load_messages(&pool, &chat.id, 0, 10).await.expect("чтение");
+        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
         assert_eq!(loaded.messages.len(), 2);
         let stored_assistant = &loaded.messages[1];
         assert_eq!(stored_assistant.reasoning.as_deref(), Some("рассуждение"));
@@ -887,7 +1299,7 @@ mod tests {
 
         assert_eq!(rows.iter().map(|row| row.seq).collect::<Vec<_>>(), vec![1, 2]);
 
-        let loaded = load_messages(&pool, &chat.id, 0, 10).await.expect("чтение");
+        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
         assert_eq!(loaded.messages[0].content, "вопрос");
         assert_eq!(loaded.messages[1].content, "ответ");
         assert_eq!(loaded.messages[1].meta.as_ref().unwrap().duration_ms, Some(42));
@@ -951,7 +1363,7 @@ mod tests {
 
         assert!(matches!(result, Err(StoreError::Backend(_))));
 
-        let loaded = load_messages(&pool, &chat.id, 0, 10).await.expect("чтение");
+        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
         assert!(
             loaded.messages.is_empty(),
             "после отказа на втором сообщении в чате не должно остаться ни одного"
@@ -973,7 +1385,7 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(StoreError::NotFound)));
-        let loaded = load_messages(&pool, &chat.id, 0, 10).await.expect("чтение");
+        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
         assert!(loaded.messages.is_empty());
     }
 
@@ -1014,10 +1426,100 @@ mod tests {
         a.await.expect("задача A").expect("обмен A");
         b.await.expect("задача B").expect("обмен B");
 
-        let page = load_messages(&pool, &chat.id, 0, 10).await.expect("чтение");
+        let page = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
         let mut seqs: Vec<i64> = page.messages.iter().map(|m| m.seq).collect();
         seqs.sort_unstable();
         assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    // --- 3.2 Миграция 0003: перенос старой схемы messages в корневые ветки ---
+
+    #[tokio::test]
+    async fn migration_0003_moves_legacy_messages_into_one_active_root_branch() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let path = dir.path().join("agentd.db");
+        let path_str = path.to_str().expect("путь").to_string();
+
+        // Схема до 0003: применяются только первые две миграции, а третья
+        // не отмечается применённой — так `open_pool` ниже увидит её как
+        // ожидающую, ровно как на боевой базе перед обновлением сервиса.
+        let legacy_dir = dir.path().join("legacy-migrations");
+        std::fs::create_dir_all(&legacy_dir).expect("каталог старых миграций");
+        for name in ["0001_init.sql", "0002_chat_summaries.sql"] {
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations").join(name),
+                legacy_dir.join(name),
+            )
+            .expect("копия старой миграции");
+        }
+
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{path_str}"))
+            .expect("адрес базы")
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let legacy_pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .expect("пул старой схемы");
+        sqlx::migrate::Migrator::new(legacy_dir)
+            .await
+            .expect("загрузка старых миграций")
+            .run(&legacy_pool)
+            .await
+            .expect("применение старых миграций");
+
+        // Данные по старой схеме: chats без active_branch, messages без
+        // branch_id, обычный UNIQUE (chat_id, seq).
+        sqlx::query(
+            "INSERT INTO chats (id, owner, title, settings, created_at, updated_at) \
+             VALUES ('chat-1', 'owner-1', 'Старый чат', '{}', 1000, 1000)",
+        )
+        .execute(&legacy_pool)
+        .await
+        .expect("вставка чата по старой схеме");
+        for seq in 1..=3i64 {
+            sqlx::query(
+                "INSERT INTO messages (id, chat_id, seq, role, content, created_at) \
+                 VALUES (?, 'chat-1', ?, 'user', ?, 1000)",
+            )
+            .bind(format!("msg-{seq}"))
+            .bind(seq)
+            .bind(format!("сообщение {seq}"))
+            .execute(&legacy_pool)
+            .await
+            .expect("вставка сообщения по старой схеме");
+        }
+        legacy_pool.close().await;
+
+        // `open_pool` применяет все миграции крейта, включая 0003.
+        let pool = open_pool(&path_str, 5, 5000).await.expect("применение 0003");
+
+        let branch_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_branches WHERE chat_id = 'chat-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("число веток чата");
+        assert_eq!(branch_count, 1, "чат должен получить ровно одну корневую ветку");
+
+        let active_branch: Option<String> =
+            sqlx::query_scalar("SELECT active_branch FROM chats WHERE id = 'chat-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("активная ветка чата");
+        let active_branch = active_branch.expect("активная ветка задана после миграции");
+
+        let message_branches: Vec<String> = sqlx::query_scalar(
+            "SELECT branch_id FROM messages WHERE chat_id = 'chat-1' ORDER BY seq",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("ветки сообщений");
+        assert_eq!(message_branches.len(), 3, "все сообщения читаются без потерь");
+        assert!(
+            message_branches.iter().all(|b| *b == active_branch),
+            "все сообщения перенесены в активную (корневую) ветку чата"
+        );
     }
 
     // --- 8.1 Миграция chat_summaries применяется при открытии пула ---
@@ -1112,6 +1614,215 @@ mod tests {
         assert_eq!(count, 0, "foreign_keys=ON должен каскадно удалить пересказ");
     }
 
+    // --- 6.1 Хранение фактов ---
+
+    #[tokio::test]
+    async fn facts_of_chat_without_facts_is_empty() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let facts = load_facts(&pool, &chat.id).await.expect("чтение");
+        assert!(facts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_fact_persists_and_overwrites_existing_key() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+
+        set_fact(&pool, &chat.id, "budget", "100000", 3).await.expect("установка");
+        let facts = load_facts(&pool, &chat.id).await.expect("чтение");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].value, "100000");
+
+        set_fact(&pool, &chat.id, "budget", "200000", 7).await.expect("перезапись");
+        let facts = load_facts(&pool, &chat.id).await.expect("чтение");
+        assert_eq!(facts.len(), 1, "перезапись ключа не создаёт вторую запись");
+        assert_eq!(facts[0].value, "200000");
+        assert_eq!(facts[0].through_seq, 7);
+    }
+
+    #[tokio::test]
+    async fn delete_fact_removes_key_and_missing_key_is_not_found() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        set_fact(&pool, &chat.id, "budget", "100000", 1).await.expect("установка");
+
+        delete_fact(&pool, &chat.id, "budget").await.expect("удаление");
+        assert!(load_facts(&pool, &chat.id).await.expect("чтение").is_empty());
+
+        let err = delete_fact(&pool, &chat.id, "budget").await.expect_err("ключа уже нет");
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn deleting_chat_cascades_facts() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        set_fact(&pool, &chat.id, "budget", "100000", 1).await.expect("установка");
+
+        delete_chat(&pool, "owner-1", &chat.id).await.expect("удаление чата");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_facts WHERE chat_id = ?")
+            .bind(&chat.id)
+            .fetch_one(&pool)
+            .await
+            .expect("подсчёт фактов");
+        assert_eq!(count, 0, "foreign_keys=ON должен каскадно удалить факты");
+    }
+
+    // --- 7.1 Ветки: создание, список, активация ---
+
+    #[tokio::test]
+    async fn new_chat_has_one_active_root_branch() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+
+        let branches = list_branches(&pool, "owner-1", &chat.id).await.expect("список веток");
+        assert_eq!(branches.len(), 1);
+        assert!(branches[0].active);
+        assert!(branches[0].parent_id.is_none());
+        assert_eq!(branches[0].id, chat.active_branch);
+    }
+
+    #[tokio::test]
+    async fn branch_created_from_message_and_activated() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        append_exchange(
+            &pool,
+            "owner-1",
+            &chat.id,
+            new_message(Role::User, "вопрос"),
+            new_message(Role::Assistant, "ответ"),
+        )
+        .await
+        .expect("обмен");
+
+        let branch = create_branch(&pool, "owner-1", &chat.id, 1, "альтернатива")
+            .await
+            .expect("создание ветки");
+        assert_eq!(branch.fork_seq, Some(1));
+        assert_eq!(branch.parent_id.as_deref(), Some(chat.active_branch.as_str()));
+
+        activate_branch(&pool, "owner-1", &chat.id, &branch.id)
+            .await
+            .expect("активация");
+        let branches = list_branches(&pool, "owner-1", &chat.id).await.expect("список веток");
+        let active: Vec<_> = branches.iter().filter(|b| b.active).collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, branch.id);
+    }
+
+    #[tokio::test]
+    async fn branch_from_nonexistent_message_is_not_found() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+
+        let err = create_branch(&pool, "owner-1", &chat.id, 99, "ветка")
+            .await
+            .expect_err("сообщения с таким seq нет");
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn two_branches_from_one_point_keep_shared_prefix_and_own_suffix() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        append_exchange(
+            &pool,
+            "owner-1",
+            &chat.id,
+            new_message(Role::User, "общий вопрос"),
+            new_message(Role::Assistant, "общий ответ"),
+        )
+        .await
+        .expect("общий обмен");
+        let root = chat.active_branch.clone();
+
+        let branch_a = create_branch(&pool, "owner-1", &chat.id, 2, "A").await.expect("ветка A");
+        activate_branch(&pool, "owner-1", &chat.id, &branch_a.id).await.expect("активация A");
+        append_messages(
+            &pool,
+            "owner-1",
+            &chat.id,
+            vec![new_message(Role::User, "только в A")],
+        )
+        .await
+        .expect("сообщение в A");
+
+        activate_branch(&pool, "owner-1", &chat.id, &root).await.expect("возврат к root");
+        let branch_b = create_branch(&pool, "owner-1", &chat.id, 2, "B").await.expect("ветка B");
+        activate_branch(&pool, "owner-1", &chat.id, &branch_b.id).await.expect("активация B");
+        append_messages(
+            &pool,
+            "owner-1",
+            &chat.id,
+            vec![new_message(Role::User, "только в B")],
+        )
+        .await
+        .expect("сообщение в B");
+
+        let history_a = load_branch_history(&pool, &chat.id, &branch_a.id, 8).await.expect("история A");
+        let history_b = load_branch_history(&pool, &chat.id, &branch_b.id, 8).await.expect("история B");
+
+        assert!(history_a.iter().any(|m| m.content == "общий вопрос"));
+        assert!(history_a.iter().any(|m| m.content == "только в A"));
+        assert!(!history_a.iter().any(|m| m.content == "только в B"));
+
+        assert!(history_b.iter().any(|m| m.content == "общий вопрос"));
+        assert!(history_b.iter().any(|m| m.content == "только в B"));
+        assert!(!history_b.iter().any(|m| m.content == "только в A"));
+    }
+
+    #[tokio::test]
+    async fn nested_branch_sees_root_and_intermediate_chain() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        append_exchange(
+            &pool,
+            "owner-1",
+            &chat.id,
+            new_message(Role::User, "корневой вопрос"),
+            new_message(Role::Assistant, "корневой ответ"),
+        )
+        .await
+        .expect("корневой обмен");
+
+        let middle = create_branch(&pool, "owner-1", &chat.id, 2, "middle").await.expect("промежуточная ветка");
+        activate_branch(&pool, "owner-1", &chat.id, &middle.id).await.expect("активация middle");
+        append_exchange(
+            &pool,
+            "owner-1",
+            &chat.id,
+            new_message(Role::User, "промежуточный вопрос"),
+            new_message(Role::Assistant, "промежуточный ответ"),
+        )
+        .await
+        .expect("промежуточный обмен");
+
+        let leaf = create_branch(&pool, "owner-1", &chat.id, 2, "leaf").await.expect("вложенная ветка");
+        activate_branch(&pool, "owner-1", &chat.id, &leaf.id).await.expect("активация leaf");
+        append_messages(&pool, "owner-1", &chat.id, vec![new_message(Role::User, "листовое сообщение")])
+            .await
+            .expect("сообщение в leaf");
+
+        let history = load_branch_history(&pool, &chat.id, &leaf.id, 8).await.expect("история leaf");
+        let contents: Vec<&str> = history.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["корневой вопрос", "корневой ответ", "промежуточный вопрос", "промежуточный ответ", "листовое сообщение"],
+        );
+    }
+
     #[tokio::test]
     async fn load_messages_ignores_summary_and_returns_full_history() {
         let (_dir, pool) = temp_pool().await;
@@ -1128,7 +1839,7 @@ mod tests {
         .expect("обмен");
         save_summary(&pool, &chat.id, "пересказ", 1).await.expect("сохранение");
 
-        let page = load_messages(&pool, &chat.id, 0, 10).await.expect("чтение");
+        let page = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
         assert_eq!(page.messages.len(), 2, "пересказ не должен скрывать сообщения");
     }
 

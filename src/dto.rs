@@ -3,7 +3,7 @@
 use crate::store;
 use agentcore::agent::{AgentReply, Message, MessageMeta, Role};
 use agentcore::config::{
-    ChatSettings, Provider, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode,
+    ChatSettings, ContextStrategy, Provider, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode,
 };
 use agentcore::pipeline::PolicyLog;
 use serde::{Deserialize, Serialize};
@@ -127,6 +127,14 @@ pub struct ChatSettingsDto {
     /// `AGENTD_SUMMARY_STEP_MESSAGES` (проверяется в `merge_settings`).
     #[serde(default, deserialize_with = "double_option")]
     pub summary_step_messages: Option<Option<u32>>,
+    /// Стратегия управления контекстом. Разбор и проверка допустимости —
+    /// вне `apply_to`, отдельным шагом с собственными кодами ошибок
+    /// (`context_strategy_invalid`, `context_strategy_not_allowed`), а не
+    /// generic `invalid_request` (specs/context-strategies).
+    #[serde(default, deserialize_with = "double_option")]
+    pub context_strategy: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub context_window_messages: Option<Option<u32>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -249,14 +257,94 @@ pub struct ChatResponse {
     pub context: Option<ContextDto>,
 }
 
-/// Итог компактизации истории на этом запросе.
+/// Что действующая стратегия сделала со сборкой истории этого запроса.
+/// Поля, не имеющие смысла для стратегии, опускаются, а не несут ноль/`false`
+/// (specs/context-strategies, «Ответ сообщает, что сделала стратегия»).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextDto {
-    /// Сколько сохранённых сообщений заменено пересказом в этом запросе.
-    pub replaced_messages: u32,
-    /// Строился ли новый пересказ на этом запросе (иначе — использован
-    /// прежний, если он был).
-    pub summary_built: bool,
+    pub strategy: ContextStrategy,
+    /// Сколько сообщений отправлено провайдеру (`sliding_window`, `facts`,
+    /// `branching`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_messages: Option<u32>,
+    /// Сколько сохранённых сообщений отброшено без замены (`sliding_window`,
+    /// `facts`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_messages: Option<u32>,
+    /// Сколько сохранённых сообщений заменено пересказом (`summary`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_messages: Option<u32>,
+    /// Строился ли новый пересказ на этом запросе (`summary`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_built: Option<bool>,
+    /// Сколько фактов подставлено в запрос (`facts`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts_applied: Option<u32>,
+    /// Обновились ли факты после ответа (`facts`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts_updated: Option<bool>,
+    /// Ветка, из которой собрана история (`branching`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<String>,
+}
+
+impl ContextDto {
+    pub fn for_summary(replaced_messages: u32, summary_built: bool) -> Self {
+        Self {
+            strategy: ContextStrategy::Summary,
+            sent_messages: None,
+            dropped_messages: None,
+            replaced_messages: Some(replaced_messages),
+            summary_built: Some(summary_built),
+            facts_applied: None,
+            facts_updated: None,
+            branch_id: None,
+        }
+    }
+
+    pub fn for_window(sent_messages: u32, dropped_messages: u32) -> Self {
+        Self {
+            strategy: ContextStrategy::SlidingWindow,
+            sent_messages: Some(sent_messages),
+            dropped_messages: Some(dropped_messages),
+            replaced_messages: None,
+            summary_built: None,
+            facts_applied: None,
+            facts_updated: None,
+            branch_id: None,
+        }
+    }
+
+    pub fn for_facts(
+        sent_messages: u32,
+        dropped_messages: u32,
+        facts_applied: u32,
+        facts_updated: bool,
+    ) -> Self {
+        Self {
+            strategy: ContextStrategy::Facts,
+            sent_messages: Some(sent_messages),
+            dropped_messages: Some(dropped_messages),
+            replaced_messages: None,
+            summary_built: None,
+            facts_applied: Some(facts_applied),
+            facts_updated: Some(facts_updated),
+            branch_id: None,
+        }
+    }
+
+    pub fn for_branching(sent_messages: u32, branch_id: String) -> Self {
+        Self {
+            strategy: ContextStrategy::Branching,
+            sent_messages: Some(sent_messages),
+            dropped_messages: None,
+            replaced_messages: None,
+            summary_built: None,
+            facts_applied: None,
+            facts_updated: None,
+            branch_id: Some(branch_id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -529,6 +617,10 @@ pub struct GetChatQuery {
     pub limit: Option<u32>,
     #[serde(default)]
     pub after: Option<i64>,
+    /// Явное указание ветки. `None` — история активной ветки чата
+    /// (specs/chat-branching, «Чтение истории учитывает ветку»).
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -545,4 +637,75 @@ pub struct ChatWithMessagesResponse {
     pub chat: ChatDto,
     pub messages: Vec<MessageView>,
     pub next_after: Option<i64>,
+    /// Ветка, чья история отдана (specs/chat-branching, «Чтение истории
+    /// учитывает ветку»).
+    pub branch_id: String,
+}
+
+// --- Факты (specs/context-facts) ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FactDto {
+    pub key: String,
+    pub value: String,
+    pub through_seq: i64,
+    pub updated_at: i64,
+}
+
+impl From<store::Fact> for FactDto {
+    fn from(fact: store::Fact) -> Self {
+        Self {
+            key: fact.key,
+            value: fact.value,
+            through_seq: fact.through_seq,
+            updated_at: fact.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FactsResponse {
+    pub facts: Vec<FactDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetFactRequest {
+    pub value: String,
+}
+
+// --- Ветки (specs/chat-branching) ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchDto {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub fork_seq: Option<i64>,
+    pub message_count: i64,
+    pub active: bool,
+}
+
+impl From<store::Branch> for BranchDto {
+    fn from(branch: store::Branch) -> Self {
+        Self {
+            id: branch.id,
+            name: branch.name,
+            parent_id: branch.parent_id,
+            fork_seq: branch.fork_seq,
+            message_count: branch.message_count,
+            active: branch.active,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchesResponse {
+    pub branches: Vec<BranchDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateBranchRequest {
+    pub from_seq: i64,
+    #[serde(default)]
+    pub name: Option<String>,
 }

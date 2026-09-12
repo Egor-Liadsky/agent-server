@@ -1,6 +1,7 @@
 //! Конфигурация сервиса. Читается только из переменных окружения:
 //! пользовательский конфиг консольного клиента сервис не трогает.
 
+use agentcore::config::ContextStrategy;
 use anyhow::{bail, Context, Result};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -17,6 +18,13 @@ pub const DEFAULT_DB_BUSY_TIMEOUT_MS: u64 = 5000;
 pub const DEFAULT_SUMMARY_KEEP_MESSAGES: u32 = 20;
 pub const DEFAULT_SUMMARY_STEP_MESSAGES: u32 = 10;
 pub const DEFAULT_SUMMARY_MAX_CHARS: u32 = 4000;
+/// Умолчание стратегии контекста: существующее развёртывание без новых
+/// переменных ведёт себя как до появления стратегий (specs/context-strategies).
+pub const DEFAULT_CONTEXT_STRATEGY: ContextStrategy = ContextStrategy::Summary;
+pub const DEFAULT_CONTEXT_WINDOW_MESSAGES: u32 = 10;
+pub const DEFAULT_MAX_FACTS: u32 = 50;
+pub const DEFAULT_FACT_VALUE_MAX_CHARS: u32 = 500;
+pub const DEFAULT_MAX_BRANCH_DEPTH: u32 = 8;
 
 pub const API_KEY_VAR: &str = "AGENTD_UPSTREAM_API_KEY";
 
@@ -79,6 +87,21 @@ pub struct AgentdConfig {
     pub summary_max_chars: u32,
     /// Модель для построения пересказа. `None` — используется модель чата.
     pub summary_model: Option<String>,
+    /// Стратегия контекста по умолчанию для чатов без явного значения.
+    pub context_strategy: ContextStrategy,
+    /// Стратегии, которые клиент вправе запросить. Пустой список — заданной
+    /// операторской переменной не было, разрешены все.
+    pub allowed_context_strategies: Vec<ContextStrategy>,
+    /// Операторское умолчание размера окна для `sliding_window` и `facts`.
+    pub context_window_messages: u32,
+    /// Потолок числа фактов чата.
+    pub max_facts: u32,
+    /// Потолок длины значения одного факта в символах.
+    pub fact_value_max_chars: u32,
+    /// Модель для обновления фактов. `None` — используется модель чата.
+    pub facts_model: Option<String>,
+    /// Потолок длины цепочки родителей при сборке истории ветки.
+    pub max_branch_depth: u32,
 }
 
 impl AgentdConfig {
@@ -205,7 +228,50 @@ impl AgentdConfig {
                 DEFAULT_SUMMARY_MAX_CHARS,
             )?,
             summary_model: get("AGENTD_SUMMARY_MODEL"),
+            context_strategy: match get("AGENTD_CONTEXT_STRATEGY") {
+                None => DEFAULT_CONTEXT_STRATEGY,
+                Some(value) => ContextStrategy::parse(&value).ok_or_else(|| {
+                    anyhow::anyhow!("AGENTD_CONTEXT_STRATEGY должен быть именем стратегии, задано: {value}")
+                })?,
+            },
+            allowed_context_strategies: match get("AGENTD_ALLOWED_CONTEXT_STRATEGIES") {
+                None => Vec::new(),
+                Some(value) => split_list(&value)
+                    .into_iter()
+                    .map(|name| {
+                        ContextStrategy::parse(&name).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "AGENTD_ALLOWED_CONTEXT_STRATEGIES содержит неизвестную стратегию: {name}"
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            context_window_messages: parse_nonzero(
+                get("AGENTD_CONTEXT_WINDOW_MESSAGES"),
+                "AGENTD_CONTEXT_WINDOW_MESSAGES",
+                DEFAULT_CONTEXT_WINDOW_MESSAGES,
+            )?,
+            max_facts: parse_nonzero(get("AGENTD_MAX_FACTS"), "AGENTD_MAX_FACTS", DEFAULT_MAX_FACTS)?,
+            fact_value_max_chars: parse_nonzero(
+                get("AGENTD_FACT_VALUE_MAX_CHARS"),
+                "AGENTD_FACT_VALUE_MAX_CHARS",
+                DEFAULT_FACT_VALUE_MAX_CHARS,
+            )?,
+            facts_model: get("AGENTD_FACTS_MODEL"),
+            max_branch_depth: parse_nonzero(
+                get("AGENTD_MAX_BRANCH_DEPTH"),
+                "AGENTD_MAX_BRANCH_DEPTH",
+                DEFAULT_MAX_BRANCH_DEPTH,
+            )?,
         })
+    }
+
+    /// Стратегия разрешена, если список операторских ограничений пуст
+    /// (умолчание — разрешены все) либо явно её называет.
+    pub fn is_context_strategy_allowed(&self, strategy: ContextStrategy) -> bool {
+        self.allowed_context_strategies.is_empty()
+            || self.allowed_context_strategies.contains(&strategy)
     }
 
     pub fn is_model_allowed(&self, model: &str) -> bool {
@@ -372,6 +438,7 @@ mod tests {
         assert_eq!(config.summary_step_messages, DEFAULT_SUMMARY_STEP_MESSAGES);
         assert_eq!(config.summary_max_chars, DEFAULT_SUMMARY_MAX_CHARS);
         assert_eq!(config.summary_model, None);
+        assert_eq!(config.context_strategy, DEFAULT_CONTEXT_STRATEGY);
     }
 
     #[test]
@@ -584,6 +651,71 @@ mod tests {
     fn missing_api_key_is_an_error_naming_the_variable() {
         let err = config_from(&[]).expect_err("ожидалась ошибка");
         assert!(format!("{err}").contains(API_KEY_VAR), "получено: {err}");
+    }
+
+    #[test]
+    fn context_strategy_defaults_to_summary() {
+        let config = config_from(&[(API_KEY_VAR, "secret-key-value")]).expect("конфигурация");
+        assert_eq!(config.context_strategy, ContextStrategy::Summary);
+        assert!(config.allowed_context_strategies.is_empty());
+        assert_eq!(config.context_window_messages, DEFAULT_CONTEXT_WINDOW_MESSAGES);
+        assert_eq!(config.max_facts, DEFAULT_MAX_FACTS);
+        assert_eq!(config.fact_value_max_chars, DEFAULT_FACT_VALUE_MAX_CHARS);
+        assert_eq!(config.max_branch_depth, DEFAULT_MAX_BRANCH_DEPTH);
+        assert!(config.is_context_strategy_allowed(ContextStrategy::Branching));
+    }
+
+    #[test]
+    fn context_strategy_variables_are_applied() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_CONTEXT_STRATEGY", "sliding_window"),
+            ("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "summary, sliding_window"),
+            ("AGENTD_CONTEXT_WINDOW_MESSAGES", "6"),
+            ("AGENTD_MAX_FACTS", "20"),
+            ("AGENTD_FACT_VALUE_MAX_CHARS", "200"),
+            ("AGENTD_FACTS_MODEL", "facts-model"),
+            ("AGENTD_MAX_BRANCH_DEPTH", "3"),
+        ])
+        .expect("конфигурация");
+        assert_eq!(config.context_strategy, ContextStrategy::SlidingWindow);
+        assert!(config.is_context_strategy_allowed(ContextStrategy::SlidingWindow));
+        assert!(!config.is_context_strategy_allowed(ContextStrategy::Facts));
+        assert_eq!(config.context_window_messages, 6);
+        assert_eq!(config.max_facts, 20);
+        assert_eq!(config.fact_value_max_chars, 200);
+        assert_eq!(config.facts_model.as_deref(), Some("facts-model"));
+        assert_eq!(config.max_branch_depth, 3);
+    }
+
+    #[test]
+    fn unknown_context_strategy_default_fails_startup() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_CONTEXT_STRATEGY", "magic"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_CONTEXT_STRATEGY"));
+    }
+
+    #[test]
+    fn unknown_allowed_context_strategy_fails_startup() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "summary,magic"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_ALLOWED_CONTEXT_STRATEGIES"));
+    }
+
+    #[test]
+    fn zero_context_window_messages_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_CONTEXT_WINDOW_MESSAGES", "0"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_CONTEXT_WINDOW_MESSAGES"));
     }
 
     #[test]

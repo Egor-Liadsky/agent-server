@@ -1,10 +1,12 @@
 //! Сборка HTTP-приложения: маршруты, слои и обработчики.
 
 use crate::dto::{
-    AppendMessagesRequest, AppendMessagesResponse, ChatDto, ChatRequest, ChatResponse,
-    ChatWithMessagesResponse, CreateChatRequest, GetChatQuery, ListChatsQuery, ListChatsResponse,
-    MessageView, ModelsResponse, UpdateChatRequest,
+    AppendMessagesRequest, AppendMessagesResponse, BranchDto, BranchesResponse, ChatDto, ChatRequest,
+    ChatResponse, ChatWithMessagesResponse, CreateBranchRequest, CreateChatRequest, FactDto,
+    FactsResponse, GetChatQuery, ListChatsQuery, ListChatsResponse, MessageView, ModelsResponse,
+    SetFactRequest, UpdateChatRequest,
 };
+use crate::context;
 use crate::error::ApiError;
 use crate::middleware::{assign_request_id, authenticate, normalize_errors, ClientId, Owner, RequestId};
 use crate::state::AppState;
@@ -159,10 +161,10 @@ fn effective_summary_settings(state: &AppState, settings: &ChatSettings) -> Effe
 /// Итог компактизации: история, которую увидит провайдер, и сведения для
 /// блока `context` в ответе (specs/context-summary, «Наблюдаемость
 /// компактизации»).
-struct CompactionOutcome {
-    history: Vec<Message>,
-    replaced_messages: u32,
-    summary_built: bool,
+pub(crate) struct CompactionOutcome {
+    pub(crate) history: Vec<Message>,
+    pub(crate) replaced_messages: u32,
+    pub(crate) summary_built: bool,
 }
 
 fn history_without_compaction(stored: Vec<store::ChatMessage>, new_message: Message) -> CompactionOutcome {
@@ -179,7 +181,7 @@ fn history_without_compaction(stored: Vec<store::ChatMessage>, new_message: Mess
 /// дословно, старше — пересказом, обновляемым ступенчато. Выполняется до
 /// проверки лимита контекста, чтобы спасать чат от `context_limit_exceeded`
 /// (specs/context-summary; design.md, решения 5-9).
-async fn compact_history(
+pub(crate) async fn compact_history(
     state: &AppState,
     chat_id: &str,
     settings: &ChatSettings,
@@ -364,7 +366,9 @@ fn merge_settings(
     dto: Option<crate::dto::ChatSettingsDto>,
     purpose: SettingsPurpose,
 ) -> Result<ChatSettings, ApiError> {
-    let settings = match dto {
+    let context_strategy_override = dto.as_ref().and_then(|d| d.context_strategy.clone());
+    let context_window_override = dto.as_ref().and_then(|d| d.context_window_messages);
+    let mut settings = match dto {
         Some(dto) => dto.apply_to(base).map_err(ApiError::invalid_request)?,
         None => base,
     };
@@ -374,11 +378,58 @@ fn merge_settings(
     // сохранении настроек чата»; design.md, решение 2).
     effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
     validate_summary_settings(state, &settings)?;
+    apply_context_strategy(state, &mut settings, context_strategy_override, context_window_override)?;
     match purpose {
         SettingsPurpose::Call => validate_settings_for_call(state, &settings)?,
         SettingsPurpose::Storage => validate_settings_for_storage(state, &settings)?,
     }
     Ok(settings)
+}
+
+/// Разбор и проверка `context_strategy`/`context_window_messages`, вне
+/// `ChatSettingsDto::apply_to`: у этих полей собственные коды ошибок
+/// (`context_strategy_invalid`, `context_strategy_not_allowed`,
+/// `context_window_invalid`), а не общий `invalid_request`
+/// (specs/context-strategies, specs/context-sliding-window). Проверяется на
+/// пути и сохранения, и вызова: сохранить запрещённую стратегию, которая
+/// сорвёт каждый следующий запрос, нельзя (design.md, решение 6).
+fn apply_context_strategy(
+    state: &AppState,
+    settings: &mut ChatSettings,
+    strategy_override: Option<Option<String>>,
+    window_override: Option<Option<u32>>,
+) -> Result<(), ApiError> {
+    if let Some(value) = strategy_override {
+        settings.context_strategy = match value {
+            None => None,
+            Some(name) => Some(
+                agentcore::config::ContextStrategy::parse(&name).ok_or_else(|| {
+                    ApiError::context_strategy_invalid(format!("неизвестная стратегия контекста: {name}"))
+                })?,
+            ),
+        };
+    }
+    if let Some(value) = window_override {
+        settings.context_window_messages = value;
+    }
+
+    let effective = context::effective_strategy(state, settings);
+    if !state.config.is_context_strategy_allowed(effective) {
+        return Err(ApiError::context_strategy_not_allowed(format!(
+            "стратегия {} не входит в список стратегий, разрешённых оператором",
+            effective.as_str()
+        )));
+    }
+
+    if let Some(window) = settings.context_window_messages {
+        if window == 0 || window > state.config.context_window_messages {
+            return Err(ApiError::context_window_invalid(format!(
+                "context_window_messages не может быть нулём или превышать операторский потолок {}",
+                state.config.context_window_messages
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Границы клиентских настроек компактизации: клиент может только сузить
@@ -580,28 +631,37 @@ async fn handle_chat_in_existing(
         .clone()
         .unwrap_or_else(|| state.config.model.clone());
 
-    let stored = store::load_messages(&state.db, &chat_id, 0, MAX_HISTORY_MESSAGES)
-        .await
-        .map_err(ApiError::from_store_error)?;
-    let user_message = Message::user(prompt);
-    // Компактизация — до проверки лимита контекста, чтобы спасать чат от
-    // context_limit_exceeded, а не срабатывать после отказа (design.md,
-    // решение 6).
-    let compaction = compact_history(&state, &chat_id, &settings, stored.messages, user_message.clone()).await;
-    let history = compaction.history;
+    let strategy = context::effective_strategy(&state, &settings);
+    let stored = store::load_messages(
+        &state.db,
+        &chat_id,
+        0,
+        MAX_HISTORY_MESSAGES,
+        None,
+        state.config.max_branch_depth,
+    )
+    .await
+    .map_err(ApiError::from_store_error)?;
+    let user_message = Message::user(prompt.clone());
+    // Сборка истории — до проверки лимита контекста, чтобы стратегия успела
+    // спасти чат от context_limit_exceeded, а не сработать после отказа
+    // (design.md, решение 6, распространено на все стратегии решением 7).
+    let mut assembled =
+        context::assemble(&state, &chat, &settings, strategy, stored.messages, user_message.clone()).await;
+    let history = std::mem::take(&mut assembled.history);
 
     let limit = effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
     check_context_limit(&history, limit)?;
 
     let pipeline = Pipeline::new(state.agent.clone());
-    let context = RequestContext::new(request_id.clone(), history, settings);
-    let (reply, policy) = run_pipeline(&pipeline, context, &request_id).await?;
+    let pipeline_context = RequestContext::new(request_id.clone(), history, settings.clone());
+    let (reply, policy) = run_pipeline(&pipeline, pipeline_context, &request_id).await?;
 
     let mut assistant_meta = reply.meta.clone();
     if assistant_meta.model.is_none() {
         assistant_meta.model = reply.model.clone().or_else(|| Some(model.clone()));
     }
-    let (_, assistant_row) = store::append_exchange(
+    let (user_row, assistant_row) = store::append_exchange(
         &state.db,
         &owner,
         &chat_id,
@@ -616,12 +676,18 @@ async fn handle_chat_in_existing(
     .await
     .map_err(ApiError::from_store_error)?;
 
+    // Факты обновляются ПОСЛЕ записи обмена — задерживать ответ пользователю
+    // вторым вызовом модели незачем, а сообщение уже целиком доступно в
+    // хвосте истории (design.md, решение 5).
+    if strategy == agentcore::config::ContextStrategy::Facts {
+        let facts_updated =
+            crate::facts::update_after_exchange(&state, &chat_id, &settings, &prompt, user_row.seq).await;
+        assembled.context.facts_updated = Some(facts_updated);
+    }
+
     Ok(ChatResponse::new(request_id, model, &reply, policy)
         .with_chat(chat_id, assistant_row.seq)
-        .with_context(crate::dto::ContextDto {
-            replaced_messages: compaction.replaced_messages,
-            summary_built: compaction.summary_built,
-        }))
+        .with_context(assembled.context))
 }
 
 async fn run_pipeline(
@@ -746,13 +812,21 @@ async fn handle_get_chat(
     let chat = store::load_chat(&state.db, &owner, &id, &defaults)
         .await
         .map_err(ApiError::from_store_error)?;
-    let page = store::load_messages(&state.db, &id, after, limit)
-        .await
-        .map_err(ApiError::from_store_error)?;
+    let page = store::load_messages(
+        &state.db,
+        &id,
+        after,
+        limit,
+        query.branch.as_deref(),
+        state.config.max_branch_depth,
+    )
+    .await
+    .map_err(ApiError::from_store_error)?;
     Ok(ChatWithMessagesResponse {
         chat: chat_dto_with_summary(&state, chat).await?,
         messages: page.messages.into_iter().map(MessageView::from).collect(),
         next_after: page.next_after,
+        branch_id: page.branch_id,
     })
 }
 
@@ -871,6 +945,182 @@ async fn handle_append_messages(
     })
 }
 
+/// Отказ хранилища вне владения чатом: `NotFound` здесь значит «факта/ветки
+/// нет», а не «чужой или несуществующий чат», поэтому код ответа —
+/// вызывающий сам подставляет уместный (specs/context-facts,
+/// specs/chat-branching).
+fn map_store_error(err: store::StoreError, not_found: ApiError) -> ApiError {
+    match err {
+        store::StoreError::NotFound => not_found,
+        other => ApiError::from_store_error(other),
+    }
+}
+
+// --- Факты (specs/context-facts) ---
+
+async fn get_facts_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+) -> Response {
+    match handle_get_facts(state, owner, id).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_get_facts(state: AppState, owner: String, chat_id: String) -> Result<FactsResponse, ApiError> {
+    let defaults = server_defaults(&state);
+    store::load_chat(&state.db, &owner, &chat_id, &defaults)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    let facts = store::load_facts(&state.db, &chat_id)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(FactsResponse {
+        facts: facts.into_iter().map(FactDto::from).collect(),
+    })
+}
+
+async fn put_fact_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path((id, key)): Path<(String, String)>,
+    Json(body): Json<SetFactRequest>,
+) -> Response {
+    match handle_set_fact(state, owner, id, key, body.value).await {
+        Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_set_fact(
+    state: AppState,
+    owner: String,
+    chat_id: String,
+    key: String,
+    value: String,
+) -> Result<FactDto, ApiError> {
+    let defaults = server_defaults(&state);
+    store::load_chat(&state.db, &owner, &chat_id, &defaults)
+        .await
+        .map_err(ApiError::from_store_error)?;
+
+    if value.chars().count() as u32 > state.config.fact_value_max_chars {
+        return Err(ApiError::facts_limit_exceeded(format!(
+            "значение факта не может превышать {} символов",
+            state.config.fact_value_max_chars
+        )));
+    }
+    let existing = store::load_facts(&state.db, &chat_id)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    let already_exists = existing.iter().any(|fact| fact.key == key);
+    if !already_exists && existing.len() as u32 >= state.config.max_facts {
+        return Err(ApiError::facts_limit_exceeded(format!(
+            "число фактов чата не может превышать операторский потолок {}",
+            state.config.max_facts
+        )));
+    }
+
+    // Ручная правка не привязана к сообщению: through_seq = 0.
+    let fact = store::set_fact(&state.db, &chat_id, &key, &value, 0)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(FactDto::from(fact))
+}
+
+async fn delete_fact_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path((id, key)): Path<(String, String)>,
+) -> Response {
+    match handle_delete_fact(state, owner, id, key).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_delete_fact(state: AppState, owner: String, chat_id: String, key: String) -> Result<(), ApiError> {
+    let defaults = server_defaults(&state);
+    store::load_chat(&state.db, &owner, &chat_id, &defaults)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    store::delete_fact(&state.db, &chat_id, &key)
+        .await
+        .map_err(|err| map_store_error(err, ApiError::fact_not_found()))
+}
+
+// --- Ветки (specs/chat-branching) ---
+
+async fn get_branches_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+) -> Response {
+    match handle_get_branches(state, owner, id).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_get_branches(state: AppState, owner: String, chat_id: String) -> Result<BranchesResponse, ApiError> {
+    let branches = store::list_branches(&state.db, &owner, &chat_id)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(BranchesResponse {
+        branches: branches.into_iter().map(BranchDto::from).collect(),
+    })
+}
+
+async fn create_branch_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+    Json(body): Json<CreateBranchRequest>,
+) -> Response {
+    match handle_create_branch(state, owner, id, body).await {
+        Ok(dto) => (StatusCode::CREATED, Json(dto)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_create_branch(
+    state: AppState,
+    owner: String,
+    chat_id: String,
+    body: CreateBranchRequest,
+) -> Result<BranchDto, ApiError> {
+    let name = body
+        .name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("ветка от {}", body.from_seq));
+    let branch = store::create_branch(&state.db, &owner, &chat_id, body.from_seq, &name)
+        .await
+        .map_err(|err| map_store_error(err, ApiError::chat_not_found()))?;
+    Ok(BranchDto::from(branch))
+}
+
+async fn activate_branch_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path((id, branch_id)): Path<(String, String)>,
+) -> Response {
+    match store::activate_branch(&state.db, &owner, &id, &branch_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => map_store_error(err, ApiError::branch_not_found())
+            .with_request_id(request_id)
+            .into_response(),
+    }
+}
+
 async fn delete_chat_handler(
     State(state): State<AppState>,
     Extension(RequestId(request_id)): Extension<RequestId>,
@@ -911,6 +1161,22 @@ pub fn router(state: AppState) -> Router {
             get(get_chat_handler).patch(patch_chat_handler).delete(delete_chat_handler),
         )
         .route("/chats/{id}/messages", post(append_messages_handler))
+        .route(
+            "/chats/{id}/facts",
+            get(get_facts_handler),
+        )
+        .route(
+            "/chats/{id}/facts/{key}",
+            axum::routing::put(put_fact_handler).delete(delete_fact_handler),
+        )
+        .route(
+            "/chats/{id}/branches",
+            get(get_branches_handler).post(create_branch_handler),
+        )
+        .route(
+            "/chats/{id}/branches/{branch_id}/activate",
+            post(activate_branch_handler),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,

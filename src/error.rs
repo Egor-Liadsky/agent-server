@@ -72,6 +72,45 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "summary_settings_invalid", message)
     }
 
+    /// Неизвестное значение `context_strategy` (specs/context-strategies,
+    /// «Стратегия контекста задаётся настройкой чата»).
+    pub fn context_strategy_invalid(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "context_strategy_invalid", message)
+    }
+
+    /// Стратегия вне операторского списка разрешённых
+    /// (specs/context-strategies, «Операторские умолчание и список
+    /// разрешённых стратегий»).
+    pub fn context_strategy_not_allowed(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "context_strategy_not_allowed",
+            message,
+        )
+    }
+
+    /// `context_window_messages` — ноль либо превышает операторский потолок
+    /// (specs/context-sliding-window, «Размер окна настраивается»).
+    pub fn context_window_invalid(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "context_window_invalid", message)
+    }
+
+    /// Ручная правка факта превышает операторский потолок числа фактов
+    /// (specs/context-facts, «Границы набора фактов»).
+    pub fn facts_limit_exceeded(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "facts_limit_exceeded", message)
+    }
+
+    /// Факт или ветка, которых нет у чата — неотличимо от чужого чата
+    /// (specs/context-facts, specs/chat-branching).
+    pub fn fact_not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "fact_not_found", "факт не найден")
+    }
+
+    pub fn branch_not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "branch_not_found", "ветка не найдена")
+    }
+
     pub fn payload_too_large() -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -220,6 +259,50 @@ impl ApiError {
             }
             Some(AgentError::Unauthorized { .. }) => Self::internal(format!("{err:#}")),
             None => Self::internal(format!("{err:#}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn body_of(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("тело ответа");
+        serde_json::from_slice(&bytes).expect("JSON конверта ошибок")
+    }
+
+    #[tokio::test]
+    async fn new_context_error_codes_produce_expected_envelope() {
+        for (error, expected_status, expected_code) in [
+            (
+                ApiError::context_strategy_invalid("неизвестная стратегия"),
+                StatusCode::BAD_REQUEST,
+                "context_strategy_invalid",
+            ),
+            (
+                ApiError::context_strategy_not_allowed("стратегия запрещена оператором"),
+                StatusCode::BAD_REQUEST,
+                "context_strategy_not_allowed",
+            ),
+            (
+                ApiError::context_window_invalid("окно должно быть положительным"),
+                StatusCode::BAD_REQUEST,
+                "context_window_invalid",
+            ),
+            (
+                ApiError::facts_limit_exceeded("превышен потолок фактов"),
+                StatusCode::BAD_REQUEST,
+                "facts_limit_exceeded",
+            ),
+        ] {
+            let response = error.with_request_id("req-1").into_response();
+            assert_eq!(response.status(), expected_status);
+            let body = body_of(response).await;
+            assert_eq!(body["error"]["code"], expected_code);
+            assert_eq!(body["error"]["request_id"], "req-1");
         }
     }
 }

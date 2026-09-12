@@ -2624,3 +2624,886 @@ async fn chat_without_chat_id_is_never_compacted() {
     let requests = server.received_requests().await.expect("запросы");
     assert_eq!(requests.len(), 1, "без chat_id обращение за пересказом не делается");
 }
+
+// --- 4. Переключатель стратегий контекста ---
+
+async fn create_chat_with_strategy(state: AppState, strategy: &str) -> String {
+    let created = create_chat(
+        state,
+        None,
+        serde_json::json!({ "settings": { "context_strategy": strategy } }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "тело: {}", created.body);
+    created.body["id"].as_str().unwrap().to_string()
+}
+
+// --- 4.2 Одна точка выбора: не-summary стратегия вызывает провайдера один раз ---
+
+#[tokio::test]
+async fn non_summary_strategy_calls_provider_exactly_once() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let id = create_chat_with_strategy(state.clone(), "sliding_window").await;
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["context"]["strategy"], "sliding_window");
+
+    let requests = server.received_requests().await.expect("запросы");
+    assert_eq!(requests.len(), 1, "стратегия без пересказа не делает вспомогательных вызовов");
+}
+
+// --- 4.3 Валидация стратегии на путях сохранения и вызова ---
+
+#[tokio::test]
+async fn unknown_context_strategy_is_rejected_on_create() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(
+        state,
+        None,
+        serde_json::json!({ "settings": { "context_strategy": "magic" } }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(created.body["error"]["code"], "context_strategy_invalid");
+}
+
+#[tokio::test]
+async fn unknown_context_strategy_is_rejected_on_patch() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state,
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "context_strategy": "magic" } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::BAD_REQUEST, "тело: {}", patched.body);
+    assert_eq!(patched.body["error"]["code"], "context_strategy_invalid");
+}
+
+#[tokio::test]
+async fn disallowed_context_strategy_is_rejected_on_call() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    let state = state_with_provider(&server, &[("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "summary")]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "prompt": "вопрос",
+            "settings": { "context_strategy": "facts" }
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "context_strategy_not_allowed");
+}
+
+// --- 4.3 Разовое переопределение не сохраняется ---
+
+#[tokio::test]
+async fn call_override_does_not_persist_context_strategy() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let id = create_chat_with_strategy(state.clone(), "facts").await;
+
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "prompt": "вопрос",
+            "settings": { "context_strategy": "sliding_window" }
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["context"]["strategy"], "sliding_window");
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["settings"]["context_strategy"], "facts");
+}
+
+// --- 4.4 Блок context: поля чужой стратегии не выводятся ---
+
+#[tokio::test]
+async fn context_block_omits_fields_of_other_strategies() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let id = create_chat_with_strategy(state.clone(), "sliding_window").await;
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    let context = &sent.body["context"];
+    assert_eq!(context["strategy"], "sliding_window");
+    assert!(context.get("facts_applied").is_none());
+    assert!(context.get("branch_id").is_none());
+    assert!(context.get("summary_built").is_none());
+}
+
+// --- 4.5 Лимит контекста считается по собранной истории ---
+
+#[tokio::test]
+async fn sliding_window_rescues_chat_from_context_limit_exceeded() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ок")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_MAX_CONTEXT_TOKENS", "3000")]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "context_strategy": "sliding_window", "context_window_messages": 1 } }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "тело: {}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    // Каждое сообщение само под лимитом, но пять таких сообщений вместе — уже
+    // не укладываются в 3000 токенов: окно размером 1 не даёт полной истории
+    // накопиться в запросе, поэтому все пять запросов проходят.
+    let long_message = "слово ".repeat(800);
+    for _ in 0..5 {
+        let sent = send(
+            state.clone(),
+            post_chat(serde_json::json!({ "chat_id": id, "prompt": long_message })),
+        )
+        .await;
+        assert_eq!(
+            sent.status,
+            StatusCode::OK,
+            "окно должно спасти запрос от context_limit_exceeded: {}",
+            sent.body
+        );
+    }
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["message_count"], 10, "вся история чата сохранена, несмотря на окно в запросах");
+}
+
+// --- 5.2 Границы context_window_messages ---
+
+#[tokio::test]
+async fn zero_context_window_messages_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(
+        state,
+        None,
+        serde_json::json!({ "settings": { "context_window_messages": 0 } }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(created.body["error"]["code"], "context_window_invalid");
+}
+
+#[tokio::test]
+async fn context_window_messages_above_operator_ceiling_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_CONTEXT_WINDOW_MESSAGES", "10"),
+    ])
+    .await;
+    let created = create_chat(
+        state,
+        None,
+        serde_json::json!({ "settings": { "context_window_messages": 11 } }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(created.body["error"]["code"], "context_window_invalid");
+}
+
+// --- 5.3 Сквозной запрос: окно 6 из 20 сохранённых сообщений ---
+
+#[tokio::test]
+async fn window_of_six_out_of_twenty_messages_reaches_provider_and_full_history_stays_readable() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "context_strategy": "sliding_window", "context_window_messages": 6 } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let pairs: Vec<(&str, &str)> = (1..=10).map(|_| ("вопрос", "ответ")).collect();
+    seed_exchanges(&state, &id, &pairs).await; // 20 сообщений
+
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "новый вопрос" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["context"]["sent_messages"], 6);
+    assert_eq!(sent.body["context"]["dropped_messages"], 14);
+
+    let requests = server.received_requests().await.expect("запросы");
+    let last = requests.last().expect("запрос к провайдеру");
+    let body: serde_json::Value = serde_json::from_slice(&last.body).expect("тело запроса");
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 7, "6 сообщений окна плюс новое");
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["message_count"], 22, "чтение чата возвращает всю сохранённую историю");
+}
+
+// --- 6.5 Эндпоинты фактов ---
+
+fn facts_uri(chat_id: &str) -> String {
+    format!("/v1/chats/{chat_id}/facts")
+}
+
+fn fact_uri(chat_id: &str, key: &str) -> String {
+    format!("/v1/chats/{chat_id}/facts/{key}")
+}
+
+#[tokio::test]
+async fn fact_can_be_set_read_and_deleted() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let set = send(
+        state.clone(),
+        request("PUT", &fact_uri(&id, "budget"), Some(serde_json::json!({ "value": "200000" })), None),
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::OK, "тело: {}", set.body);
+    assert_eq!(set.body["value"], "200000");
+
+    let listed = send(state.clone(), request("GET", &facts_uri(&id), None, None)).await;
+    assert_eq!(listed.status, StatusCode::OK);
+    let facts = listed.body["facts"].as_array().unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0]["value"], "200000");
+
+    let overwritten = send(
+        state.clone(),
+        request("PUT", &fact_uri(&id, "budget"), Some(serde_json::json!({ "value": "300000" })), None),
+    )
+    .await;
+    assert_eq!(overwritten.body["value"], "300000");
+    let listed = send(state.clone(), request("GET", &facts_uri(&id), None, None)).await;
+    assert_eq!(listed.body["facts"].as_array().unwrap().len(), 1, "перезапись не создаёт вторую запись");
+
+    let deleted = send(state.clone(), request("DELETE", &fact_uri(&id, "budget"), None, None)).await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+    let listed = send(state, request("GET", &facts_uri(&id), None, None)).await;
+    assert!(listed.body["facts"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn deleting_missing_fact_is_404() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let deleted = send(state, request("DELETE", &fact_uri(&id, "missing"), None, None)).await;
+    assert_eq!(deleted.status, StatusCode::NOT_FOUND, "тело: {}", deleted.body);
+    assert_eq!(deleted.body["error"]["code"], "fact_not_found");
+}
+
+#[tokio::test]
+async fn foreign_chat_facts_are_not_exposed() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_CLIENT_TOKENS", "owner-a,owner-b"),
+    ])
+    .await;
+    let created = create_chat(state.clone(), Some("owner-a"), serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    send(
+        state.clone(),
+        request("PUT", &fact_uri(&id, "secret"), Some(serde_json::json!({ "value": "x" })), Some("owner-a")),
+    )
+    .await;
+
+    let foreign = send(state, request("GET", &facts_uri(&id), None, Some("owner-b"))).await;
+    assert_eq!(foreign.status, StatusCode::NOT_FOUND, "тело: {}", foreign.body);
+}
+
+#[tokio::test]
+async fn manual_fact_over_limit_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[(API_KEY_VAR, "secret-key-value"), ("AGENTD_MAX_FACTS", "1")]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    send(
+        state.clone(),
+        request("PUT", &fact_uri(&id, "first"), Some(serde_json::json!({ "value": "a" })), None),
+    )
+    .await;
+
+    let over_limit = send(
+        state,
+        request("PUT", &fact_uri(&id, "second"), Some(serde_json::json!({ "value": "b" })), None),
+    )
+    .await;
+    assert_eq!(over_limit.status, StatusCode::BAD_REQUEST, "тело: {}", over_limit.body);
+    assert_eq!(over_limit.body["error"]["code"], "facts_limit_exceeded");
+}
+
+// --- 6.3 Обновление фактов после обмена ---
+
+#[tokio::test]
+async fn facts_update_failure_does_not_break_main_response() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    // Первый вызов — основной ответ, второй (обновление фактов) — отказ.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("основной ответ")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "context_strategy": "facts" } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "бюджет — 200000" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "основной ответ не должен зависеть от обновления фактов: {}", sent.body);
+    assert_eq!(sent.body["context"]["facts_updated"], false);
+
+    let facts = send(state, request("GET", &facts_uri(&id), None, None)).await;
+    assert!(facts.body["facts"].as_array().unwrap().is_empty(), "факты остаются прежними при отказе обновления");
+}
+
+// --- 7.3 Эндпоинты веток ---
+
+fn branches_uri(chat_id: &str) -> String {
+    format!("/v1/chats/{chat_id}/branches")
+}
+
+#[tokio::test]
+async fn branch_created_listed_and_activated_over_http() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    seed_exchanges(&state, &id, &[("вопрос", "ответ")]).await;
+
+    let branches = send(state.clone(), request("GET", &branches_uri(&id), None, None)).await;
+    assert_eq!(branches.status, StatusCode::OK, "тело: {}", branches.body);
+    assert_eq!(branches.body["branches"].as_array().unwrap().len(), 1);
+
+    let created_branch = send(
+        state.clone(),
+        request(
+            "POST",
+            &branches_uri(&id),
+            Some(serde_json::json!({ "from_seq": 1, "name": "альтернатива" })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(created_branch.status, StatusCode::CREATED, "тело: {}", created_branch.body);
+    let branch_id = created_branch.body["id"].as_str().unwrap().to_string();
+
+    let activated = send(
+        state.clone(),
+        request("POST", &format!("{}/{branch_id}/activate", branches_uri(&id)), None, None),
+    )
+    .await;
+    assert_eq!(activated.status, StatusCode::NO_CONTENT, "тело: {}", activated.body);
+
+    let branches = send(state, request("GET", &branches_uri(&id), None, None)).await;
+    let list = branches.body["branches"].as_array().unwrap();
+    let active: Vec<_> = list.iter().filter(|b| b["active"] == true).collect();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0]["id"], branch_id);
+}
+
+#[tokio::test]
+async fn branch_from_nonexistent_message_is_404_over_http() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(
+        state,
+        request(
+            "POST",
+            &branches_uri(&id),
+            Some(serde_json::json!({ "from_seq": 99, "name": "ветка" })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::NOT_FOUND, "тело: {}", sent.body);
+}
+
+#[tokio::test]
+async fn branch_operations_on_foreign_chat_are_404() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_CLIENT_TOKENS", "owner-a,owner-b"),
+    ])
+    .await;
+    let created = create_chat(state.clone(), Some("owner-a"), serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let appended = send(
+        state.clone(),
+        append(
+            &id,
+            serde_json::json!({
+                "messages": [
+                    { "role": "user", "content": "вопрос" },
+                    { "role": "assistant", "content": "ответ" }
+                ]
+            }),
+            Some("owner-a"),
+        ),
+    )
+    .await;
+    assert_eq!(appended.status, StatusCode::CREATED, "подготовка истории: {}", appended.body);
+
+    let list = send(state.clone(), request("GET", &branches_uri(&id), None, Some("owner-b"))).await;
+    assert_eq!(list.status, StatusCode::NOT_FOUND, "тело: {}", list.body);
+
+    let create = send(
+        state.clone(),
+        request(
+            "POST",
+            &branches_uri(&id),
+            Some(serde_json::json!({ "from_seq": 1, "name": "ветка" })),
+            Some("owner-b"),
+        ),
+    )
+    .await;
+    assert_eq!(create.status, StatusCode::NOT_FOUND, "тело: {}", create.body);
+
+    let activate = send(
+        state,
+        request("POST", &format!("{}/whatever/activate", branches_uri(&id)), None, Some("owner-b")),
+    )
+    .await;
+    assert_eq!(activate.status, StatusCode::NOT_FOUND, "тело: {}", activate.body);
+}
+
+// --- 7.4 Чтение чата с указанием ветки ---
+
+#[tokio::test]
+async fn reading_explicit_branch_does_not_change_active_branch() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    seed_exchanges(&state, &id, &[("общий вопрос", "общий ответ")]).await;
+
+    let root_branch_id = send(state.clone(), request("GET", &format!("/v1/chats/{id}"), None, None))
+        .await
+        .body["branch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let created_branch = send(
+        state.clone(),
+        request(
+            "POST",
+            &branches_uri(&id),
+            Some(serde_json::json!({ "from_seq": 2, "name": "вторая" })),
+            None,
+        ),
+    )
+    .await;
+    let branch_id = created_branch.body["id"].as_str().unwrap().to_string();
+    send(
+        state.clone(),
+        request("POST", &format!("{}/{branch_id}/activate", branches_uri(&id)), None, None),
+    )
+    .await;
+
+    let explicit = send(
+        state.clone(),
+        request("GET", &format!("/v1/chats/{id}?branch={root_branch_id}"), None, None),
+    )
+    .await;
+    assert_eq!(explicit.body["branch_id"], root_branch_id);
+
+    let default_read = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(
+        default_read.body["branch_id"], branch_id,
+        "явное указание ветки не переключает активную ветку чата"
+    );
+}
+
+// --- 7.5 Независимость веток при сборке контекста ---
+
+#[tokio::test]
+async fn branching_strategy_keeps_sibling_branches_independent() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "context_strategy": "branching" } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    seed_exchanges(&state, &id, &[("общий вопрос", "общий ответ")]).await;
+    let root_branch_id = send(state.clone(), request("GET", &format!("/v1/chats/{id}"), None, None))
+        .await
+        .body["branch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let branch_a = send(
+        state.clone(),
+        request("POST", &branches_uri(&id), Some(serde_json::json!({ "from_seq": 2, "name": "A" })), None),
+    )
+    .await;
+    let branch_a_id = branch_a.body["id"].as_str().unwrap().to_string();
+    send(
+        state.clone(),
+        request("POST", &format!("{}/{branch_a_id}/activate", branches_uri(&id)), None, None),
+    )
+    .await;
+    send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "только в ветке A" })),
+    )
+    .await;
+
+    send(
+        state.clone(),
+        request("POST", &format!("{}/{root_branch_id}/activate", branches_uri(&id)), None, None),
+    )
+    .await;
+
+    let branch_b = send(
+        state.clone(),
+        request("POST", &branches_uri(&id), Some(serde_json::json!({ "from_seq": 2, "name": "B" })), None),
+    )
+    .await;
+    let branch_b_id = branch_b.body["id"].as_str().unwrap().to_string();
+    send(
+        state.clone(),
+        request("POST", &format!("{}/{branch_b_id}/activate", branches_uri(&id)), None, None),
+    )
+    .await;
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос о ветке A" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+
+    let requests = server.received_requests().await.expect("запросы");
+    let last = requests.last().expect("запрос к провайдеру");
+    let body = String::from_utf8_lossy(&last.body);
+    assert!(!body.contains("только в ветке A"), "сообщения соседней ветки не должны попасть в запрос: {body}");
+}
+
+// --- 9.1/9.2 Сравнение стратегий: сценарий сбора ТЗ против wiremock ---
+//
+// Сценарий (`tests/data/context-scenario.json`) — один и тот же для всех
+// стратегий и для ручного прогона против живой модели (9.3), поэтому цифры
+// в отчёте сравнимы (specs/context-strategy-comparison, «Один сценарий
+// прогоняется на всех стратегиях»).
+
+struct Scenario {
+    messages: Vec<String>,
+    control_answer_contains: Vec<String>,
+}
+
+fn load_scenario() -> Scenario {
+    let raw = include_str!("../tests/data/context-scenario.json");
+    let value: serde_json::Value = serde_json::from_str(raw).expect("сценарий разобран");
+    Scenario {
+        messages: value["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m.as_str().expect("строка сообщения").to_string())
+            .collect(),
+        control_answer_contains: value["control_answer_contains"]
+            .as_array()
+            .expect("control_answer_contains")
+            .iter()
+            .map(|s| s.as_str().expect("строка варианта ответа").to_string())
+            .collect(),
+    }
+}
+
+/// Деталь контрольного вопроса присутствует в теле последнего запроса к
+/// провайдеру — прокси для «модель могла бы ответить верно», не требующий
+/// живой модели (specs/context-strategy-comparison, «Прогон измеряет...
+/// удержание деталей»).
+fn last_request_contains_detail(requests: &[wiremock::Request], scenario: &Scenario) -> bool {
+    let last = requests.last().expect("хотя бы один запрос к провайдеру");
+    let body = String::from_utf8_lossy(&last.body);
+    scenario.control_answer_contains.iter().any(|needle| body.contains(needle))
+}
+
+#[tokio::test]
+async fn scenario_on_summary_strategy_keeps_detail_via_summary_text() {
+    let _guard = test_lock();
+    let scenario = load_scenario();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply(
+            "Пересказ: бюджет проекта 250000 рублей, дедлайн конец квартала, каналы — Telegram и email.",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(
+        &server,
+        &[("AGENTD_SUMMARY_ENABLED", "true"), ("AGENTD_SUMMARY_KEEP_MESSAGES", "4"), ("AGENTD_SUMMARY_STEP_MESSAGES", "1")],
+    )
+    .await;
+    let created = create_chat_with_strategy(state.clone(), "summary").await;
+
+    for message in &scenario.messages {
+        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": message }))).await;
+        assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    }
+
+    let requests: Vec<_> = server
+        .received_requests()
+        .await
+        .expect("запросы")
+        .into_iter()
+        .filter(|r| !String::from_utf8_lossy(&r.body).contains(SUMMARY_CALL_MARKER))
+        .collect();
+    assert!(
+        last_request_contains_detail(&requests, &scenario),
+        "пересказ должен донести деталь из первого сообщения до контрольного вопроса"
+    );
+}
+
+#[tokio::test]
+async fn scenario_on_sliding_window_strategy_loses_early_detail() {
+    let _guard = test_lock();
+    let scenario = load_scenario();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_CONTEXT_WINDOW_MESSAGES", "4")]).await;
+    let created = create_chat_with_strategy(state.clone(), "sliding_window").await;
+
+    for message in &scenario.messages {
+        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": message }))).await;
+        assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    }
+
+    let requests = server.received_requests().await.expect("запросы");
+    assert!(
+        !last_request_contains_detail(&requests, &scenario),
+        "узкое окно без пересказа не может донести вытесненную деталь"
+    );
+}
+
+#[tokio::test]
+async fn scenario_on_facts_strategy_keeps_detail_via_fact() {
+    let _guard = test_lock();
+    let scenario = load_scenario();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(crate::facts::FACTS_UPDATE_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply(
+            r#"[{"op":"set","key":"budget","value":"250000 рублей"}]"#,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(crate::facts::FACTS_UPDATE_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_CONTEXT_WINDOW_MESSAGES", "4")]).await;
+    let created = create_chat_with_strategy(state.clone(), "facts").await;
+
+    for message in &scenario.messages {
+        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": message }))).await;
+        assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    }
+
+    let requests: Vec<_> = server
+        .received_requests()
+        .await
+        .expect("запросы")
+        .into_iter()
+        .filter(|r| !String::from_utf8_lossy(&r.body).contains(crate::facts::FACTS_UPDATE_MARKER))
+        .collect();
+    assert!(
+        last_request_contains_detail(&requests, &scenario),
+        "устойчивый факт должен донести деталь из первого сообщения до контрольного вопроса"
+    );
+}
+
+#[tokio::test]
+async fn scenario_on_branching_strategy_checkpoints_and_switches() {
+    let _guard = test_lock();
+    let scenario = load_scenario();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat_with_strategy(state.clone(), "branching").await;
+
+    // Первая половина сценария — общий ствол диалога (checkpoint).
+    let midpoint = scenario.messages.len() / 2;
+    for message in &scenario.messages[..midpoint] {
+        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": message }))).await;
+        assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    }
+    let checkpoint_seq = send(state.clone(), request("GET", &format!("/v1/chats/{created}"), None, None))
+        .await
+        .body["message_count"]
+        .as_i64()
+        .unwrap();
+    let root_branch_id = send(state.clone(), request("GET", &format!("/v1/chats/{created}"), None, None))
+        .await
+        .body["branch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let branch_a = send(
+        state.clone(),
+        request(
+            "POST",
+            &branches_uri(&created),
+            Some(serde_json::json!({ "from_seq": checkpoint_seq, "name": "вариант A" })),
+            None,
+        ),
+    )
+    .await;
+    let branch_a_id = branch_a.body["id"].as_str().unwrap().to_string();
+    send(state.clone(), request("POST", &format!("{}/{branch_a_id}/activate", branches_uri(&created)), None, None)).await;
+    for message in &scenario.messages[midpoint..] {
+        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": format!("[A] {message}") }))).await;
+        assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    }
+
+    send(state.clone(), request("POST", &format!("{}/{root_branch_id}/activate", branches_uri(&created)), None, None)).await;
+    let branch_b = send(
+        state.clone(),
+        request(
+            "POST",
+            &branches_uri(&created),
+            Some(serde_json::json!({ "from_seq": checkpoint_seq, "name": "вариант B" })),
+            None,
+        ),
+    )
+    .await;
+    let branch_b_id = branch_b.body["id"].as_str().unwrap().to_string();
+    send(state.clone(), request("POST", &format!("{}/{branch_b_id}/activate", branches_uri(&created)), None, None)).await;
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")))
+        .mount(&server)
+        .await;
+    for message in &scenario.messages[midpoint..] {
+        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": format!("[B] {message}") }))).await;
+        assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    }
+
+    let requests = server.received_requests().await.expect("запросы после переключения на B");
+    let last = requests.last().expect("запрос к провайдеру");
+    let body = String::from_utf8_lossy(&last.body);
+    assert!(!body.contains("[A]"), "ветка B не должна видеть сообщения ветки A: {body}");
+    assert!(body.contains("[B]"), "ветка B должна видеть собственные сообщения: {body}");
+}
