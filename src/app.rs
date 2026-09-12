@@ -80,7 +80,7 @@ fn contains_api_key(value: &serde_json::Value) -> bool {
 }
 
 /// Приближённая оценка размера истории в токенах: точного токенизатора
-/// провайдера (`deepseek-chat` через `agentupstream`, либо Ollama) у сервиса
+/// провайдера (`deepseek-v4-flash`/`deepseek-v4-pro` через `agentupstream`, либо Ollama) у сервиса
 /// нет, поэтому размер оценивается по длине текста, а не подсчитывается
 /// точно (design.md, решение «Оценка размера — по длине текста»).
 fn estimate_tokens(history: &[Message]) -> u32 {

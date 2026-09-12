@@ -37,6 +37,10 @@ pub fn log_exchange(record: ExchangeRecord<'_>) {
 
 /// Подписчик по конфигурации сервиса. Ключ провайдера в стартовой записи —
 /// только маскированный.
+///
+/// Текстовый формат получает цвет и компактную раскладку (для человека в
+/// терминале); JSON остаётся машинным без косметики, чтобы не ломать
+/// парсинг агрегаторами логов.
 pub fn init(config: &AgentdConfig) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     match (config.log_format, config.log_target) {
@@ -49,19 +53,25 @@ pub fn init(config: &AgentdConfig) {
             .with_writer(std::io::stderr)
             .with_env_filter(filter)
             .init(),
-        (LogFormat::Text, LogTarget::Stdout) => {
-            tracing_subscriber::fmt().with_env_filter(filter).init()
-        }
+        (LogFormat::Text, LogTarget::Stdout) => tracing_subscriber::fmt()
+            .compact()
+            .with_target(false)
+            .with_env_filter(filter)
+            .init(),
         (LogFormat::Text, LogTarget::Stderr) => tracing_subscriber::fmt()
+            .compact()
+            .with_target(false)
             .with_writer(std::io::stderr)
             .with_env_filter(filter)
             .init(),
     }
 
+    print_banner(config);
+
     tracing::info!(
         listen_addr = %config.listen_addr,
         model = %config.model,
-        allowed_models = ?config.allowed_models,
+        allowed_models = %config.allowed_models.join(", "),
         api_key = %config.masked_api_key(),
         log_content = config.log_content,
         "конфигурация сервиса"
@@ -71,6 +81,50 @@ pub fn init(config: &AgentdConfig) {
             "список клиентских токенов пуст: сервис принимает запросы без аутентификации"
         );
     }
+}
+
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const CYAN: &str = "\x1b[36m";
+const YELLOW: &str = "\x1b[33m";
+const GREEN: &str = "\x1b[32m";
+const RESET: &str = "\x1b[0m";
+
+/// Стартовый баннер для человека в терминале. Пишется отдельно от журнала
+/// (`eprintln`, не `tracing`), чтобы не мешать разбору JSON-строк и не
+/// зависеть от уровня фильтра. Цвет включается только на TTY.
+fn print_banner(config: &AgentdConfig) {
+    let color = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let paint = |code: &str, text: &str| -> String {
+        if color {
+            format!("{code}{text}{RESET}")
+        } else {
+            text.to_string()
+        }
+    };
+
+    let auth = if config.client_tokens.is_empty() {
+        paint(YELLOW, "выключена")
+    } else {
+        paint(GREEN, "включена")
+    };
+
+    eprintln!();
+    eprintln!(
+        "  {} {}",
+        paint(BOLD, "agentd"),
+        paint(DIM, concat!("v", env!("CARGO_PKG_VERSION")))
+    );
+    eprintln!("  {} {}", paint(DIM, "адрес:"), paint(CYAN, &config.listen_addr.to_string()));
+    eprintln!("  {} {}", paint(DIM, "модель:"), paint(CYAN, &config.model));
+    eprintln!("  {} {auth}", paint(DIM, "аутентификация:"));
+    eprintln!(
+        "  {} {}/{}",
+        paint(DIM, "журнал:"),
+        format!("{:?}", config.log_format).to_lowercase(),
+        format!("{:?}", config.log_target).to_lowercase()
+    );
+    eprintln!();
 }
 
 /// Перехват журнала для тестов: подписчик пишет в буфер, а тест читает из

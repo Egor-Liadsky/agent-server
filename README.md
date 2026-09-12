@@ -35,7 +35,7 @@ git-зависимостью. Оттуда же подключается `agentu
 | `AGENTD_LISTEN_ADDR`         | `0.0.0.0:8080`            | Адрес прослушивания целиком |
 | `PORT`                       | —                         | Порт, если `AGENTD_LISTEN_ADDR` не задан (хостинги задают его сами) |
 | `AGENTD_UPSTREAM_BASE_URL`   | `https://api.deepseek.com`| Базовый адрес OpenAI-совместимого API |
-| `AGENTD_MODEL`               | `deepseek-chat`           | Модель по умолчанию |
+| `AGENTD_MODEL`               | `deepseek-v4-flash`           | Модель по умолчанию |
 | `AGENTD_ALLOWED_MODELS`      | пусто                     | Список моделей через запятую. Пусто — разрешена только `AGENTD_MODEL` |
 | `AGENTD_OLLAMA_URL`          | —                         | Адрес локального Ollama. Не задан — `provider: "ollama"` в запросе отклоняется |
 | `AGENTD_CLIENT_TOKENS`       | пусто                     | Клиентские токены через запятую. Пусто — аутентификация выключена |
@@ -79,7 +79,7 @@ git-зависимостью. Оттуда же подключается `agentu
 
 ```bash
 AGENTD_UPSTREAM_API_KEY=sk-... \
-AGENTD_MODEL=deepseek-chat \
+AGENTD_MODEL=deepseek-v4-flash \
 PORT=8080 \
 cargo run --release
 ```
@@ -99,7 +99,7 @@ curl -sS -X POST http://127.0.0.1:8080/v1/chat \
   "request_id": "0f0f…",
   "content": "Привет! Чем помочь?",
   "reasoning": null,
-  "model": "deepseek-chat",
+  "model": "deepseek-v4-flash",
   "usage": { "prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18, "reasoning_tokens": null },
   "timing": { "duration_ms": 812, "sent_at": 1788976567, "received_at": 1788976568 },
   "policy": { "input": [], "output": [], "judge": null }
