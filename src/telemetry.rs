@@ -1,7 +1,40 @@
 //! Журнал сервиса: настройка подписчика и запись об одном обмене.
 
 use crate::config::{AgentdConfig, LogFormat, LogTarget};
+use agentcore::logging::{ExchangeKind, ExchangeSink};
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::EnvFilter;
+
+/// Цели записей отладки: по ним фильтр `RUST_LOG` включает или гасит
+/// отдельно обмен с клиентом и обмен с провайдером.
+pub const API_TARGET: &str = "agentd::api";
+pub const UPSTREAM_TARGET: &str = "agentd::upstream";
+
+/// Человекочитаемый JSON для отладочных записей. При сбое сериализации
+/// возвращается компактная запись: диагностика не должна падать.
+pub fn pretty(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Приёмник обмена с провайдером: сырые тела запроса и ответа уходят в журнал
+/// сервиса. Файлов JSONL внутри контейнера нет, поэтому вместо директории
+/// ядру отдаётся этот приёмник.
+pub struct TracingExchangeSink;
+
+impl ExchangeSink for TracingExchangeSink {
+    fn record(&self, kind: ExchangeKind, entry: &serde_json::Value) {
+        let direction = match kind {
+            ExchangeKind::Request => "запрос провайдеру",
+            ExchangeKind::Response => "ответ провайдера",
+        };
+        tracing::debug!(
+            target: UPSTREAM_TARGET,
+            id = entry.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+            payload = %pretty(entry),
+            "{direction}"
+        );
+    }
+}
 
 /// Что попадает в журнал по каждому запросу. Тексты промпта и ответа
 /// заполняются только при включённом признаке записи содержимого.
@@ -42,28 +75,21 @@ pub fn log_exchange(record: ExchangeRecord<'_>) {
 /// терминале); JSON остаётся машинным без косметики, чтобы не ломать
 /// парсинг агрегаторами логов.
 pub fn init(config: &AgentdConfig) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    match (config.log_format, config.log_target) {
-        (LogFormat::Json, LogTarget::Stdout) => tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .init(),
-        (LogFormat::Json, LogTarget::Stderr) => tracing_subscriber::fmt()
-            .json()
-            .with_writer(std::io::stderr)
-            .with_env_filter(filter)
-            .init(),
-        (LogFormat::Text, LogTarget::Stdout) => tracing_subscriber::fmt()
-            .compact()
-            .with_target(false)
-            .with_env_filter(filter)
-            .init(),
-        (LogFormat::Text, LogTarget::Stderr) => tracing_subscriber::fmt()
-            .compact()
-            .with_target(false)
-            .with_writer(std::io::stderr)
-            .with_env_filter(filter)
-            .init(),
+    // `RUST_LOG` сильнее дебага: точечную настройку уровней он не отменяет.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_filter(config.debug)));
+    let writer = match config.log_target {
+        LogTarget::Stdout => BoxMakeWriter::new(std::io::stdout),
+        LogTarget::Stderr => BoxMakeWriter::new(std::io::stderr),
+    };
+    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_writer(writer);
+    match (config.log_format, config.debug) {
+        (LogFormat::Json, _) => builder.json().init(),
+        // В отладке компактная раскладка не годится: она повторяет поля
+        // спана в хвосте каждой записи, и многострочный JSON тонет между
+        // ними. Полный формат печатает их один раз в заголовке спана.
+        (LogFormat::Text, true) => builder.with_target(false).init(),
+        (LogFormat::Text, false) => builder.compact().with_target(false).init(),
     }
 
     print_banner(config);
@@ -80,6 +106,23 @@ pub fn init(config: &AgentdConfig) {
         tracing::warn!(
             "список клиентских токенов пуст: сервис принимает запросы без аутентификации"
         );
+    }
+    if config.debug {
+        tracing::warn!(
+            "режим отладки: в журнал попадают тела запросов и ответов, включая тексты \
+             промптов и ответов модели — не включать на рабочем стенде"
+        );
+    }
+}
+
+/// Фильтр по умолчанию. В дебаге поднимается уровень сервиса и HTTP-слоя, но
+/// шумные библиотеки остаются на своих уровнях: иначе полезные записи тонут
+/// в трассировке соединений и SQL.
+fn default_filter(debug: bool) -> &'static str {
+    if debug {
+        "debug,hyper=info,hyper_util=info,reqwest=info,sqlx=warn,h2=info"
+    } else {
+        "info"
     }
 }
 
@@ -124,6 +167,9 @@ fn print_banner(config: &AgentdConfig) {
         format!("{:?}", config.log_format).to_lowercase(),
         format!("{:?}", config.log_target).to_lowercase()
     );
+    if config.debug {
+        eprintln!("  {} {}", paint(DIM, "режим:"), paint(YELLOW, "отладка"));
+    }
     eprintln!();
 }
 

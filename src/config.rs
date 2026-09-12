@@ -54,6 +54,10 @@ pub struct AgentdConfig {
     pub log_target: LogTarget,
     /// Писать ли в журнал тексты промптов и ответов.
     pub log_content: bool,
+    /// Режим отладки: подробный журнал в консоль и читаемый JSON обоих
+    /// уровней обмена. Меняет только умолчания `AGENTD_LOG_*`, явно заданные
+    /// значения сильнее.
+    pub debug: bool,
     /// Путь к файлу базы SQLite.
     pub db_path: String,
     pub db_max_connections: u32,
@@ -105,6 +109,9 @@ impl AgentdConfig {
             },
         };
 
+        // Читается до остальных полей журнала: дебаг сдвигает их умолчания.
+        let debug = parse_bool_named(get("AGENTD_DEBUG"), "AGENTD_DEBUG")?;
+
         let model = get("AGENTD_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
         // Пустой список означает «разрешена только модель по умолчанию»:
         // иначе клиент направлял бы трафик на любую модель провайдера.
@@ -144,7 +151,10 @@ impl AgentdConfig {
                 "AGENTD_MAX_CONCURRENCY",
                 DEFAULT_MAX_CONCURRENCY,
             )?,
+            // В дебаге умолчание — текстовый формат: JSON-строки в консоли
+            // читать неудобно, а машинный разбор при отладке не нужен.
             log_format: match get("AGENTD_LOG_FORMAT").as_deref() {
+                None if debug => LogFormat::Text,
                 None | Some("json") => LogFormat::Json,
                 Some("text") => LogFormat::Text,
                 Some(other) => bail!("AGENTD_LOG_FORMAT должен быть json или text, задано: {other}"),
@@ -156,7 +166,13 @@ impl AgentdConfig {
                     bail!("AGENTD_LOG_TARGET должен быть stdout или stderr, задано: {other}")
                 }
             },
-            log_content: parse_bool(get("AGENTD_LOG_CONTENT"))?,
+            // Отладка без текстов промптов и ответов бессмысленна, поэтому в
+            // дебаге содержимое пишется, пока переменная не запретит явно.
+            log_content: match get("AGENTD_LOG_CONTENT") {
+                None => debug,
+                value => parse_bool(value)?,
+            },
+            debug,
             db_path: get("AGENTD_DB_PATH").unwrap_or_else(|| DEFAULT_DB_PATH.to_string()),
             db_max_connections: parse_nonzero(
                 get("AGENTD_DB_MAX_CONNECTIONS"),
@@ -310,6 +326,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn debug_shifts_log_defaults() {
+        let config = config_from(&[(API_KEY_VAR, "secret-key-value"), ("AGENTD_DEBUG", "true")])
+            .expect("конфигурация");
+        assert!(config.debug);
+        assert_eq!(config.log_format, LogFormat::Text);
+        assert!(config.log_content);
+    }
+
+    #[test]
+    fn explicit_log_settings_win_over_debug() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_DEBUG", "true"),
+            ("AGENTD_LOG_FORMAT", "json"),
+            ("AGENTD_LOG_CONTENT", "false"),
+        ])
+        .expect("конфигурация");
+        assert!(config.debug);
+        assert_eq!(config.log_format, LogFormat::Json);
+        assert!(!config.log_content);
+    }
+
+    #[test]
     fn defaults_are_applied() {
         let config = config_from(&[(API_KEY_VAR, "secret-key-value")]).expect("конфигурация");
         assert_eq!(config.listen_addr.to_string(), DEFAULT_LISTEN_ADDR);
@@ -323,6 +362,7 @@ mod tests {
         assert_eq!(config.log_format, LogFormat::Json);
         assert_eq!(config.log_target, LogTarget::Stdout);
         assert!(!config.log_content);
+        assert!(!config.debug);
         assert_eq!(config.db_path, DEFAULT_DB_PATH);
         assert_eq!(config.db_max_connections, DEFAULT_DB_MAX_CONNECTIONS);
         assert_eq!(config.db_busy_timeout_ms, DEFAULT_DB_BUSY_TIMEOUT_MS);

@@ -1997,6 +1997,71 @@ fn append_log_records_counts_without_message_text() {
     );
 }
 
+// --- Режим отладки ---
+
+/// Прогоняет один `/v1/chat` через провайдера на `wiremock` с заданными
+/// переменными окружения и возвращает текст перехваченного журнала.
+fn captured_chat_log(extra: &[(&str, &str)]) -> String {
+    let capture = crate::telemetry::capture::Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(capture.clone())
+        .finish();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    // Подписчик задаётся на текущий поток, поэтому исполнение однопоточное:
+    // иначе записи ушли бы мимо перехвата.
+    tracing::subscriber::with_default(subscriber, || {
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")),
+                )
+                .mount(&server)
+                .await;
+            let state = state_with_provider(&server, extra).await;
+            let sent = send(
+                state,
+                post_chat(serde_json::json!({ "prompt": "секретный вопрос" })),
+            )
+            .await;
+            assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+        })
+    });
+
+    capture.text()
+}
+
+#[test]
+fn debug_logs_api_and_upstream_bodies() {
+    let _guard = test_lock();
+    let output = captured_chat_log(&[("AGENTD_DEBUG", "true")]);
+
+    assert!(output.contains("тело запроса"), "нет тела запроса: {output}");
+    assert!(output.contains("секретный вопрос"), "нет текста запроса: {output}");
+    assert!(output.contains("тело ответа"), "нет тела ответа: {output}");
+    assert!(output.contains("запрос провайдеру"), "нет запроса к провайдеру: {output}");
+    assert!(output.contains("ответ провайдера"), "нет ответа провайдера: {output}");
+    assert!(output.contains("ответ модели"), "нет текста ответа модели: {output}");
+}
+
+#[test]
+fn without_debug_bodies_are_not_logged() {
+    let _guard = test_lock();
+    let output = captured_chat_log(&[]);
+
+    assert!(output.contains("обмен с моделью"), "нет сводки обмена: {output}");
+    assert!(!output.contains("тело запроса"), "тело запроса попало в журнал: {output}");
+    assert!(!output.contains("запрос провайдеру"), "обмен с провайдером в журнале: {output}");
+    assert!(!output.contains("секретный вопрос"), "текст запроса в журнале: {output}");
+}
+
 // --- Настройки чата с локальным провайдером ---
 
 // 1.8 — чат с провайдером ollama создаётся и меняется при ненастроенном Ollama

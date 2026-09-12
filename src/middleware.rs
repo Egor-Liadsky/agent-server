@@ -3,6 +3,8 @@
 
 use crate::error::ApiError;
 use crate::state::AppState;
+use crate::telemetry::{pretty, API_TARGET};
+use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
@@ -77,6 +79,80 @@ fn envelope_for(status: StatusCode) -> ApiError {
             ApiError::invalid_request("запрос не удалось разобрать")
         }
         _ => ApiError::internal(format!("слой вернул статус {status}")),
+    }
+}
+
+/// Тела запроса и ответа в журнал отладки. Слой ставится только в режиме
+/// отладки: он буферизует тела целиком, а вне отладки такой цены платить не
+/// за что. Буферизация безопасна — ответы сервиса не потоковые, а размер
+/// запроса уже ограничен `RequestBodyLimitLayer` снаружи.
+pub async fn log_bodies(request: Request, next: Next) -> Response {
+    let request_id = request_id_of(&request);
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(err) => return read_error(&err.to_string()).with_request_id(request_id).into_response(),
+    };
+    log_payload(&bytes, |event| {
+        tracing::debug!(
+            target: API_TARGET,
+            %request_id,
+            method = %method,
+            uri = %uri,
+            payload = %event,
+            "тело запроса"
+        );
+    });
+
+    let response = next.run(Request::from_parts(parts, Body::from(bytes))).await;
+
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        // Тело собственного ответа не прочиталось — журналу нечего показать,
+        // но клиенту важнее получить ответ, поэтому статус сохраняется.
+        Err(err) => {
+            tracing::warn!(%request_id, error = %err, "тело ответа не прочитано для журнала");
+            Bytes::new()
+        }
+    };
+    log_payload(&bytes, |event| {
+        tracing::debug!(
+            target: API_TARGET,
+            %request_id,
+            status = status.as_u16(),
+            payload = %event,
+            "тело ответа"
+        );
+    });
+
+    Response::from_parts(parts, Body::from(bytes))
+}
+
+/// Пустые тела не пишутся, JSON печатается с отступами, остальное — как есть.
+fn log_payload(bytes: &Bytes, emit: impl FnOnce(&str)) {
+    if bytes.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) => emit(&pretty(&value)),
+        Err(_) => emit(&text),
+    }
+}
+
+/// Чтение тела прервалось: превышение лимита отдаётся как 413, прочие
+/// причины — как неразобранный запрос. Тип ошибки `axum` не различает их
+/// иначе, чем по тексту вложенной причины.
+fn read_error(message: &str) -> ApiError {
+    if message.contains("length limit exceeded") {
+        ApiError::payload_too_large()
+    } else {
+        ApiError::invalid_request("тело запроса не прочитано")
     }
 }
 

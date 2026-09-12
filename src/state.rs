@@ -73,17 +73,22 @@ impl Agent for ServiceAgent {
 
 fn build_agent(config: &AgentdConfig) -> Result<ServiceAgent> {
     AGENT_CREATIONS.fetch_add(1, Ordering::SeqCst);
-    // Журнал обмена в сервисе выключен: диалоги пишет structured logging,
-    // а файлы JSONL внутри контейнера некуда складывать.
     // Ключ и адрес провайдера принадлежат сервису и берутся из его
     // переменных окружения, а не из пользовательского конфига клиента.
     let core_config = Config {
         model: Some(config.model.clone()),
         ..Config::default()
     };
+    // Файлы JSONL внутри контейнера некуда складывать, поэтому в обычном
+    // режиме журнал обмена выключен, а в дебаге сырые тела уходят приёмником
+    // в structured logging сервиса.
+    let log = Arc::new(if config.debug {
+        ExchangeLog::to_sink(Arc::new(crate::telemetry::TracingExchangeSink))
+    } else {
+        ExchangeLog::disabled()
+    });
     // Таймаут провайдера живёт на клиенте ядра: его истечение даёт
     // типизированный `AgentError::Timeout`, а не безымянное зависание.
-    let log = Arc::new(ExchangeLog::disabled());
     Ok(ServiceAgent {
         cloud: UpstreamAgent::new(
             config.upstream_api_key.clone(),

@@ -916,7 +916,7 @@ pub fn router(state: AppState) -> Router {
             authenticate,
         ));
 
-    Router::new()
+    let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .nest("/v1", v1)
@@ -935,8 +935,18 @@ pub fn router(state: AppState) -> Router {
                 .layer(TimeoutLayer::new(
                     request_timeout + std::time::Duration::from_secs(5),
                 )),
-        )
-        .layer(RequestBodyLimitLayer::new(max_body_bytes))
+        );
+
+    // Журнал тел ставится внутрь лимита размера и идентификатора запроса:
+    // слишком большое тело отсекается до буферизации, а `request_id` к этому
+    // моменту уже присвоен.
+    let app = if state.config.debug {
+        app.layer(axum::middleware::from_fn(crate::middleware::log_bodies))
+    } else {
+        app
+    };
+
+    app.layer(RequestBodyLimitLayer::new(max_body_bytes))
         .layer(axum::middleware::from_fn(normalize_errors))
         .layer(axum::middleware::from_fn(assign_request_id))
         .layer(TraceLayer::new_for_http())
