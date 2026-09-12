@@ -70,7 +70,12 @@ where
     Option::deserialize(deserializer).map(Some)
 }
 
+/// `summary` и `summary_through_seq` — только для чтения, поэтому этот DTO
+/// их не объявляет: `deny_unknown_fields` отклоняет попытку прислать их
+/// (или любое другое неизвестное поле) как некорректный запрос
+/// (specs/context-summary, «Наблюдаемость компактизации»).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatSettingsDto {
     #[serde(default)]
     pub provider: Option<String>,
@@ -106,6 +111,22 @@ pub struct ChatSettingsDto {
     /// «Разовое переопределение лимита на один запрос»).
     #[serde(default, deserialize_with = "double_option")]
     pub max_context_tokens: Option<Option<u32>>,
+    /// Включает или выключает компактизацию истории для этого чата. Та же
+    /// семантика присутствия поля, что и у `max_context_tokens`: поля нет —
+    /// сохранённое значение остаётся, `null` — возврат к операторскому
+    /// умолчанию (`AGENTD_SUMMARY_ENABLED`), значение — задаёт
+    /// (specs/context-summary, «Настройки компактизации на уровне чата»).
+    #[serde(default, deserialize_with = "double_option")]
+    pub summary_enabled: Option<Option<bool>>,
+    /// Потолок дословного хвоста компактизации для этого чата: не может
+    /// превышать `AGENTD_SUMMARY_KEEP_MESSAGES` (проверяется в
+    /// `merge_settings`).
+    #[serde(default, deserialize_with = "double_option")]
+    pub summary_keep_messages: Option<Option<u32>>,
+    /// Шаг пересказа для этого чата: не может быть меньше
+    /// `AGENTD_SUMMARY_STEP_MESSAGES` (проверяется в `merge_settings`).
+    #[serde(default, deserialize_with = "double_option")]
+    pub summary_step_messages: Option<Option<u32>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -189,6 +210,13 @@ impl ChatSettingsDto {
         defaults.max_context_tokens = self
             .max_context_tokens
             .unwrap_or(defaults.max_context_tokens);
+        defaults.summary_enabled = self.summary_enabled.unwrap_or(defaults.summary_enabled);
+        defaults.summary_keep_messages = self
+            .summary_keep_messages
+            .unwrap_or(defaults.summary_keep_messages);
+        defaults.summary_step_messages = self
+            .summary_step_messages
+            .unwrap_or(defaults.summary_step_messages);
         Ok(defaults)
     }
 }
@@ -211,6 +239,24 @@ pub struct ChatResponse {
     /// Номер сохранённого ответа модели в чате.
     #[serde(default)]
     pub seq: Option<i64>,
+    /// Сведения о компактизации истории этого запроса. `null` — запрос без
+    /// `chat_id`: компактизации не подлежит (specs/context-summary,
+    /// «Разовый вызов без чата не компактизуется»). Для запроса с `chat_id`
+    /// присутствует всегда, включая некомпактизованные запросы — иначе
+    /// настройкам не с чем сравниваться (specs/context-summary,
+    /// «Наблюдаемость компактизации»).
+    #[serde(default)]
+    pub context: Option<ContextDto>,
+}
+
+/// Итог компактизации истории на этом запросе.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextDto {
+    /// Сколько сохранённых сообщений заменено пересказом в этом запросе.
+    pub replaced_messages: u32,
+    /// Строился ли новый пересказ на этом запросе (иначе — использован
+    /// прежний, если он был).
+    pub summary_built: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -261,12 +307,18 @@ impl ChatResponse {
             policy,
             chat_id: None,
             seq: None,
+            context: None,
         }
     }
 
     pub fn with_chat(mut self, chat_id: String, seq: i64) -> Self {
         self.chat_id = Some(chat_id);
         self.seq = Some(seq);
+        self
+    }
+
+    pub fn with_context(mut self, context: ContextDto) -> Self {
+        self.context = Some(context);
         self
     }
 }
@@ -288,6 +340,14 @@ pub struct ChatDto {
     pub created_at: i64,
     pub updated_at: i64,
     pub message_count: i64,
+    /// Текст пересказа вытесненной части истории. Только для чтения: входные
+    /// DTO это поле не объявляют (specs/context-summary, «Наблюдаемость
+    /// компактизации»).
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Номер последнего пересказанного сообщения.
+    #[serde(default)]
+    pub summary_through_seq: Option<i64>,
 }
 
 impl From<store::Chat> for ChatDto {
@@ -299,7 +359,22 @@ impl From<store::Chat> for ChatDto {
             created_at: chat.created_at,
             updated_at: chat.updated_at,
             message_count: chat.message_count,
+            summary: None,
+            summary_through_seq: None,
         }
+    }
+}
+
+impl ChatDto {
+    /// Наполняет поля пересказа, только для чтения (`GET /v1/chats` и
+    /// `GET /v1/chats/{id}`); отсутствие пересказа оставляет оба поля
+    /// `null`.
+    pub fn with_summary(mut self, summary: Option<store::ChatSummary>) -> Self {
+        if let Some(summary) = summary {
+            self.summary = Some(summary.summary);
+            self.summary_through_seq = Some(summary.through_seq);
+        }
+        self
     }
 }
 

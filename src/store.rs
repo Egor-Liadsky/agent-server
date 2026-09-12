@@ -508,6 +508,58 @@ pub async fn append_messages(
     Ok(rows)
 }
 
+/// Пересказ вытесненной части истории чата, хранимый отдельно от сообщений
+/// (design.md, решение 4).
+#[derive(Debug, Clone)]
+pub struct ChatSummary {
+    pub summary: String,
+    pub through_seq: i64,
+}
+
+/// Пересказ чата, если он уже построен.
+pub async fn load_summary(pool: &SqlitePool, chat_id: &str) -> Result<Option<ChatSummary>, StoreError> {
+    let row = sqlx::query("SELECT summary, through_seq FROM chat_summaries WHERE chat_id = ?")
+        .bind(chat_id)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(match row {
+        Some(row) => Some(ChatSummary {
+            summary: row.try_get("summary")?,
+            through_seq: row.try_get("through_seq")?,
+        }),
+        None => None,
+    })
+}
+
+/// Сохраняет пересказ чата, заменяя прежний. `through_seq` монотонно не
+/// убывает: конкурентная запись худшим исходом даёт лишний вызов модели, а
+/// не откат границы назад (design.md, риск «Параллельные запросы»).
+pub async fn save_summary(
+    pool: &SqlitePool,
+    chat_id: &str,
+    summary: &str,
+    through_seq: i64,
+) -> Result<(), StoreError> {
+    let now = now_secs();
+    sqlx::query(
+        "INSERT INTO chat_summaries (chat_id, summary, through_seq, updated_at) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT (chat_id) DO UPDATE SET \
+             summary = excluded.summary, \
+             through_seq = excluded.through_seq, \
+             updated_at = excluded.updated_at \
+         WHERE excluded.through_seq >= chat_summaries.through_seq",
+    )
+    .bind(chat_id)
+    .bind(summary)
+    .bind(through_seq)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn insert_message(
     tx: &mut sqlx::SqliteConnection,
     chat_id: &str,
@@ -966,6 +1018,118 @@ mod tests {
         let mut seqs: Vec<i64> = page.messages.iter().map(|m| m.seq).collect();
         seqs.sort_unstable();
         assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    // --- 8.1 Миграция chat_summaries применяется при открытии пула ---
+
+    #[tokio::test]
+    async fn chat_summaries_table_exists_after_open_pool() {
+        let (_dir, pool) = temp_pool().await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_summaries")
+            .fetch_one(&pool)
+            .await
+            .expect("таблица chat_summaries существует");
+        assert_eq!(count, 0);
+    }
+
+    // --- 8.2 Хранение пересказа ---
+
+    #[tokio::test]
+    async fn load_summary_of_chat_without_summary_is_none() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let summary = load_summary(&pool, &chat.id).await.expect("чтение");
+        assert!(summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn save_summary_persists_and_overwrites() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+
+        save_summary(&pool, &chat.id, "первый пересказ", 5)
+            .await
+            .expect("сохранение");
+        let loaded = load_summary(&pool, &chat.id)
+            .await
+            .expect("чтение")
+            .expect("пересказ сохранён");
+        assert_eq!(loaded.summary, "первый пересказ");
+        assert_eq!(loaded.through_seq, 5);
+
+        save_summary(&pool, &chat.id, "второй пересказ", 15)
+            .await
+            .expect("перезапись");
+        let loaded = load_summary(&pool, &chat.id)
+            .await
+            .expect("чтение")
+            .expect("пересказ сохранён");
+        assert_eq!(loaded.summary, "второй пересказ");
+        assert_eq!(loaded.through_seq, 15);
+    }
+
+    #[tokio::test]
+    async fn save_summary_does_not_move_through_seq_backward() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+
+        save_summary(&pool, &chat.id, "новый пересказ", 20)
+            .await
+            .expect("сохранение");
+        // Запоздавшая запись с меньшей границей не должна откатить прогресс
+        // (design.md, риск «Параллельные запросы в один чат»).
+        save_summary(&pool, &chat.id, "устаревший пересказ", 10)
+            .await
+            .expect("запись не должна падать");
+
+        let loaded = load_summary(&pool, &chat.id)
+            .await
+            .expect("чтение")
+            .expect("пересказ сохранён");
+        assert_eq!(loaded.summary, "новый пересказ");
+        assert_eq!(loaded.through_seq, 20);
+    }
+
+    // --- 8.3 Каскад и полнота load_messages ---
+
+    #[tokio::test]
+    async fn deleting_chat_cascades_summary() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        save_summary(&pool, &chat.id, "пересказ", 5).await.expect("сохранение");
+
+        delete_chat(&pool, "owner-1", &chat.id).await.expect("удаление");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_summaries WHERE chat_id = ?")
+            .bind(&chat.id)
+            .fetch_one(&pool)
+            .await
+            .expect("подсчёт пересказов");
+        assert_eq!(count, 0, "foreign_keys=ON должен каскадно удалить пересказ");
+    }
+
+    #[tokio::test]
+    async fn load_messages_ignores_summary_and_returns_full_history() {
+        let (_dir, pool) = temp_pool().await;
+        let defaults = ChatSettings::default();
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        append_exchange(
+            &pool,
+            "owner-1",
+            &chat.id,
+            new_message(Role::User, "вопрос"),
+            new_message(Role::Assistant, "ответ"),
+        )
+        .await
+        .expect("обмен");
+        save_summary(&pool, &chat.id, "пересказ", 1).await.expect("сохранение");
+
+        let page = load_messages(&pool, &chat.id, 0, 10).await.expect("чтение");
+        assert_eq!(page.messages.len(), 2, "пересказ не должен скрывать сообщения");
     }
 
     // --- 3.7 Отпечаток владельца ---

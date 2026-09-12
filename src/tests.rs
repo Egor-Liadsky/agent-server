@@ -84,6 +84,49 @@ pub fn provider_reply(content: &str) -> serde_json::Value {
     })
 }
 
+/// Различает вызов модели ради пересказа (тело содержит инструкцию
+/// компактизации) и обычный диалоговый вызов: оба идут на один и тот же
+/// `/chat/completions`, поэтому маршрутизация мока — по содержимому тела
+/// запроса (specs/context-summary, интеграционные тесты компактизации).
+struct BodyContains(&'static str);
+
+impl wiremock::Match for BodyContains {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        String::from_utf8_lossy(&request.body).contains(self.0)
+    }
+}
+
+struct BodyLacks(&'static str);
+
+impl wiremock::Match for BodyLacks {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        !String::from_utf8_lossy(&request.body).contains(self.0)
+    }
+}
+
+const SUMMARY_CALL_MARKER: &str = "Обнови пересказ разговора";
+
+/// Дозаписывает `pairs` обменов (вопрос/ответ) в чат через
+/// `POST /v1/chats/{id}/messages`, не обращаясь к провайдеру: удобно для
+/// подготовки длинной истории перед проверкой компактизации.
+async fn seed_exchanges(state: &AppState, chat_id: &str, pairs: &[(&str, &str)]) {
+    let messages: Vec<serde_json::Value> = pairs
+        .iter()
+        .flat_map(|(question, answer)| {
+            [
+                serde_json::json!({ "role": "user", "content": question }),
+                serde_json::json!({ "role": "assistant", "content": answer }),
+            ]
+        })
+        .collect();
+    let sent = send(
+        state.clone(),
+        append(chat_id, serde_json::json!({ "messages": messages }), None),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::CREATED, "подготовка истории: {}", sent.body);
+}
+
 /// Сервис, у которого апстрим — заданный `wiremock`.
 pub async fn state_with_provider(server: &MockServer, extra: &[(&str, &str)]) -> AppState {
     let uri = server.uri();
@@ -137,6 +180,7 @@ fn successful_response_has_contract_shape() {
         policy: Default::default(),
         chat_id: None,
         seq: None,
+        context: None,
     };
     let value = serde_json::to_value(&response).expect("сериализация");
     assert_eq!(value["request_id"], "req-1");
@@ -327,20 +371,38 @@ async fn client_limit_wider_than_operator_default_is_rejected() {
 }
 
 #[tokio::test]
-async fn client_limit_without_operator_default_is_rejected() {
+async fn client_limit_without_operator_default_is_accepted_and_still_enforced() {
+    // Клиентский лимит действует самостоятельно: отсутствие операторского
+    // лимита не повод для отказа (specs/chat-context-limit, «Задан только
+    // клиентский лимит»; design.md, решение 1).
     let _guard = test_lock();
-    let state = state_with_provider(&MockServer::start().await, &[]).await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
     let sent = send(
-        state,
+        state.clone(),
         post_chat(serde_json::json!({
             "prompt": "привет",
             "settings": { "max_context_tokens": 500 }
         })),
     )
     .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
 
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "prompt": "привет, как дела сегодня?",
+            "settings": { "max_context_tokens": 1 }
+        })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
-    assert_eq!(sent.body["error"]["code"], "context_limit_invalid");
+    assert_eq!(sent.body["error"]["code"], "context_limit_exceeded");
 }
 
 #[tokio::test]
@@ -885,6 +947,185 @@ async fn patch_with_invalid_settings_does_not_change_chat() {
     assert_eq!(loaded.body["title"], "Новый чат");
 }
 
+// --- Настройки компактизации в контракте ---
+
+#[tokio::test]
+async fn patch_without_summary_field_keeps_stored_value_and_null_resets_it() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "summary_keep_messages": 15 } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+    assert_eq!(patched.body["settings"]["summary_keep_messages"], 15);
+
+    // Поле отсутствует — сохранённое значение остаётся.
+    let renamed = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "title": "Другой заголовок" })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(renamed.status, StatusCode::OK, "тело: {}", renamed.body);
+    assert_eq!(renamed.body["settings"]["summary_keep_messages"], 15);
+
+    // Явный null возвращает к операторскому умолчанию.
+    let cleared = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "summary_keep_messages": null } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "тело: {}", cleared.body);
+    assert!(cleared.body["settings"]["summary_keep_messages"].is_null());
+}
+
+#[tokio::test]
+async fn summary_keep_messages_above_operator_ceiling_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_SUMMARY_KEEP_MESSAGES", "20"),
+    ])
+    .await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "summary_keep_messages": 40 } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::BAD_REQUEST, "тело: {}", patched.body);
+    assert_eq!(patched.body["error"]["code"], "summary_settings_invalid");
+
+    // Разовое переопределение той же границей.
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "prompt": "привет",
+            "settings": { "summary_keep_messages": 40 }
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "summary_settings_invalid");
+}
+
+#[tokio::test]
+async fn summary_step_messages_below_operator_floor_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_SUMMARY_STEP_MESSAGES", "10"),
+    ])
+    .await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "summary_step_messages": 2 } }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(created.body["error"]["code"], "summary_settings_invalid");
+}
+
+#[tokio::test]
+async fn zero_summary_keep_messages_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(
+        state,
+        None,
+        serde_json::json!({ "settings": { "summary_keep_messages": 0 } }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(created.body["error"]["code"], "summary_settings_invalid");
+}
+
+#[tokio::test]
+async fn chat_can_enable_summary_when_operator_default_is_disabled() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_SUMMARY_ENABLED", "false"),
+    ])
+    .await;
+    let enabled = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "summary_enabled": true } }),
+    )
+    .await;
+    assert_eq!(enabled.status, StatusCode::CREATED, "тело: {}", enabled.body);
+    assert_eq!(enabled.body["settings"]["summary_enabled"], true);
+
+    let default_chat = create_chat(state, None, serde_json::json!({})).await;
+    assert!(default_chat.body["settings"]["summary_enabled"].is_null());
+}
+
+// --- Наблюдаемость: поля пересказа только для чтения ---
+
+#[tokio::test]
+async fn chat_without_summary_reports_null_summary_fields() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert!(loaded.body["summary"].is_null());
+    assert!(loaded.body["summary_through_seq"].is_null());
+}
+
+#[tokio::test]
+async fn patch_with_summary_field_is_rejected_as_read_only() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "summary": "подделанный пересказ" } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert!(loaded.body["summary"].is_null());
+}
+
 // 5.7 — удаление чата
 
 #[tokio::test]
@@ -1214,12 +1455,16 @@ async fn chat_call_override_does_not_change_stored_chat_limit() {
 }
 
 #[tokio::test]
-async fn chat_call_with_stored_limit_above_operator_default_is_rejected() {
+async fn patch_max_context_tokens_above_operator_default_is_rejected_at_storage() {
+    // Проверка лимита при сохранении срабатывает тем же кодом, что и при
+    // вызове: отказ приходит на PATCH, а не на следующем POST /v1/chat
+    // (specs/chat-context-limit, «Сохранение лимита шире операторского»).
     let _guard = test_lock();
-    let server = MockServer::start().await;
-    // Никаких смонтированных ожиданий: запрос отклоняется до обращения к
-    // апстриму, обращение к нему обвалило бы тест.
-    let state = state_with_provider(&server, &[("AGENTD_MAX_CONTEXT_TOKENS", "1000")]).await;
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_MAX_CONTEXT_TOKENS", "1000"),
+    ])
+    .await;
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
@@ -1233,18 +1478,34 @@ async fn chat_call_with_stored_limit_above_operator_default_is_rejected() {
         ),
     )
     .await;
-    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+    assert_eq!(patched.status, StatusCode::BAD_REQUEST, "тело: {}", patched.body);
+    assert_eq!(patched.body["error"]["code"], "context_limit_invalid");
 
-    let sent = send(
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert!(loaded.body["settings"]["max_context_tokens"].is_null());
+}
+
+#[tokio::test]
+async fn create_chat_with_ollama_provider_and_excessive_limit_is_rejected() {
+    // Проверка лимита не обходится для чатов с локальным провайдером: он
+    // относится к размеру истории, а не к способу вызова модели
+    // (specs/chat-context-limit, «Сохранение лимита для чата с локальным
+    // провайдером»).
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_MAX_CONTEXT_TOKENS", "4000"),
+        ("AGENTD_OLLAMA_URL", "http://localhost:11434"),
+    ])
+    .await;
+    let created = create_chat(
         state,
-        post_chat(serde_json::json!({
-            "chat_id": id,
-            "prompt": "привет"
-        })),
+        None,
+        serde_json::json!({ "settings": { "provider": "ollama", "max_context_tokens": 8000 } }),
     )
     .await;
-    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
-    assert_eq!(sent.body["error"]["code"], "context_limit_invalid");
+    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(created.body["error"]["code"], "context_limit_invalid");
 }
 
 // 6.5 — модель чата вне белого списка
@@ -1953,4 +2214,348 @@ async fn omitted_settings_fields_stay_unchanged() {
     assert_eq!(patched.body["settings"]["model"], "test-model");
     assert_eq!(patched.body["settings"]["sampling"]["temperature"], 0.4);
     assert_eq!(patched.body["settings"]["experts"], serde_json::json!(["аналитик"]));
+}
+
+// --- Компактизация истории: интеграционные тесты через wiremock ---
+
+fn summary_chat_settings(keep: u32, step: u32) -> serde_json::Value {
+    serde_json::json!({
+        "settings": {
+            "summary_enabled": true,
+            "summary_keep_messages": keep,
+            "summary_step_messages": step
+        }
+    })
+}
+
+// 12.1 — выключенная компактизация: провайдер видит всё, без обращений за пересказом
+
+#[tokio::test]
+async fn disabled_summary_sends_full_history_without_summary_calls() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    seed_exchanges(
+        &state,
+        &id,
+        &[("вопрос 1", "ответ 1"), ("вопрос 2", "ответ 2"), ("вопрос 3", "ответ 3")],
+    )
+    .await;
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "новый вопрос" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["context"]["replaced_messages"], 0);
+    assert_eq!(sent.body["context"]["summary_built"], false);
+
+    let requests = server.received_requests().await.expect("запросы");
+    assert_eq!(requests.len(), 1, "не должно быть отдельного обращения за пересказом");
+    let body = String::from_utf8_lossy(&requests[0].body);
+    assert!(body.contains("вопрос 1"), "полная история должна дойти до провайдера: {body}");
+}
+
+// 12.2 — порог достигнут: два обращения, тело второго содержит пересказ и не содержит вытесненных сообщений
+
+#[tokio::test]
+async fn reaching_step_builds_summary_and_sends_tail_without_evicted_messages() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("итог пересказа")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_SUMMARY_STEP_MESSAGES", "1")]).await;
+    let created = create_chat(state.clone(), None, summary_chat_settings(4, 3)).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    // 4 обмена = 8 сообщений; keep=4 оставляет хвост из последних 4 (2
+    // обмена), в вытесненной части — 4 сообщения, порог шага (3) достигнут.
+    seed_exchanges(
+        &state,
+        &id,
+        &[
+            ("вопрос 1", "ответ 1"),
+            ("вопрос 2", "ответ 2"),
+            ("вопрос 3", "ответ 3"),
+            ("вопрос 4", "ответ 4"),
+        ],
+    )
+    .await;
+
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "новый вопрос" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["content"], "ответ модели");
+    assert_eq!(sent.body["context"]["replaced_messages"], 4);
+    assert_eq!(sent.body["context"]["summary_built"], true);
+
+    let requests = server.received_requests().await.expect("запросы");
+    assert_eq!(requests.len(), 2, "ожидались ровно два обращения: пересказ и ответ");
+    let main_call = requests
+        .iter()
+        .find(|r| !String::from_utf8_lossy(&r.body).contains(SUMMARY_CALL_MARKER))
+        .expect("основной вызов");
+    let body = String::from_utf8_lossy(&main_call.body);
+    assert!(body.contains("Краткое содержание предыдущей части разговора"), "{body}");
+    assert!(body.contains("итог пересказа"), "{body}");
+    assert!(body.contains("вопрос 3"), "хвост из последних 4 сообщений должен дойти: {body}");
+    assert!(!body.contains("вопрос 1"), "вытесненное сообщение не должно уйти провайдеру: {body}");
+    assert!(!body.contains("вопрос 2"), "вытесненное сообщение не должно уйти провайдеру: {body}");
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["summary"], "итог пересказа");
+    assert_eq!(loaded.body["summary_through_seq"], 4);
+}
+
+// 12.3 — следующий запрос до новой ступени: одно обращение, подставлен прежний пересказ
+
+#[tokio::test]
+async fn next_request_below_step_reuses_stored_summary_with_one_call() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("итог пересказа")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_SUMMARY_STEP_MESSAGES", "1")]).await;
+    let created = create_chat(state.clone(), None, summary_chat_settings(4, 3)).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    seed_exchanges(
+        &state,
+        &id,
+        &[
+            ("вопрос 1", "ответ 1"),
+            ("вопрос 2", "ответ 2"),
+            ("вопрос 3", "ответ 3"),
+            ("вопрос 4", "ответ 4"),
+        ],
+    )
+    .await;
+    // Первый запрос строит пересказ (через seq 4) и добавляет обмен seq 9/10.
+    let first = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "новый вопрос" })),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "тело: {}", first.body);
+
+    let second = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "ещё вопрос" })),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::OK, "тело: {}", second.body);
+    // Вытесненных, но ещё не пересказанных сообщений после первого запроса —
+    // 2 (seq 5 и 6), это меньше шага (3): пересказ не перестраивается.
+    assert_eq!(second.body["context"]["summary_built"], false);
+
+    let requests = server.received_requests().await.expect("запросы");
+    assert_eq!(requests.len(), 3, "1 пересказ + 2 обычных ответа");
+    let summary_calls = requests
+        .iter()
+        .filter(|r| String::from_utf8_lossy(&r.body).contains(SUMMARY_CALL_MARKER))
+        .count();
+    assert_eq!(summary_calls, 1, "пересказ не должен перестраиваться на втором запросе");
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["summary_through_seq"], 4, "граница пересказа не должна была сдвинуться");
+}
+
+// 12.4 — ошибка провайдера на вызове пересказа не ломает пользовательский запрос
+
+#[tokio::test]
+async fn summary_call_failure_degrades_without_breaking_user_request() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_SUMMARY_STEP_MESSAGES", "1")]).await;
+    let created = create_chat(state.clone(), None, summary_chat_settings(4, 3)).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    seed_exchanges(
+        &state,
+        &id,
+        &[
+            ("вопрос 1", "ответ 1"),
+            ("вопрос 2", "ответ 2"),
+            ("вопрос 3", "ответ 3"),
+            ("вопрос 4", "ответ 4"),
+        ],
+    )
+    .await;
+
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "новый вопрос" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "ошибка пересказа не должна ломать ответ: {}", sent.body);
+    assert_eq!(sent.body["content"], "ответ модели");
+    assert_eq!(sent.body["context"]["summary_built"], false);
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert!(loaded.body["summary"].is_null(), "сохранённый пересказ не должен был появиться");
+}
+
+// 12.5 — компактизация спасает от context_limit_exceeded, а компактизованный избыток всё равно отклоняется
+
+#[tokio::test]
+async fn compaction_avoids_context_limit_exceeded_when_full_history_would_not_fit() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("краткий итог")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_MAX_CONTEXT_TOKENS", "200"), ("AGENTD_SUMMARY_STEP_MESSAGES", "1")]).await;
+    // Хвост (keep=2) — только последний обмен, чтобы компактизованная
+    // история (пересказ + один короткий обмен + новое сообщение) уложилась
+    // в лимит, даже когда полная история из четырёх длинных ответов — нет.
+    let created = create_chat(state.clone(), None, summary_chat_settings(2, 1)).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let long_answer = "ответ ".repeat(200); // достаточно длинно, чтобы полная история превысила лимит в 200 токенов
+    seed_exchanges(
+        &state,
+        &id,
+        &[
+            ("вопрос 1", &long_answer),
+            ("вопрос 2", &long_answer),
+            ("вопрос 3", &long_answer),
+            ("вопрос 4", "короткий ответ"),
+        ],
+    )
+    .await;
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "новый вопрос" })),
+    )
+    .await;
+    assert_eq!(
+        sent.status,
+        StatusCode::OK,
+        "компактизация должна была уложить историю в лимит: {}",
+        sent.body
+    );
+}
+
+#[tokio::test]
+async fn compacted_history_still_exceeding_limit_is_rejected_without_calling_provider_for_reply() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("краткий итог")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(SUMMARY_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    // Лимит настолько мал, что даже пересказ с хвостом его превышают.
+    let state = state_with_provider(&server, &[("AGENTD_MAX_CONTEXT_TOKENS", "1"), ("AGENTD_SUMMARY_STEP_MESSAGES", "1")]).await;
+    let created = create_chat(state.clone(), None, summary_chat_settings(4, 3)).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    seed_exchanges(
+        &state,
+        &id,
+        &[
+            ("вопрос 1", "ответ 1"),
+            ("вопрос 2", "ответ 2"),
+            ("вопрос 3", "ответ 3"),
+            ("вопрос 4", "ответ 4"),
+        ],
+    )
+    .await;
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "новый вопрос" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "context_limit_exceeded");
+
+    let requests = server.received_requests().await.expect("запросы");
+    assert!(
+        requests.iter().all(|r| String::from_utf8_lossy(&r.body).contains(SUMMARY_CALL_MARKER)),
+        "по пользовательскому сообщению провайдер не должен вызываться"
+    );
+}
+
+// 12.6 — разовый вызов без chat_id не компактизуется
+
+#[tokio::test]
+async fn chat_without_chat_id_is_never_compacted() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "prompt": "привет",
+            "settings": { "summary_enabled": true }
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert!(sent.body.get("context").map(|c| c.is_null()).unwrap_or(true));
+
+    let requests = server.received_requests().await.expect("запросы");
+    assert_eq!(requests.len(), 1, "без chat_id обращение за пересказом не делается");
 }

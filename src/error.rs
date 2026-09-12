@@ -63,6 +63,15 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "context_limit_exceeded", message)
     }
 
+    /// Клиентское значение настроек компактизации выходит за операторские
+    /// границы: `summary_keep_messages` шире `AGENTD_SUMMARY_KEEP_MESSAGES`,
+    /// `summary_step_messages` уже `AGENTD_SUMMARY_STEP_MESSAGES`, либо любое
+    /// из значений — ноль (specs/context-summary, «Границы клиентских
+    /// настроек компактизации»).
+    pub fn summary_settings_invalid(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "summary_settings_invalid", message)
+    }
+
     pub fn payload_too_large() -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,

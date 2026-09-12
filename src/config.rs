@@ -14,6 +14,9 @@ pub const DEFAULT_MAX_CONCURRENCY: usize = 16;
 pub const DEFAULT_DB_PATH: &str = "agentd.db";
 pub const DEFAULT_DB_MAX_CONNECTIONS: u32 = 5;
 pub const DEFAULT_DB_BUSY_TIMEOUT_MS: u64 = 5000;
+pub const DEFAULT_SUMMARY_KEEP_MESSAGES: u32 = 20;
+pub const DEFAULT_SUMMARY_STEP_MESSAGES: u32 = 10;
+pub const DEFAULT_SUMMARY_MAX_CHARS: u32 = 4000;
 
 pub const API_KEY_VAR: &str = "AGENTD_UPSTREAM_API_KEY";
 
@@ -58,6 +61,20 @@ pub struct AgentdConfig {
     /// Операторский лимит контекстного окна по умолчанию, в токенах.
     /// `None` — проверка размера истории не выполняется.
     pub max_context_tokens: Option<u32>,
+    /// Компактизация истории включена по умолчанию для новых запросов чата.
+    /// Чат может включить или выключить её своим значением
+    /// `settings.summary_enabled` (specs/context-summary, «Операторские
+    /// настройки компактизации»).
+    pub summary_enabled: bool,
+    /// Потолок дословного хвоста компактизации: клиент может только сузить.
+    pub summary_keep_messages: u32,
+    /// Нижняя граница шага пересказа: клиент может только увеличить.
+    pub summary_step_messages: u32,
+    /// Верхняя граница длины пересказа в символах. Операторское значение,
+    /// клиенту не передаётся.
+    pub summary_max_chars: u32,
+    /// Модель для построения пересказа. `None` — используется модель чата.
+    pub summary_model: Option<String>,
 }
 
 impl AgentdConfig {
@@ -155,6 +172,23 @@ impl AgentdConfig {
                 get("AGENTD_MAX_CONTEXT_TOKENS"),
                 "AGENTD_MAX_CONTEXT_TOKENS",
             )?,
+            summary_enabled: parse_bool_named(get("AGENTD_SUMMARY_ENABLED"), "AGENTD_SUMMARY_ENABLED")?,
+            summary_keep_messages: parse_nonzero(
+                get("AGENTD_SUMMARY_KEEP_MESSAGES"),
+                "AGENTD_SUMMARY_KEEP_MESSAGES",
+                DEFAULT_SUMMARY_KEEP_MESSAGES,
+            )?,
+            summary_step_messages: parse_nonzero(
+                get("AGENTD_SUMMARY_STEP_MESSAGES"),
+                "AGENTD_SUMMARY_STEP_MESSAGES",
+                DEFAULT_SUMMARY_STEP_MESSAGES,
+            )?,
+            summary_max_chars: parse_nonzero(
+                get("AGENTD_SUMMARY_MAX_CHARS"),
+                "AGENTD_SUMMARY_MAX_CHARS",
+                DEFAULT_SUMMARY_MAX_CHARS,
+            )?,
+            summary_model: get("AGENTD_SUMMARY_MODEL"),
         })
     }
 
@@ -228,13 +262,17 @@ fn parse_optional_positive(value: Option<String>, name: &str) -> Result<Option<u
     }
 }
 
-fn parse_bool(value: Option<String>) -> Result<bool> {
+fn parse_bool_named(value: Option<String>, name: &str) -> Result<bool> {
     match value.as_deref() {
         None => Ok(false),
         Some("1" | "true" | "yes" | "on") => Ok(true),
         Some("0" | "false" | "no" | "off") => Ok(false),
-        Some(other) => bail!("AGENTD_LOG_CONTENT должен быть булевым значением, задано: {other}"),
+        Some(other) => bail!("{name} должен быть булевым значением, задано: {other}"),
     }
+}
+
+fn parse_bool(value: Option<String>) -> Result<bool> {
+    parse_bool_named(value, "AGENTD_LOG_CONTENT")
 }
 
 /// Маскированное представление секрета: не более четырёх первых и четырёх
@@ -289,6 +327,99 @@ mod tests {
         assert_eq!(config.db_max_connections, DEFAULT_DB_MAX_CONNECTIONS);
         assert_eq!(config.db_busy_timeout_ms, DEFAULT_DB_BUSY_TIMEOUT_MS);
         assert_eq!(config.max_context_tokens, None);
+        assert!(!config.summary_enabled);
+        assert_eq!(config.summary_keep_messages, DEFAULT_SUMMARY_KEEP_MESSAGES);
+        assert_eq!(config.summary_step_messages, DEFAULT_SUMMARY_STEP_MESSAGES);
+        assert_eq!(config.summary_max_chars, DEFAULT_SUMMARY_MAX_CHARS);
+        assert_eq!(config.summary_model, None);
+    }
+
+    #[test]
+    fn summary_variables_are_applied() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_SUMMARY_ENABLED", "true"),
+            ("AGENTD_SUMMARY_KEEP_MESSAGES", "30"),
+            ("AGENTD_SUMMARY_STEP_MESSAGES", "5"),
+            ("AGENTD_SUMMARY_MAX_CHARS", "1000"),
+            ("AGENTD_SUMMARY_MODEL", "summary-model"),
+        ])
+        .expect("конфигурация");
+        assert!(config.summary_enabled);
+        assert_eq!(config.summary_keep_messages, 30);
+        assert_eq!(config.summary_step_messages, 5);
+        assert_eq!(config.summary_max_chars, 1000);
+        assert_eq!(config.summary_model.as_deref(), Some("summary-model"));
+    }
+
+    #[test]
+    fn non_numeric_summary_keep_messages_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_SUMMARY_KEEP_MESSAGES", "много"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_SUMMARY_KEEP_MESSAGES"));
+    }
+
+    #[test]
+    fn zero_summary_keep_messages_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_SUMMARY_KEEP_MESSAGES", "0"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_SUMMARY_KEEP_MESSAGES"));
+    }
+
+    #[test]
+    fn non_numeric_summary_step_messages_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_SUMMARY_STEP_MESSAGES", "много"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_SUMMARY_STEP_MESSAGES"));
+    }
+
+    #[test]
+    fn zero_summary_step_messages_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_SUMMARY_STEP_MESSAGES", "0"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_SUMMARY_STEP_MESSAGES"));
+    }
+
+    #[test]
+    fn non_numeric_summary_max_chars_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_SUMMARY_MAX_CHARS", "много"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_SUMMARY_MAX_CHARS"));
+    }
+
+    #[test]
+    fn zero_summary_max_chars_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_SUMMARY_MAX_CHARS", "0"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_SUMMARY_MAX_CHARS"));
+    }
+
+    #[test]
+    fn invalid_summary_enabled_is_an_error() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_SUMMARY_ENABLED", "может быть"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_SUMMARY_ENABLED"));
     }
 
     #[test]

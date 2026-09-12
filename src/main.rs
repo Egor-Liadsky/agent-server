@@ -5,6 +5,7 @@ mod error;
 mod middleware;
 mod state;
 mod store;
+mod summary;
 mod telemetry;
 
 #[cfg(test)]
@@ -15,6 +16,10 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Файл необязателен: в проде переменные обычно приходят из окружения
+    // контейнера/оркестратора, а не из .env рядом с бинарником.
+    dotenvy::dotenv().ok();
+
     // Ключ провайдера обязателен: без него сервис не стартует, а не отказывает
     // на первом запросе.
     let config = match AgentdConfig::from_env() {

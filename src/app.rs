@@ -7,11 +7,12 @@ use crate::dto::{
 };
 use crate::error::ApiError;
 use crate::middleware::{assign_request_id, authenticate, normalize_errors, ClientId, Owner, RequestId};
-use crate::store;
-use crate::telemetry::{log_exchange, ExchangeRecord};
 use crate::state::AppState;
-use agentcore::agent::Message;
-use agentcore::config::{ChatSettings, Provider};
+use crate::store;
+use crate::summary;
+use crate::telemetry::{log_exchange, ExchangeRecord};
+use agentcore::agent::{Agent, Message};
+use agentcore::config::{ChatSettings, Provider, ReasoningMode, ThinkingMode};
 use agentcore::pipeline::{Pipeline, PipelineOutcome, RequestContext};
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
@@ -97,9 +98,11 @@ fn role_str(role: &agentcore::agent::Role) -> &'static str {
     }
 }
 
-/// Эффективный лимит контекстного окна на этот запрос: клиентское поле может
-/// только сузить операторский лимит по умолчанию (specs/context-limit,
-/// «Клиентское сужение лимита на один запрос»).
+/// Эффективный лимит контекстного окна на этот запрос: минимум из заданных
+/// значений. Оператор задаёт только потолок — клиентское значение действует
+/// самостоятельно и тогда, когда операторский лимит не настроен
+/// (specs/chat-context-limit, «Эффективный лимит запроса»; design.md,
+/// решение 1).
 fn effective_context_limit(
     operator_default: Option<u32>,
     client_value: Option<u32>,
@@ -107,13 +110,11 @@ fn effective_context_limit(
     match (operator_default, client_value) {
         (None, None) => Ok(None),
         (Some(default), None) => Ok(Some(default)),
+        (None, Some(client)) => Ok(Some(client)),
         (Some(default), Some(client)) if client <= default => Ok(Some(client)),
         (Some(default), Some(_client)) => Err(ApiError::context_limit_invalid(format!(
             "max_context_tokens не может превышать операторский лимит {default}"
         ))),
-        (None, Some(_client)) => Err(ApiError::context_limit_invalid(
-            "max_context_tokens задан, но операторский лимит контекстного окна не настроен",
-        )),
     }
 }
 
@@ -131,6 +132,153 @@ fn check_context_limit(history: &[Message], limit: Option<u32>) -> Result<(), Ap
         )));
     }
     Ok(())
+}
+
+/// Эффективные настройки компактизации на этот запрос: клиентское значение
+/// поверх операторского умолчания — то же правило присутствия, что и у
+/// `max_context_tokens` (specs/context-summary, «Настройки компактизации на
+/// уровне чата»).
+struct EffectiveSummarySettings {
+    enabled: bool,
+    keep_messages: u32,
+    step_messages: u32,
+}
+
+fn effective_summary_settings(state: &AppState, settings: &ChatSettings) -> EffectiveSummarySettings {
+    EffectiveSummarySettings {
+        enabled: settings.summary_enabled.unwrap_or(state.config.summary_enabled),
+        keep_messages: settings
+            .summary_keep_messages
+            .unwrap_or(state.config.summary_keep_messages),
+        step_messages: settings
+            .summary_step_messages
+            .unwrap_or(state.config.summary_step_messages),
+    }
+}
+
+/// Итог компактизации: история, которую увидит провайдер, и сведения для
+/// блока `context` в ответе (specs/context-summary, «Наблюдаемость
+/// компактизации»).
+struct CompactionOutcome {
+    history: Vec<Message>,
+    replaced_messages: u32,
+    summary_built: bool,
+}
+
+fn history_without_compaction(stored: Vec<store::ChatMessage>, new_message: Message) -> CompactionOutcome {
+    let mut history: Vec<Message> = stored.into_iter().map(message_from_stored).collect();
+    history.push(new_message);
+    CompactionOutcome {
+        history,
+        replaced_messages: 0,
+        summary_built: false,
+    }
+}
+
+/// Компактизация истории чата перед вызовом модели: последние `N` сообщений
+/// дословно, старше — пересказом, обновляемым ступенчато. Выполняется до
+/// проверки лимита контекста, чтобы спасать чат от `context_limit_exceeded`
+/// (specs/context-summary; design.md, решения 5-9).
+async fn compact_history(
+    state: &AppState,
+    chat_id: &str,
+    settings: &ChatSettings,
+    stored: Vec<store::ChatMessage>,
+    new_message: Message,
+) -> CompactionOutcome {
+    let effective = effective_summary_settings(state, settings);
+    if !effective.enabled {
+        return history_without_compaction(stored, new_message);
+    }
+    let boundary = summary::tail_boundary(&stored, effective.keep_messages);
+    if boundary == 0 {
+        return history_without_compaction(stored, new_message);
+    }
+
+    let existing = match store::load_summary(&state.db, chat_id).await {
+        Ok(summary) => summary,
+        Err(err) => {
+            tracing::warn!(chat_id, error = %err, "не удалось прочитать пересказ чата");
+            None
+        }
+    };
+    let (previous_summary, through_seq) = match &existing {
+        Some(s) => (Some(s.summary.clone()), s.through_seq),
+        None => (None, 0),
+    };
+
+    let pending = summary::pending_messages(&stored, boundary, through_seq);
+    let reached_step = pending.len() as u32 >= effective.step_messages;
+
+    if !reached_step {
+        return match previous_summary {
+            // Прежний пересказ есть — подставляем его без обращения к модели.
+            Some(text) => {
+                let tail = &stored[boundary..];
+                let history = summary::assemble_history(Some(&text), tail, new_message);
+                CompactionOutcome {
+                    history,
+                    replaced_messages: boundary as u32,
+                    summary_built: false,
+                }
+            }
+            // Пересказа ещё нет, а порог не достигнут: компактизация ещё не
+            // начала действовать — история уходит целиком.
+            None => history_without_compaction(stored, new_message),
+        };
+    }
+
+    let prompt = summary::summary_prompt(previous_summary.as_deref(), &pending, state.config.summary_max_chars);
+    let mut summary_settings = settings.clone();
+    if let Some(model) = &state.config.summary_model {
+        summary_settings.model = Some(model.clone());
+    }
+    summary_settings.reasoning = ReasoningMode::Default;
+    summary_settings.thinking = ThinkingMode::Disabled;
+    summary_settings.custom_response_mode = false;
+
+    let built = state.agent.ask(&[Message::user(prompt)], &summary_settings).await;
+    let new_through_seq = stored[boundary - 1].seq;
+    let (final_summary, summary_built) = match built {
+        Ok(reply) => {
+            let truncated = summary::truncate_summary(&reply.content, state.config.summary_max_chars);
+            match store::save_summary(&state.db, chat_id, &truncated, new_through_seq).await {
+                Ok(()) => {
+                    tracing::info!(
+                        chat_id,
+                        replaced_messages = boundary,
+                        through_seq = new_through_seq,
+                        "пересказ истории чата построен"
+                    );
+                    if state.config.log_content {
+                        tracing::info!(chat_id, summary = %truncated, "текст построенного пересказа");
+                    }
+                    (Some(truncated), true)
+                }
+                Err(err) => {
+                    tracing::warn!(chat_id, error = %err, "не удалось сохранить пересказ чата");
+                    (previous_summary, false)
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(chat_id, error = %err, "не удалось построить пересказ чата");
+            (previous_summary, false)
+        }
+    };
+
+    match final_summary {
+        Some(text) => {
+            let tail = &stored[boundary..];
+            let history = summary::assemble_history(Some(&text), tail, new_message);
+            CompactionOutcome {
+                history,
+                replaced_messages: boundary as u32,
+                summary_built,
+            }
+        }
+        None => history_without_compaction(stored, new_message),
+    }
 }
 
 fn history_from(request: &ChatRequest) -> Result<Vec<Message>, ApiError> {
@@ -220,11 +368,42 @@ fn merge_settings(
         Some(dto) => dto.apply_to(base).map_err(ApiError::invalid_request)?,
         None => base,
     };
+    // Лимит контекста относится к размеру истории, а не к способу вызова
+    // модели: проверяется при обоих SettingsPurpose и для любого провайдера,
+    // включая ollama (specs/chat-context-limit, «Проверка лимита при
+    // сохранении настроек чата»; design.md, решение 2).
+    effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
+    validate_summary_settings(state, &settings)?;
     match purpose {
         SettingsPurpose::Call => validate_settings_for_call(state, &settings)?,
         SettingsPurpose::Storage => validate_settings_for_storage(state, &settings)?,
     }
     Ok(settings)
+}
+
+/// Границы клиентских настроек компактизации: клиент может только сузить
+/// дословный хвост (не больше операторского потолка) и только разредить шаг
+/// пересказа (не меньше операторской нижней границы); ноль недопустим ни для
+/// одного значения (specs/context-summary, «Границы клиентских настроек
+/// компактизации»).
+fn validate_summary_settings(state: &AppState, settings: &ChatSettings) -> Result<(), ApiError> {
+    if let Some(keep) = settings.summary_keep_messages
+        && (keep == 0 || keep > state.config.summary_keep_messages)
+    {
+        return Err(ApiError::summary_settings_invalid(format!(
+            "summary_keep_messages не может быть нулём или превышать операторский потолок {}",
+            state.config.summary_keep_messages
+        )));
+    }
+    if let Some(step) = settings.summary_step_messages
+        && (step == 0 || step < state.config.summary_step_messages)
+    {
+        return Err(ApiError::summary_settings_invalid(format!(
+            "summary_step_messages не может быть нулём или быть меньше операторской нижней границы {}",
+            state.config.summary_step_messages
+        )));
+    }
+    Ok(())
 }
 
 /// Зачем проверяются настройки: сервис собирается вызвать модель сам или
@@ -405,8 +584,11 @@ async fn handle_chat_in_existing(
         .await
         .map_err(ApiError::from_store_error)?;
     let user_message = Message::user(prompt);
-    let mut history: Vec<Message> = stored.messages.into_iter().map(message_from_stored).collect();
-    history.push(user_message.clone());
+    // Компактизация — до проверки лимита контекста, чтобы спасать чат от
+    // context_limit_exceeded, а не срабатывать после отказа (design.md,
+    // решение 6).
+    let compaction = compact_history(&state, &chat_id, &settings, stored.messages, user_message.clone()).await;
+    let history = compaction.history;
 
     let limit = effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
     check_context_limit(&history, limit)?;
@@ -434,7 +616,12 @@ async fn handle_chat_in_existing(
     .await
     .map_err(ApiError::from_store_error)?;
 
-    Ok(ChatResponse::new(request_id, model, &reply, policy).with_chat(chat_id, assistant_row.seq))
+    Ok(ChatResponse::new(request_id, model, &reply, policy)
+        .with_chat(chat_id, assistant_row.seq)
+        .with_context(crate::dto::ContextDto {
+            replaced_messages: compaction.replaced_messages,
+            summary_built: compaction.summary_built,
+        }))
 }
 
 async fn run_pipeline(
@@ -443,7 +630,7 @@ async fn run_pipeline(
     request_id: &str,
 ) -> Result<(agentcore::agent::AgentReply, agentcore::pipeline::PolicyLog), ApiError> {
     match pipeline.run(context).await {
-        Ok(PipelineOutcome::Completed { reply, policy }) => Ok((reply, policy)),
+        Ok(PipelineOutcome::Completed { reply, policy }) => Ok((*reply, policy)),
         Ok(PipelineOutcome::Rejected {
             stage, code, reason, ..
         }) => {
@@ -513,10 +700,24 @@ async fn handle_list_chats(
     let page = store::list_chats(&state.db, &owner, limit, query.cursor.as_deref(), &defaults)
         .await
         .map_err(ApiError::from_store_error)?;
+    let mut chats = Vec::with_capacity(page.chats.len());
+    for chat in page.chats {
+        chats.push(chat_dto_with_summary(&state, chat).await?);
+    }
     Ok(ListChatsResponse {
-        chats: page.chats.into_iter().map(ChatDto::from).collect(),
+        chats,
         next_cursor: page.next_cursor,
     })
+}
+
+/// `ChatDto` вместе с пересказом чата, если он построен (specs/context-summary,
+/// «Наблюдаемость компактизации»).
+async fn chat_dto_with_summary(state: &AppState, chat: store::Chat) -> Result<ChatDto, ApiError> {
+    let chat_id = chat.id.clone();
+    let summary = store::load_summary(&state.db, &chat_id)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(ChatDto::from(chat).with_summary(summary))
 }
 
 async fn get_chat_handler(
@@ -549,7 +750,7 @@ async fn handle_get_chat(
         .await
         .map_err(ApiError::from_store_error)?;
     Ok(ChatWithMessagesResponse {
-        chat: ChatDto::from(chat),
+        chat: chat_dto_with_summary(&state, chat).await?,
         messages: page.messages.into_iter().map(MessageView::from).collect(),
         next_after: page.next_after,
     })
@@ -595,7 +796,7 @@ async fn handle_patch_chat(
     let updated = store::update_chat(&state.db, &owner, &id, title.as_deref(), settings.as_ref(), &defaults)
         .await
         .map_err(ApiError::from_store_error)?;
-    Ok(ChatDto::from(updated))
+    chat_dto_with_summary(&state, updated).await
 }
 
 /// `POST /v1/chats/{id}/messages`: дозапись готовых реплик. Провайдер и
@@ -780,7 +981,28 @@ mod context_limit_tests {
     }
 
     #[test]
-    fn effective_context_limit_rejects_client_value_without_operator_default() {
-        assert!(effective_context_limit(None, Some(50)).is_err());
+    fn effective_context_limit_accepts_client_value_without_operator_default() {
+        // Клиентское значение действует самостоятельно: отсутствие
+        // операторского лимита не повод для отказа (design.md, решение 1).
+        assert_eq!(effective_context_limit(None, Some(4000)).unwrap(), Some(4000));
+    }
+
+    #[test]
+    fn effective_context_limit_narrower_client_wins_over_wider_operator_default() {
+        assert_eq!(
+            effective_context_limit(Some(8000), Some(4000)).unwrap(),
+            Some(4000)
+        );
+    }
+
+    #[test]
+    fn effective_context_limit_wider_client_than_operator_default_is_invalid() {
+        let err = effective_context_limit(Some(4000), Some(8000)).unwrap_err();
+        assert_eq!(err.code, "context_limit_invalid");
+    }
+
+    #[test]
+    fn effective_context_limit_without_either_value_is_none() {
+        assert_eq!(effective_context_limit(None, None).unwrap(), None);
     }
 }
