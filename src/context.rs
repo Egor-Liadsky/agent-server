@@ -29,9 +29,6 @@ pub struct StrategyCtx<'a> {
     pub state: &'a AppState,
     pub chat: &'a store::Chat,
     pub settings: &'a ChatSettings,
-    /// Владелец чата — нужен `memory_layers` для долговременной памяти,
-    /// область видимости которой шире одного чата.
-    pub owner: &'a str,
 }
 
 #[async_trait]
@@ -97,33 +94,6 @@ impl ContextStrategyImpl for BranchingImpl {
     }
 }
 
-struct MemoryLayersImpl;
-
-#[async_trait]
-impl ContextStrategyImpl for MemoryLayersImpl {
-    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_message: Message) -> Assembled {
-        let outcome = crate::memory::assemble(ctx.state, ctx.chat, ctx.settings, ctx.owner, stored, new_message).await;
-        // Счётчики маршрутизатора относятся к маршрутизации ПРЕДЫДУЩЕГО
-        // сообщения этого чата (design.md, решение 5): маршрутизатор ещё не
-        // отработал на момент сборки текущего запроса, поэтому здесь читается
-        // результат прошлого фонового прогона (`AppState.memory_route_outcomes`).
-        let router = ctx
-            .state
-            .memory_route_outcomes
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .get(&ctx.chat.id)
-            .copied()
-            .unwrap_or_default();
-        let context = crate::memory::context_dto(&outcome, router);
-        Assembled {
-            context,
-            sections: outcome.sections,
-            history: outcome.history,
-        }
-    }
-}
-
 /// Единственная точка ветвления по стратегии (specs/context-strategies,
 /// «Стратегия контекста задаётся настройкой чата»).
 fn impl_for(strategy: ContextStrategy) -> Box<dyn ContextStrategyImpl + Send + Sync> {
@@ -132,7 +102,6 @@ fn impl_for(strategy: ContextStrategy) -> Box<dyn ContextStrategyImpl + Send + S
         ContextStrategy::SlidingWindow => Box::new(WindowImpl),
         ContextStrategy::Facts => Box::new(FactsImpl),
         ContextStrategy::Branching => Box::new(BranchingImpl),
-        ContextStrategy::MemoryLayers => Box::new(MemoryLayersImpl),
     }
 }
 
@@ -140,7 +109,10 @@ fn impl_for(strategy: ContextStrategy) -> Box<dyn ContextStrategyImpl + Send + S
 /// стратегии, включая те, что не формируют служебных разделов
 /// (specs/context-strategies, «Первым сообщением истории идёт системное
 /// сообщение»; design.md, решение 3: `sliding_window` и `branching`
-/// получают его без своего кода).
+/// получают его без своего кода). Слоистая память, если включена, оборачивает
+/// результат стратегии: её разделы идут ПЕРЕД разделами стратегии, а поля
+/// памяти дополняют `ContextDto` стратегии, не подменяя его
+/// (design.md — decouple-memory-layers, решение 1).
 pub async fn assemble(
     state: &AppState,
     chat: &store::Chat,
@@ -150,8 +122,27 @@ pub async fn assemble(
     stored: Vec<store::ChatMessage>,
     new_message: Message,
 ) -> Assembled {
-    let ctx = StrategyCtx { state, chat, settings, owner };
+    let ctx = StrategyCtx { state, chat, settings };
     let mut assembled = impl_for(strategy).assemble(&ctx, stored, new_message).await;
+    if crate::memory::effective_layers_enabled(state, settings) {
+        let memory = crate::memory::layers(state, chat, settings, owner).await;
+        crate::memory::merge_into_context(&mut assembled.context, &memory, &assembled.history);
+        let mut sections = memory.sections;
+        sections.extend(std::mem::take(&mut assembled.sections));
+        assembled.sections = sections;
+        // Счётчики маршрутизатора относятся к маршрутизации ПРЕДЫДУЩЕГО
+        // сообщения этого чата (design.md, решение 5): маршрутизатор ещё не
+        // отработал на момент сборки текущего запроса, поэтому здесь читается
+        // результат прошлого фонового прогона (`AppState.memory_route_outcomes`).
+        let router = state
+            .memory_route_outcomes
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(&chat.id)
+            .copied()
+            .unwrap_or_default();
+        crate::memory::merge_router_counters(&mut assembled.context, router);
+    }
     let system_message = crate::system_message::build(&state.config.system_prompt, &assembled.sections);
     assembled.history.insert(0, system_message);
     assembled
@@ -246,5 +237,89 @@ mod tests {
         assert!(matches!(assembled.history[0].role, Role::System));
         assert!(assembled.history[0].content.contains("Факты чата:"));
         assert!(assembled.history.iter().skip(1).all(|m| !m.content.contains("Факты чата:")));
+    }
+
+    // --- Слоистая память как обёртка над стратегией (decouple-memory-layers) ---
+
+    fn dummy_message(role: Role, seq: i64, content: &str) -> store::ChatMessage {
+        store::ChatMessage { seq, role, content: content.to_string(), reasoning: None, meta: None, created_at: 0 }
+    }
+
+    #[tokio::test]
+    async fn memory_sections_come_before_summary_section_in_that_order() {
+        let _guard = crate::state::test_lock();
+        let state = AppState::for_tests().await;
+        let settings = ChatSettings {
+            context_strategy: Some(ContextStrategy::Summary),
+            summary_enabled: Some(true),
+            memory_layers_enabled: Some(true),
+            ..ChatSettings::default()
+        };
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
+        store::set_long_term_memory(&state.db, "owner-1", "decision", Some("auth"), "Clerk", "manual", None, 1)
+            .await
+            .expect("долговременная запись");
+        store::set_working_memory(&state.db, &chat.id, &chat.active_task_id, "target", "iOS 17+", "manual", 1)
+            .await
+            .expect("рабочая запись");
+
+        // Достаточно сообщений, чтобы хвост стратегии summary не покрыл всю
+        // историю (умолчание `AGENTD_SUMMARY_KEEP_MESSAGES` — 20), и уже
+        // сохранённый пересказ, который подставляется без вызова модели —
+        // порог перестройки (`AGENTD_SUMMARY_STEP_MESSAGES` — 10) не достигнут.
+        let stored: Vec<store::ChatMessage> = (1..=25)
+            .map(|seq| {
+                if seq % 2 == 1 {
+                    dummy_message(Role::User, seq, &format!("вопрос {seq}"))
+                } else {
+                    dummy_message(Role::Assistant, seq, &format!("ответ {seq}"))
+                }
+            })
+            .collect();
+        store::save_summary(&state.db, &chat.id, "итог прошлого", stored[4].seq).await.expect("пересказ сохранён");
+
+        let assembled = assemble(
+            &state,
+            &chat,
+            &settings,
+            "owner-1",
+            ContextStrategy::Summary,
+            stored,
+            Message::user("новое"),
+        )
+        .await;
+
+        let system = &assembled.history[0].content;
+        let long_term_at = system.find("Долговременная память:").expect("раздел долговременной памяти");
+        let working_at = system.find("Рабочая память задачи:").expect("раздел рабочей памяти");
+        let summary_at = system.find(crate::summary::SUMMARY_MARKER).expect("раздел пересказа");
+        assert!(long_term_at < working_at, "долговременная память должна идти раньше рабочей");
+        assert!(working_at < summary_at, "разделы памяти должны идти раньше раздела стратегии");
+    }
+
+    #[tokio::test]
+    async fn disabled_memory_layers_add_no_sections_for_any_strategy() {
+        for strategy in ContextStrategy::ALL {
+            let _guard = crate::state::test_lock();
+            let state = AppState::for_tests().await;
+            let settings = ChatSettings { context_strategy: Some(strategy), ..ChatSettings::default() };
+            let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
+            store::set_long_term_memory(&state.db, "owner-1", "decision", Some("auth"), "Clerk", "manual", None, 1)
+                .await
+                .expect("долговременная запись");
+            store::set_working_memory(&state.db, &chat.id, &chat.active_task_id, "target", "iOS 17+", "manual", 1)
+                .await
+                .expect("рабочая запись");
+
+            let assembled =
+                assemble(&state, &chat, &settings, "owner-1", strategy, Vec::new(), Message::user("новое")).await;
+
+            let system = &assembled.history[0].content;
+            assert!(
+                !system.contains("Долговременная память:") && !system.contains("Рабочая память задачи:"),
+                "стратегия {strategy:?}: разделы памяти не должны появляться при выключенной слоистой памяти"
+            );
+            assert!(assembled.context.memory_long_term_entries.is_none(), "стратегия {strategy:?}");
+        }
     }
 }

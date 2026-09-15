@@ -121,13 +121,14 @@ pub struct AgentdConfig {
     /// Модель для запроса названия чата. `None` — модель сервиса по
     /// умолчанию.
     pub title_model: Option<String>,
-    /// Включает автоматический маршрутизатор записей памяти для стратегии
-    /// `memory_layers` (specs/memory-layers). Включён по умолчанию.
+    /// Операторское умолчание включённости слоистой памяти для чатов без
+    /// явного значения (specs/memory-layers). Выключена по умолчанию.
+    pub memory_layers_enabled: bool,
+    /// Включает автоматический маршрутизатор записей памяти, когда слоистая
+    /// память включена (specs/memory-layers). Включён по умолчанию.
     pub memory_router_enabled: bool,
     /// Модель для вызова маршрутизатора памяти. `None` — модель чата.
     pub memory_router_model: Option<String>,
-    /// Размер хвоста краткосрочной памяти (дословных сообщений).
-    pub memory_short_term_tail_messages: u32,
     /// Потолок числа записей рабочей памяти, подставляемых в контекст.
     pub memory_working_max_entries: u32,
     /// Потолок длины значения записи рабочей памяти в символах.
@@ -305,17 +306,17 @@ impl AgentdConfig {
             system_prompt: get("AGENTD_SYSTEM_PROMPT").unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
             auto_title: parse_bool_named_default(get("AGENTD_AUTO_TITLE"), "AGENTD_AUTO_TITLE", true)?,
             title_model: get("AGENTD_TITLE_MODEL"),
+            memory_layers_enabled: parse_bool_named_default(
+                get("AGENTD_MEMORY_LAYERS_ENABLED"),
+                "AGENTD_MEMORY_LAYERS_ENABLED",
+                false,
+            )?,
             memory_router_enabled: parse_bool_named_default(
                 get("AGENTD_MEMORY_ROUTER_ENABLED"),
                 "AGENTD_MEMORY_ROUTER_ENABLED",
                 true,
             )?,
             memory_router_model: get("AGENTD_MEMORY_ROUTER_MODEL"),
-            memory_short_term_tail_messages: parse_nonzero(
-                get("AGENTD_MEMORY_SHORT_TERM_TAIL_MESSAGES"),
-                "AGENTD_MEMORY_SHORT_TERM_TAIL_MESSAGES",
-                DEFAULT_CONTEXT_WINDOW_MESSAGES,
-            )?,
             memory_working_max_entries: parse_nonzero(
                 get("AGENTD_MEMORY_WORKING_MAX_ENTRIES"),
                 "AGENTD_MEMORY_WORKING_MAX_ENTRIES",
@@ -869,9 +870,9 @@ mod tests {
     #[test]
     fn memory_settings_default_when_not_set() {
         let config = config_from(&[(API_KEY_VAR, "secret-key-value")]).expect("конфигурация");
+        assert!(!config.memory_layers_enabled);
         assert!(config.memory_router_enabled);
         assert_eq!(config.memory_router_model, None);
-        assert_eq!(config.memory_short_term_tail_messages, DEFAULT_CONTEXT_WINDOW_MESSAGES);
         assert_eq!(config.memory_working_max_entries, DEFAULT_MEMORY_WORKING_MAX_ENTRIES);
         assert_eq!(config.memory_working_value_max_chars, DEFAULT_MEMORY_WORKING_VALUE_MAX_CHARS);
         assert_eq!(config.memory_working_key_max_chars, DEFAULT_MEMORY_WORKING_KEY_MAX_CHARS);
@@ -884,9 +885,9 @@ mod tests {
     fn memory_settings_are_read_from_environment() {
         let config = config_from(&[
             (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_MEMORY_LAYERS_ENABLED", "true"),
             ("AGENTD_MEMORY_ROUTER_ENABLED", "false"),
             ("AGENTD_MEMORY_ROUTER_MODEL", "router-model"),
-            ("AGENTD_MEMORY_SHORT_TERM_TAIL_MESSAGES", "4"),
             ("AGENTD_MEMORY_WORKING_MAX_ENTRIES", "10"),
             ("AGENTD_MEMORY_WORKING_VALUE_MAX_CHARS", "200"),
             ("AGENTD_MEMORY_WORKING_KEY_MAX_CHARS", "40"),
@@ -895,9 +896,9 @@ mod tests {
             ("AGENTD_MEMORY_LONG_TERM_KEY_MAX_CHARS", "50"),
         ])
         .expect("конфигурация");
+        assert!(config.memory_layers_enabled);
         assert!(!config.memory_router_enabled);
         assert_eq!(config.memory_router_model.as_deref(), Some("router-model"));
-        assert_eq!(config.memory_short_term_tail_messages, 4);
         assert_eq!(config.memory_working_max_entries, 10);
         assert_eq!(config.memory_working_value_max_chars, 200);
         assert_eq!(config.memory_working_key_max_chars, 40);
@@ -914,5 +915,25 @@ mod tests {
         ])
         .expect_err("ожидалась ошибка");
         assert!(format!("{err}").contains("AGENTD_MEMORY_WORKING_MAX_ENTRIES"));
+    }
+
+    #[test]
+    fn legacy_short_term_tail_variable_is_no_longer_read() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_MEMORY_SHORT_TERM_TAIL_MESSAGES", "4"),
+        ])
+        .expect("конфигурация: неизвестная более переменная не мешает старту");
+        assert!(!config.memory_layers_enabled);
+    }
+
+    #[test]
+    fn invalid_memory_layers_enabled_value_fails_startup() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_MEMORY_LAYERS_ENABLED", "magic"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_MEMORY_LAYERS_ENABLED"));
     }
 }

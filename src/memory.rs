@@ -1,12 +1,13 @@
-//! Стратегия контекста `memory_layers`: три слоя памяти с раздельным
-//! хранением и разной областью жизни — краткосрочный (хвост сообщений),
-//! рабочий (чат + задача) и долговременный (владелец) — и автоматический
-//! маршрутизатор, распределяющий записи по слоям после каждого сообщения
-//! пользователя (specs/memory-layers, design.md).
+//! Слоистая память: рабочий (чат + задача) и долговременный (владелец) слои
+//! памяти с раздельным хранением и разной областью жизни, плюс
+//! автоматический маршрутизатор, распределяющий записи по слоям после
+//! каждого сообщения пользователя. Независима от действующей стратегии
+//! контекста — оборачивает её результат разделами и полями памяти
+//! (specs/memory-layers, design.md).
 
 use crate::dto::ContextDto;
 use crate::state::AppState;
-use crate::store::{self, ChatMessage};
+use crate::store;
 use agentcore::agent::{Agent, Message};
 use agentcore::config::{ChatSettings, ReasoningMode, ThinkingMode};
 use serde::Deserialize;
@@ -345,16 +346,7 @@ fn log_applied(state: &AppState, chat: &store::Chat, layer: Layer, op: &str, key
     }
 }
 
-// --- Стратегия контекста memory_layers (design.md, решение 5) ---
-
-fn message_from_stored(stored: ChatMessage) -> Message {
-    Message {
-        role: stored.role,
-        content: stored.content,
-        reasoning: stored.reasoning,
-        meta: stored.meta,
-    }
-}
+// --- Слоистая память как обёртка над стратегией контекста (design.md, решение 1) ---
 
 fn long_term_section(entries: &[store::LongTermMemoryEntry]) -> Option<String> {
     if entries.is_empty() {
@@ -379,31 +371,21 @@ fn chars_of(text: &str) -> u32 {
     text.chars().count() as u32
 }
 
-/// Итог сборки истории и разделов стратегии `memory_layers`.
-pub struct MemoryLayersOutcome {
-    pub history: Vec<Message>,
+/// Разделы и счётчики слоистой памяти, собранные независимо от действующей
+/// стратегии контекста (design.md, решение 1). Краткосрочная история сюда не
+/// входит: она целиком остаётся работой стратегии, а не этого слоя.
+pub struct MemoryLayers {
     pub sections: Vec<String>,
     pub long_term_entries: u32,
     pub long_term_chars: u32,
     pub working_entries: u32,
     pub working_chars: u32,
-    pub short_term_messages: u32,
-    pub short_term_chars: u32,
 }
 
-/// Сборка стратегии `memory_layers`: долговременная и рабочая память —
-/// разделами системного сообщения (`[long_term_section, working_section]`,
-/// пропуская пустые), хвост краткосрочной памяти — прямой вызов
-/// `window::assemble` (design.md, решение 5: переиспользование, а не
-/// копирование логики усечения окна).
-pub async fn assemble(
-    state: &AppState,
-    chat: &store::Chat,
-    settings: &ChatSettings,
-    owner: &str,
-    stored: Vec<store::ChatMessage>,
-    new_message: Message,
-) -> MemoryLayersOutcome {
+/// Читает долговременную и рабочую память с операторскими/чатовыми лимитами
+/// и строит их разделы в порядке `[long_term, working]`, пропуская пустые
+/// (specs/memory-layers, «Порядок разделов памяти при обеих непустых»).
+pub async fn layers(state: &AppState, chat: &store::Chat, settings: &ChatSettings, owner: &str) -> MemoryLayers {
     let long_term = store::load_long_term_memory(&state.db, owner, effective_long_term_max_entries(state, settings))
         .await
         .unwrap_or_default();
@@ -426,53 +408,44 @@ pub async fn assemble(
         sections.push(section);
     }
 
-    let tail_size = effective_short_term_tail(state, settings);
-    let boundary = crate::summary::tail_boundary(&stored, tail_size);
-    let short_term_messages = (stored.len() - boundary) as u32;
-    let short_term_chars: u32 = stored[boundary..].iter().map(|m| chars_of(&m.content)).sum();
-
-    let mut history: Vec<Message> = stored.into_iter().skip(boundary).map(message_from_stored).collect();
-    history.push(new_message);
-
-    MemoryLayersOutcome {
-        history,
-        sections,
-        long_term_entries,
-        long_term_chars,
-        working_entries,
-        working_chars,
-        short_term_messages,
-        short_term_chars,
-    }
+    MemoryLayers { sections, long_term_entries, long_term_chars, working_entries, working_chars }
 }
 
-/// `context: ContextDto` — счётчики применённых/отброшенных операций
-/// относятся к маршрутизации ПРЕДЫДУЩЕГО сообщения (маршрутизатор ещё не
-/// отработал на момент сборки истории, design.md, решение 5); вызывающий
-/// код подставляет их отдельно, как `facts_updated` у стратегии `facts`.
-pub fn context_dto(outcome: &MemoryLayersOutcome, router: RouteOutcome) -> ContextDto {
-    ContextDto::for_memory_layers(
-        outcome.long_term_entries,
-        outcome.long_term_chars,
-        outcome.working_entries,
-        outcome.working_chars,
-        outcome.short_term_messages,
-        outcome.short_term_chars,
-        router.applied_set,
-        router.applied_update,
-        router.applied_delete,
-        router.rejected,
-    )
+/// Заполняет поля памяти уже собранного `ContextDto` действующей стратегии,
+/// не трогая её собственные поля. Краткосрочный слой считается по факту —
+/// длиной и суммой символов истории, которую фактически собрала стратегия
+/// (`history`, ПОСЛЕ работы стратегии, до вставки системного сообщения)
+/// (design.md, решение 2).
+pub fn merge_into_context(context: &mut ContextDto, memory: &MemoryLayers, history: &[Message]) {
+    context.memory_long_term_entries = Some(memory.long_term_entries);
+    context.memory_long_term_chars = Some(memory.long_term_chars);
+    context.memory_working_entries = Some(memory.working_entries);
+    context.memory_working_chars = Some(memory.working_chars);
+    context.memory_short_term_messages = Some(history.len() as u32);
+    context.memory_short_term_chars = Some(history.iter().map(|m| chars_of(&m.content)).sum());
+}
+
+/// Подмешивает счётчики маршрутизатора памяти в уже заполненный `ContextDto`.
+/// Счётчики относятся к маршрутизации ПРЕДЫДУЩЕГО сообщения (маршрутизатор
+/// ещё не отработал на момент сборки истории, design.md, решение 5).
+pub fn merge_router_counters(context: &mut ContextDto, router: RouteOutcome) {
+    context.memory_router_applied_set = Some(router.applied_set);
+    context.memory_router_applied_update = Some(router.applied_update);
+    context.memory_router_applied_delete = Some(router.applied_delete);
+    context.memory_router_rejected = Some(router.rejected);
 }
 
 // --- Операторские умолчания и переопределения на чат (design.md, решение 6) ---
 
-pub fn effective_router_enabled(state: &AppState, settings: &ChatSettings) -> bool {
-    settings.memory_router_enabled.unwrap_or(state.config.memory_router_enabled)
+/// Включена ли слоистая память для этого чата: настройка чата поверх
+/// операторского умолчания (specs/memory-layers, «Операторские умолчания и
+/// лимиты слоистой памяти»).
+pub fn effective_layers_enabled(state: &AppState, settings: &ChatSettings) -> bool {
+    settings.memory_layers_enabled.unwrap_or(state.config.memory_layers_enabled)
 }
 
-pub fn effective_short_term_tail(state: &AppState, settings: &ChatSettings) -> u32 {
-    settings.memory_short_term_tail.unwrap_or(state.config.memory_short_term_tail_messages)
+pub fn effective_router_enabled(state: &AppState, settings: &ChatSettings) -> bool {
+    settings.memory_router_enabled.unwrap_or(state.config.memory_router_enabled)
 }
 
 pub fn effective_working_max_entries(state: &AppState, settings: &ChatSettings) -> u32 {
@@ -486,7 +459,6 @@ pub fn effective_long_term_max_entries(state: &AppState, settings: &ChatSettings
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentcore::agent::Role;
 
     fn limits() -> Limits {
         Limits {
@@ -512,10 +484,6 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
-    }
-
-    fn message(role: Role, seq: i64, content: &str) -> ChatMessage {
-        ChatMessage { seq, role, content: content.to_string(), reasoning: None, meta: None, created_at: 0 }
     }
 
     // --- 3.1 Разбор операций ---
@@ -662,7 +630,7 @@ mod tests {
     // --- 4.2 Порядок разделов ---
 
     #[tokio::test]
-    async fn assemble_orders_long_term_section_before_working_section() {
+    async fn layers_orders_long_term_section_before_working_section() {
         let state = AppState::for_tests().await;
         let chat = store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
         store::set_long_term_memory(&state.db, "owner-1", "decision", Some("auth"), "Clerk", "manual", None, 1)
@@ -672,64 +640,50 @@ mod tests {
             .await
             .expect("рабочая запись");
 
-        let outcome = assemble(&state, &chat, &chat.settings, "owner-1", Vec::new(), Message::user("новое")).await;
-        assert_eq!(outcome.sections.len(), 2);
-        assert!(outcome.sections[0].starts_with(LONG_TERM_SECTION_HEADING));
-        assert!(outcome.sections[1].starts_with(WORKING_SECTION_HEADING));
+        let memory = layers(&state, &chat, &chat.settings, "owner-1").await;
+        assert_eq!(memory.sections.len(), 2);
+        assert!(memory.sections[0].starts_with(LONG_TERM_SECTION_HEADING));
+        assert!(memory.sections[1].starts_with(WORKING_SECTION_HEADING));
     }
 
-    #[tokio::test]
-    async fn assemble_short_term_tail_is_limited_to_configured_size() {
-        let state = AppState::for_tests().await;
-        let chat = store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
-        let stored: Vec<ChatMessage> = (1..=20)
-            .map(|seq| {
-                if seq % 2 == 1 {
-                    message(Role::User, seq, &format!("вопрос {seq}"))
-                } else {
-                    message(Role::Assistant, seq, &format!("ответ {seq}"))
-                }
-            })
-            .collect();
-        let mut settings = chat.settings.clone();
-        settings.memory_short_term_tail = Some(6);
+    // --- 2.1 Краткосрочный слой считается по факту переданной истории ---
 
-        let outcome = assemble(&state, &chat, &settings, "owner-1", stored, Message::user("новое")).await;
-        assert_eq!(outcome.short_term_messages, 6);
-        assert_eq!(outcome.history.len(), 7, "6 сообщений хвоста плюс новое");
+    #[test]
+    fn merge_into_context_counts_short_term_from_passed_history_not_a_separate_setting() {
+        let memory = MemoryLayers { sections: Vec::new(), long_term_entries: 0, long_term_chars: 0, working_entries: 0, working_chars: 0 };
+        let history = vec![Message::user("вопрос"), Message::assistant("ответ подлиннее")];
+        let mut context = ContextDto::for_window(0, 0);
+        merge_into_context(&mut context, &memory, &history);
+        assert_eq!(context.memory_short_term_messages, Some(2));
+        let expected_chars: u32 = history.iter().map(|m| m.content.chars().count() as u32).sum();
+        assert_eq!(context.memory_short_term_chars, Some(expected_chars));
     }
 
     // --- 4.5 Счётчики блока context ---
 
     #[test]
-    fn context_dto_counters_reflect_actual_assembly() {
-        let outcome = MemoryLayersOutcome {
-            history: Vec::new(),
-            sections: Vec::new(),
-            long_term_entries: 2,
-            long_term_chars: 40,
-            working_entries: 1,
-            working_chars: 10,
-            short_term_messages: 3,
-            short_term_chars: 30,
-        };
+    fn merge_into_context_counters_reflect_actual_assembly() {
+        let memory = MemoryLayers { sections: Vec::new(), long_term_entries: 2, long_term_chars: 40, working_entries: 1, working_chars: 10 };
+        let history = vec![Message::user("а"), Message::user("б"), Message::user("в")];
+        let mut context = ContextDto::for_window(0, 0);
+        merge_into_context(&mut context, &memory, &history);
         let router = RouteOutcome { applied_set: 1, applied_update: 0, applied_delete: 0, rejected: 1 };
-        let dto = context_dto(&outcome, router);
-        assert_eq!(dto.memory_long_term_entries, Some(2));
-        assert_eq!(dto.memory_working_entries, Some(1));
-        assert_eq!(dto.memory_short_term_messages, Some(3));
-        assert_eq!(dto.memory_router_applied_set, Some(1));
-        assert_eq!(dto.memory_router_rejected, Some(1));
+        merge_router_counters(&mut context, router);
+        assert_eq!(context.memory_long_term_entries, Some(2));
+        assert_eq!(context.memory_working_entries, Some(1));
+        assert_eq!(context.memory_short_term_messages, Some(3));
+        assert_eq!(context.memory_router_applied_set, Some(1));
+        assert_eq!(context.memory_router_rejected, Some(1));
     }
 
     // --- 5.2 Настройка чата переопределяет операторское умолчание ---
 
     #[tokio::test]
-    async fn chat_setting_overrides_operator_default_short_term_tail() {
+    async fn chat_setting_overrides_operator_default_layers_enabled() {
         let state = AppState::for_tests().await;
-        assert_eq!(effective_short_term_tail(&state, &ChatSettings::default()), state.config.memory_short_term_tail_messages);
-        let settings = ChatSettings { memory_short_term_tail: Some(4), ..ChatSettings::default() };
-        assert_eq!(effective_short_term_tail(&state, &settings), 4);
+        assert_eq!(effective_layers_enabled(&state, &ChatSettings::default()), state.config.memory_layers_enabled);
+        let settings = ChatSettings { memory_layers_enabled: Some(true), ..ChatSettings::default() };
+        assert!(effective_layers_enabled(&state, &settings));
     }
 
     // --- 7.1 Значение записи маскируется в журнале по умолчанию ---

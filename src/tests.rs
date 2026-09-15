@@ -3200,7 +3200,7 @@ async fn chat_created_with_own_title_skips_generation() {
     assert_eq!(loaded.body["title"], "Своё название");
 }
 
-// --- 3.5/5.3 memory_layers: устойчивость маршрутизатора и список разрешённых стратегий ---
+// --- 3.5/5.3 слоистая память: устойчивость маршрутизатора и что "memory_layers" больше не стратегия ---
 
 #[tokio::test]
 async fn memory_router_failure_does_not_break_main_response_or_change_memory() {
@@ -3222,7 +3222,7 @@ async fn memory_router_failure_does_not_break_main_response_or_change_memory() {
     let created = create_chat(
         state.clone(),
         None,
-        serde_json::json!({ "settings": { "context_strategy": "memory_layers" } }),
+        serde_json::json!({ "settings": { "context_strategy": "sliding_window", "memory_layers_enabled": true } }),
     )
     .await;
     let id = created.body["id"].as_str().unwrap().to_string();
@@ -3245,8 +3245,12 @@ async fn memory_router_failure_does_not_break_main_response_or_change_memory() {
     assert!(working.is_empty(), "отказ маршрутизатора не должен менять состояние памяти");
 }
 
+/// `memory_layers` — больше не значение `context_strategy`: запрос с ним
+/// отклоняется как любое другое незнакомое имя стратегии, а не как
+/// «стратегия не в списке разрешённых» (specs/memory-layers, «Стратегия
+/// контекста memory_layers», REMOVED).
 #[tokio::test]
-async fn memory_layers_is_rejected_when_not_in_allowed_context_strategies() {
+async fn context_strategy_memory_layers_is_rejected_as_unknown_value() {
     let _guard = test_lock();
     let server = MockServer::start().await;
     let state = state_with_provider(&server, &[("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "summary")]).await;
@@ -3263,7 +3267,158 @@ async fn memory_layers_is_rejected_when_not_in_allowed_context_strategies() {
     )
     .await;
     assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
-    assert_eq!(sent.body["error"]["code"], "context_strategy_not_allowed");
+    assert_eq!(sent.body["error"]["code"], "context_strategy_invalid");
+}
+
+/// Слоистая память доступна поверх любой стратегии из
+/// `AGENTD_ALLOWED_CONTEXT_STRATEGIES`, список которого больше не определяет
+/// и не ограничивает её доступность отдельно (specs/memory-layers,
+/// «Слоистая память включена независимо от списка разрешённых стратегий»).
+#[tokio::test]
+async fn memory_layers_enabled_works_over_a_strategy_allowed_by_the_operator_list() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "sliding_window")]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "context_strategy": "sliding_window", "memory_layers_enabled": true } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(state, post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["context"]["strategy"], "sliding_window");
+    assert_eq!(sent.body["context"]["memory_long_term_entries"], 0);
+}
+
+/// Фоновый маршрутизатор памяти запускается по независимому переключателю
+/// слоистой памяти, а не по действующей стратегии контекста
+/// (decouple-memory-layers, решение 3): при одной и той же стратегии
+/// `sliding_window` он вызывается при включённой памяти и не вызывается при
+/// выключенной.
+#[tokio::test]
+async fn memory_router_runs_only_when_memory_layers_enabled_regardless_of_strategy() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("[]")))
+        .mount(&server)
+        .await;
+    // Генерация названия чата — фоновый вызов той же модели после первого
+    // обмена: выключаем, чтобы считать только запросы основного ответа и
+    // маршрутизатора памяти.
+    let state = state_with_provider(&server, &[("AGENTD_AUTO_TITLE", "false")]).await;
+
+    let enabled = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "context_strategy": "sliding_window", "memory_layers_enabled": true } }),
+    )
+    .await;
+    let enabled_id = enabled.body["id"].as_str().unwrap().to_string();
+    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": enabled_id, "prompt": "вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let requests_after_enabled = server.received_requests().await.expect("запросы").len();
+    assert_eq!(requests_after_enabled, 2, "маршрутизатор должен вызваться вторым запросом при включённой памяти");
+
+    let disabled = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "context_strategy": "sliding_window", "memory_layers_enabled": false } }),
+    )
+    .await;
+    let disabled_id = disabled.body["id"].as_str().unwrap().to_string();
+    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": disabled_id, "prompt": "вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let requests_after_disabled = server.received_requests().await.expect("запросы").len();
+    assert_eq!(
+        requests_after_disabled,
+        requests_after_enabled + 1,
+        "маршрутизатор не должен вызываться при выключенной памяти"
+    );
+}
+
+/// Слоистая память сочетается с каждой из четырёх оставшихся стратегий
+/// контекста: ответ несёт поля стратегии и поля памяти одновременно
+/// (specs/memory-layers, «Разбивка по слоям в блоке context ответа»).
+#[tokio::test]
+async fn memory_layers_combines_with_each_context_strategy() {
+    for strategy in ["summary", "sliding_window", "facts", "branching"] {
+        let _guard = test_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+            .mount(&server)
+            .await;
+        let state = state_with_provider(&server, &[]).await;
+        let created = create_chat(
+            state.clone(),
+            None,
+            serde_json::json!({ "settings": { "context_strategy": strategy, "memory_layers_enabled": true, "memory_router_enabled": false } }),
+        )
+        .await;
+        let id = created.body["id"].as_str().unwrap().to_string();
+        crate::store::set_long_term_memory(&state.db, crate::store::ANONYMOUS_OWNER, "decision", Some("auth"), "Clerk", "manual", None, 1)
+            .await
+            .expect("долговременная запись");
+
+        let sent = send(state, post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+        assert_eq!(sent.status, StatusCode::OK, "стратегия {strategy}: тело {}", sent.body);
+        assert_eq!(sent.body["context"]["strategy"], strategy, "стратегия {strategy}");
+        assert_eq!(
+            sent.body["context"]["memory_long_term_entries"], 1,
+            "стратегия {strategy}: поля памяти должны присутствовать вместе с полями стратегии"
+        );
+    }
+}
+
+/// Факт (стратегия `facts`) и запись долговременной памяти (слоистая
+/// память), сохранённые ранее, одновременно попадают в системное сообщение
+/// следующего запроса, каждый в своём разделе (specs/memory-layers).
+#[tokio::test]
+async fn facts_and_memory_layers_sections_both_land_in_next_system_message() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "context_strategy": "facts", "memory_layers_enabled": true, "memory_router_enabled": false } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    crate::store::set_fact(&state.db, &id, "budget", "200000", 1).await.expect("факт сохранён");
+    crate::store::set_long_term_memory(&state.db, crate::store::ANONYMOUS_OWNER, "decision", Some("auth"), "Clerk", "manual", None, 1)
+        .await
+        .expect("долговременная запись");
+
+    let sent = send(state, post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+
+    // Первый запрос — основной вызов модели (с системным сообщением);
+    // второй — фоновое обновление фактов уже другим, однострочным промптом.
+    let requests = server.received_requests().await.expect("запросы");
+    let first = requests.first().expect("хотя бы один запрос");
+    let body: serde_json::Value = first.body_json().expect("тело запроса — JSON");
+    let system = body["messages"][0]["content"].as_str().expect("системное сообщение");
+    assert!(system.contains("Факты чата:"), "раздел фактов отсутствует: {system}");
+    assert!(system.contains("Долговременная память:"), "раздел памяти отсутствует: {system}");
 }
 
 // --- 6.2/6.3 Эндпоинты памяти (specs/memory-layers) ---

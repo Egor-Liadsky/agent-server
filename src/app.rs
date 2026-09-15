@@ -702,8 +702,10 @@ async fn handle_chat_in_existing(
 
     // Маршрутизатор памяти — тоже фоновый вызов, после записи обмена, вне
     // ответа пользователю (design.md, решение 5, «Риски»): результат этого
-    // прогона попадёт в блок `context` СЛЕДУЮЩЕГО ответа этого чата.
-    if strategy == agentcore::config::ContextStrategy::MemoryLayers
+    // прогона попадёт в блок `context` СЛЕДУЮЩЕГО ответа этого чата. Запуск
+    // зависит от независимого переключателя слоистой памяти, а не от
+    // действующей стратегии контекста (decouple-memory-layers, решение 3).
+    if crate::memory::effective_layers_enabled(&state, &settings)
         && crate::memory::effective_router_enabled(&state, &settings)
     {
         let route_state = state.clone();
