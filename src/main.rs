@@ -9,7 +9,9 @@ mod middleware;
 mod state;
 mod store;
 mod summary;
+mod system_message;
 mod telemetry;
+mod title;
 mod window;
 
 #[cfg(test)]

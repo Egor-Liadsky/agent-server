@@ -37,8 +37,8 @@ const DEFAULT_CHATS_LIMIT: u32 = 50;
 const MAX_CHATS_LIMIT: u32 = 200;
 const DEFAULT_MESSAGES_LIMIT: u32 = 200;
 const MAX_MESSAGES_LIMIT: u32 = 500;
-const DEFAULT_CHAT_TITLE: &str = "Новый чат";
-const MAX_CHAT_TITLE_LEN: usize = 200;
+pub(crate) const DEFAULT_CHAT_TITLE: &str = "Новый чат";
+pub(crate) const MAX_CHAT_TITLE_LEN: usize = 200;
 /// Предел одной дозаписи: обмен с локальной моделью — это две реплики, а
 /// запас нужен только на повтор после неудачи, не на выгрузку истории.
 const MAX_APPEND_MESSAGES: usize = 100;
@@ -97,6 +97,7 @@ fn role_str(role: &agentcore::agent::Role) -> &'static str {
     match role {
         agentcore::agent::Role::User => "user",
         agentcore::agent::Role::Assistant => "assistant",
+        agentcore::agent::Role::System => "system",
     }
 }
 
@@ -165,6 +166,10 @@ pub(crate) struct CompactionOutcome {
     pub(crate) history: Vec<Message>,
     pub(crate) replaced_messages: u32,
     pub(crate) summary_built: bool,
+    /// Раздел пересказа для системного сообщения запроса. `None` — чат
+    /// целиком укладывается в дословный хвост (specs/context-summary,
+    /// «Короткий чат не получает раздела пересказа»).
+    pub(crate) summary_section: Option<String>,
 }
 
 fn history_without_compaction(stored: Vec<store::ChatMessage>, new_message: Message) -> CompactionOutcome {
@@ -174,6 +179,7 @@ fn history_without_compaction(stored: Vec<store::ChatMessage>, new_message: Mess
         history,
         replaced_messages: 0,
         summary_built: false,
+        summary_section: None,
     }
 }
 
@@ -217,11 +223,12 @@ pub(crate) async fn compact_history(
             // Прежний пересказ есть — подставляем его без обращения к модели.
             Some(text) => {
                 let tail = &stored[boundary..];
-                let history = summary::assemble_history(Some(&text), tail, new_message);
+                let history = summary::assemble_history(tail, new_message);
                 CompactionOutcome {
                     history,
                     replaced_messages: boundary as u32,
                     summary_built: false,
+                    summary_section: Some(summary::summary_section(&text)),
                 }
             }
             // Пересказа ещё нет, а порог не достигнут: компактизация ещё не
@@ -272,11 +279,12 @@ pub(crate) async fn compact_history(
     match final_summary {
         Some(text) => {
             let tail = &stored[boundary..];
-            let history = summary::assemble_history(Some(&text), tail, new_message);
+            let history = summary::assemble_history(tail, new_message);
             CompactionOutcome {
                 history,
                 replaced_messages: boundary as u32,
                 summary_built,
+                summary_section: Some(summary::summary_section(&text)),
             }
         }
         None => history_without_compaction(stored, new_message),
@@ -649,6 +657,11 @@ async fn handle_chat_in_existing(
     let mut assembled =
         context::assemble(&state, &chat, &settings, strategy, stored.messages, user_message.clone()).await;
     let history = std::mem::take(&mut assembled.history);
+    // Системное сообщение уходит первым при любой стратегии (design.md,
+    // решение 3): его текст переиспользуется как контекст для генерации
+    // названия чата, не задерживая ответ пользователю вторым обращением к
+    // системному сообщению.
+    let system_text = history.first().map(|m| m.content.clone()).unwrap_or_default();
 
     let limit = effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
     check_context_limit(&history, limit)?;
@@ -683,6 +696,23 @@ async fn handle_chat_in_existing(
         let facts_updated =
             crate::facts::update_after_exchange(&state, &chat_id, &settings, &prompt, user_row.seq).await;
         assembled.context.facts_updated = Some(facts_updated);
+    }
+
+    // Название генерируется фоном, вне ответа пользователю (design.md,
+    // решение 5): ответ уже сформирован, ждать вызов модели незачем.
+    if crate::title::should_generate(&state, &chat.title, user_row.seq) {
+        let state = state.clone();
+        let title_chat_id = chat_id.clone();
+        let owner = owner.clone();
+        let settings = settings.clone();
+        tokio::spawn(crate::title::generate_and_save(
+            state,
+            title_chat_id,
+            owner,
+            settings,
+            system_text,
+            prompt.clone(),
+        ));
     }
 
     Ok(ChatResponse::new(request_id, model, &reply, policy)

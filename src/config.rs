@@ -25,6 +25,10 @@ pub const DEFAULT_CONTEXT_WINDOW_MESSAGES: u32 = 10;
 pub const DEFAULT_MAX_FACTS: u32 = 50;
 pub const DEFAULT_FACT_VALUE_MAX_CHARS: u32 = 500;
 pub const DEFAULT_MAX_BRANCH_DEPTH: u32 = 8;
+/// Базовый текст системного сообщения, если оператор не задал свой
+/// (specs/context-strategies, «Базовый текст системного сообщения
+/// настраивается оператором»).
+pub const DEFAULT_SYSTEM_PROMPT: &str = "Ты — полезный ассистент.";
 
 pub const API_KEY_VAR: &str = "AGENTD_UPSTREAM_API_KEY";
 
@@ -102,6 +106,15 @@ pub struct AgentdConfig {
     pub facts_model: Option<String>,
     /// Потолок длины цепочки родителей при сборке истории ветки.
     pub max_branch_depth: u32,
+    /// Базовый текст системного сообщения, отправляемого первым в каждом
+    /// запросе с `chat_id` (specs/context-strategies).
+    pub system_prompt: String,
+    /// Автоматическая генерация названия чата после первого обмена
+    /// (specs/chat-title). Включена по умолчанию.
+    pub auto_title: bool,
+    /// Модель для запроса названия чата. `None` — модель сервиса по
+    /// умолчанию.
+    pub title_model: Option<String>,
 }
 
 impl AgentdConfig {
@@ -264,6 +277,9 @@ impl AgentdConfig {
                 "AGENTD_MAX_BRANCH_DEPTH",
                 DEFAULT_MAX_BRANCH_DEPTH,
             )?,
+            system_prompt: get("AGENTD_SYSTEM_PROMPT").unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
+            auto_title: parse_bool_named_default(get("AGENTD_AUTO_TITLE"), "AGENTD_AUTO_TITLE", true)?,
+            title_model: get("AGENTD_TITLE_MODEL"),
         })
     }
 
@@ -355,6 +371,17 @@ fn parse_bool_named(value: Option<String>, name: &str) -> Result<bool> {
 
 fn parse_bool(value: Option<String>) -> Result<bool> {
     parse_bool_named(value, "AGENTD_LOG_CONTENT")
+}
+
+/// Как `parse_bool_named`, но незаданная переменная даёт `default`, а не
+/// всегда `false`: `AGENTD_AUTO_TITLE` включена по умолчанию.
+fn parse_bool_named_default(value: Option<String>, name: &str, default: bool) -> Result<bool> {
+    match value.as_deref() {
+        None => Ok(default),
+        Some("1" | "true" | "yes" | "on") => Ok(true),
+        Some("0" | "false" | "no" | "off") => Ok(false),
+        Some(other) => bail!("{name} должен быть булевым значением, задано: {other}"),
+    }
 }
 
 /// Маскированное представление секрета: не более четырёх первых и четырёх
@@ -724,5 +751,50 @@ mod tests {
         let masked = config.masked_api_key();
         assert_eq!(masked, "sk-1***abcd");
         assert!(!masked.contains("234567890"));
+    }
+
+    #[test]
+    fn system_prompt_defaults_when_not_set() {
+        let config = config_from(&[(API_KEY_VAR, "secret-key-value")]).expect("конфигурация");
+        assert_eq!(config.system_prompt, DEFAULT_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn system_prompt_uses_operator_value_when_set() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_SYSTEM_PROMPT", "свой базовый текст"),
+        ])
+        .expect("конфигурация");
+        assert_eq!(config.system_prompt, "свой базовый текст");
+    }
+
+    #[test]
+    fn auto_title_defaults_to_enabled() {
+        let config = config_from(&[(API_KEY_VAR, "secret-key-value")]).expect("конфигурация");
+        assert!(config.auto_title);
+        assert_eq!(config.title_model, None);
+    }
+
+    #[test]
+    fn auto_title_can_be_disabled_and_title_model_set() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_AUTO_TITLE", "false"),
+            ("AGENTD_TITLE_MODEL", "title-model"),
+        ])
+        .expect("конфигурация");
+        assert!(!config.auto_title);
+        assert_eq!(config.title_model.as_deref(), Some("title-model"));
+    }
+
+    #[test]
+    fn invalid_auto_title_value_fails_startup() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_AUTO_TITLE", "magic"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_AUTO_TITLE"));
     }
 }

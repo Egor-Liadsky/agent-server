@@ -489,6 +489,10 @@ impl From<store::ChatMessage> for MessageView {
         let role = match message.role {
             Role::User => RoleDto::User,
             Role::Assistant => RoleDto::Assistant,
+            // Системные сообщения хранилище никогда не пишет (design.md,
+            // решение 4): ветка — только защита от несуществующего на
+            // практике случая, `RoleDto` варианта `System` не имеет.
+            Role::System => RoleDto::User,
         };
         let (reasoning, model, usage, timing) = if matches!(message.role, Role::Assistant) {
             let usage = message.meta.as_ref().map(UsageDto::from);

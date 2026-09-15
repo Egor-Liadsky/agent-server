@@ -2892,7 +2892,7 @@ async fn window_of_six_out_of_twenty_messages_reaches_provider_and_full_history_
     let last = requests.last().expect("запрос к провайдеру");
     let body: serde_json::Value = serde_json::from_slice(&last.body).expect("тело запроса");
     let messages = body["messages"].as_array().expect("messages");
-    assert_eq!(messages.len(), 7, "6 сообщений окна плюс новое");
+    assert_eq!(messages.len(), 8, "системное сообщение, 6 сообщений окна плюс новое");
 
     let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
     assert_eq!(loaded.body["message_count"], 22, "чтение чата возвращает всю сохранённую историю");
@@ -3034,6 +3034,170 @@ async fn facts_update_failure_does_not_break_main_response() {
 
     let facts = send(state, request("GET", &facts_uri(&id), None, None)).await;
     assert!(facts.body["facts"].as_array().unwrap().is_empty(), "факты остаются прежними при отказе обновления");
+}
+
+// --- 4.4/4.5 Автоматическое название чата (specs/chat-title) ---
+
+#[tokio::test]
+async fn title_generation_saves_provider_title_after_first_exchange() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(crate::title::TITLE_UPDATE_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("\"Бюджет проекта\".")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(crate::title::TITLE_UPDATE_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let owner = crate::store::ANONYMOUS_OWNER.to_string();
+    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+        .await
+        .expect("чат");
+
+    crate::title::generate_and_save(
+        state.clone(),
+        id.clone(),
+        owner,
+        chat.settings.clone(),
+        state.config.system_prompt.clone(),
+        "бюджет на проект".to_string(),
+    )
+    .await;
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["title"], "Бюджет проекта");
+}
+
+#[tokio::test]
+async fn title_generation_failure_leaves_default_title() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let owner = crate::store::ANONYMOUS_OWNER.to_string();
+    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+        .await
+        .expect("чат");
+
+    crate::title::generate_and_save(
+        state.clone(),
+        id.clone(),
+        owner,
+        chat.settings.clone(),
+        state.config.system_prompt.clone(),
+        "бюджет на проект".to_string(),
+    )
+    .await;
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["title"], "Новый чат", "отказ генерации не должен менять название");
+}
+
+#[tokio::test]
+async fn manual_rename_during_generation_is_kept() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("Название от модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let owner = crate::store::ANONYMOUS_OWNER.to_string();
+    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+        .await
+        .expect("чат");
+
+    // Клиент переименовывает чат ДО того, как фоновая генерация успела
+    // записать результат (specs/chat-title, «Ручное переименование во время
+    // генерации»).
+    send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "title": "Название клиента" })),
+            None,
+        ),
+    )
+    .await;
+
+    crate::title::generate_and_save(
+        state.clone(),
+        id.clone(),
+        owner,
+        chat.settings.clone(),
+        state.config.system_prompt.clone(),
+        "бюджет на проект".to_string(),
+    )
+    .await;
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["title"], "Название клиента", "название клиента не должно быть перезаписано");
+}
+
+#[tokio::test]
+async fn auto_title_disabled_sends_no_title_request() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_AUTO_TITLE", "false")]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "первый вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let requests = server.received_requests().await.expect("запросы");
+    assert_eq!(requests.len(), 1, "выключенная генерация не делает второго вызова к провайдеру");
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["title"], "Новый чат");
+}
+
+#[tokio::test]
+async fn chat_created_with_own_title_skips_generation() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({ "title": "Своё название" })).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "первый вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let requests = server.received_requests().await.expect("запросы");
+    assert_eq!(requests.len(), 1, "чат со своим названием не запускает генерацию");
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    assert_eq!(loaded.body["title"], "Своё название");
 }
 
 // --- 7.3 Эндпоинты веток ---

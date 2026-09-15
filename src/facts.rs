@@ -10,10 +10,9 @@ use agentcore::agent::{Agent, Message};
 use agentcore::config::{ChatSettings, ReasoningMode, ThinkingMode};
 use serde::Deserialize;
 
-/// Метка блока фактов в истории — отличает его от обычных сообщений
-/// пользователя (specs/context-facts, «Блок фактов передаётся как отдельное
-/// сообщение... и SHALL быть отличим от сообщений пользователя»).
-const FACTS_MARKER: &str = "[факты чата]";
+/// Заголовок раздела фактов в системном сообщении (specs/context-facts,
+/// «Раздел SHALL быть явно озаглавлен как факты чата»).
+const FACTS_SECTION_HEADING: &str = "Факты чата:";
 /// Отличает вызов обновления фактов от обычного диалогового вызова в
 /// тестах, мокающих провайдера по содержимому тела запроса.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -21,6 +20,9 @@ pub const FACTS_UPDATE_MARKER: &str = "Верни JSON-массив операц
 
 pub struct FactsOutcome {
     pub history: Vec<Message>,
+    /// Раздел фактов для системного сообщения запроса. `None` — фактов нет
+    /// (specs/context-facts, «Пустой набор фактов не добавляет раздела»).
+    pub facts_section: Option<String>,
     pub sent_messages: u32,
     pub dropped_messages: u32,
     pub facts_applied: u32,
@@ -35,19 +37,20 @@ fn message_from_stored(stored: ChatMessage) -> Message {
     }
 }
 
-/// Текст блока фактов — пустой набор не создаёт сообщения совсем
-/// (specs/context-facts, «Пустых фактов в запросе нет»).
-fn facts_block(facts: &[store::Fact]) -> Option<String> {
+/// Текст раздела фактов для системного сообщения — пустой набор не создаёт
+/// раздела совсем (specs/context-facts, «Пустой набор фактов не добавляет
+/// раздела»).
+fn facts_section(facts: &[store::Fact]) -> Option<String> {
     if facts.is_empty() {
         return None;
     }
     let lines: Vec<String> = facts.iter().map(|f| format!("- {}: {}", f.key, f.value)).collect();
-    Some(format!("{FACTS_MARKER}\n{}", lines.join("\n")))
+    Some(format!("{FACTS_SECTION_HEADING}\n{}", lines.join("\n")))
 }
 
-/// История для провайдера: блок фактов (если есть), затем последние
-/// `window_size` сообщений, затем новое сообщение (specs/context-facts,
-/// «Запрос собирается из фактов и хвоста истории»).
+/// История для провайдера: последние `window_size` сообщений, затем новое
+/// сообщение — блок фактов уходит отдельно, разделом системного сообщения
+/// (specs/context-facts, «Блок фактов передаётся системным сообщением»).
 pub async fn assemble(
     state: &AppState,
     chat_id: &str,
@@ -63,21 +66,20 @@ pub async fn assemble(
         }
     };
     let facts_applied = facts.len() as u32;
+    let facts_section = facts_section(&facts);
 
     let boundary = crate::summary::tail_boundary(&stored, window_size);
     let dropped_messages = boundary as u32;
     let tail = &stored[boundary..];
     let sent_messages = tail.len() as u32;
 
-    let mut history = Vec::with_capacity(tail.len() + 2);
-    if let Some(block) = facts_block(&facts) {
-        history.push(Message::user(block));
-    }
+    let mut history = Vec::with_capacity(tail.len() + 1);
     history.extend(tail.iter().cloned().map(message_from_stored));
     history.push(new_message);
 
     FactsOutcome {
         history,
+        facts_section,
         sent_messages,
         dropped_messages,
         facts_applied,
@@ -262,20 +264,20 @@ mod tests {
     // --- 6.4 Сборка истории ---
 
     #[test]
-    fn facts_block_is_absent_when_empty() {
-        assert!(facts_block(&[]).is_none());
+    fn facts_section_is_absent_when_empty() {
+        assert!(facts_section(&[]).is_none());
     }
 
     #[test]
-    fn facts_block_lists_each_fact() {
-        let block = facts_block(&[fact("budget", "200000"), fact("deadline", "март")]).expect("блок фактов");
-        assert!(block.contains(FACTS_MARKER));
-        assert!(block.contains("budget: 200000"));
-        assert!(block.contains("deadline: март"));
+    fn facts_section_lists_each_fact() {
+        let section = facts_section(&[fact("budget", "200000"), fact("deadline", "март")]).expect("раздел фактов");
+        assert!(section.contains(FACTS_SECTION_HEADING));
+        assert!(section.contains("budget: 200000"));
+        assert!(section.contains("deadline: март"));
     }
 
     #[tokio::test]
-    async fn assemble_orders_facts_then_tail_then_new_message() {
+    async fn assemble_orders_facts_section_then_tail_then_new_message() {
         let state = crate::state::AppState::for_tests().await;
         let chat = store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default())
             .await
@@ -288,9 +290,11 @@ mod tests {
         let outcome = assemble(&state, &chat.id, 6, stored, Message::user("новое")).await;
 
         assert_eq!(outcome.facts_applied, 1);
-        assert_eq!(outcome.history.len(), 3);
-        assert!(outcome.history[0].content.contains(FACTS_MARKER));
-        assert_eq!(outcome.history[1].content, "первое сообщение");
-        assert_eq!(outcome.history[2].content, "новое");
+        assert_eq!(outcome.history.len(), 2);
+        let section = outcome.facts_section.expect("раздел фактов собран");
+        assert!(section.contains(FACTS_SECTION_HEADING));
+        assert!(section.contains("budget: 200000"));
+        assert_eq!(outcome.history[0].content, "первое сообщение");
+        assert_eq!(outcome.history[1].content, "новое");
     }
 }

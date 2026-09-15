@@ -105,13 +105,23 @@ fn role_to_str(role: Role) -> &'static str {
     match role {
         Role::User => "user",
         Role::Assistant => "assistant",
+        // Системные сообщения не записываются: они синтезируются на каждый
+        // запрос (design.md, решение 4). Ветка нужна только для
+        // исчерпывающего match.
+        Role::System => "system",
     }
 }
 
+/// `"system"` разбирается наравне с `"user"`/`"assistant"`, хотя
+/// системные сообщения хранилище никогда не пишет: чтение не должно
+/// падать, если строка с такой ролью всё же появится в базе
+/// (design.md, решение 4, «чтобы чтение не падало на данных из
+/// будущего»).
 fn role_from_str(value: &str) -> Result<Role, StoreError> {
     match value {
         "user" => Ok(Role::User),
         "assistant" => Ok(Role::Assistant),
+        "system" => Ok(Role::System),
         other => Err(StoreError::Backend(anyhow::anyhow!(
             "неизвестная роль сообщения в хранилище: {other}"
         ))),
@@ -325,6 +335,32 @@ pub async fn update_chat(
 
     tx.commit().await?;
     load_chat(pool, owner, id, defaults).await
+}
+
+/// Обновляет название чата, только если оно всё ещё равно `expected` —
+/// закрывает гонку с ручным `PATCH /v1/chats/{id}` одним запросом: если
+/// клиент успел переименовать чат, условие не выполнится и сгенерированное
+/// название будет отброшено (specs/chat-title, design.md, решение 6).
+/// Возвращает `true`, если строка действительно обновилась.
+pub async fn set_title_if_default(
+    pool: &SqlitePool,
+    owner: &str,
+    id: &str,
+    title: &str,
+    expected: &str,
+) -> Result<bool, StoreError> {
+    let now = now_secs();
+    let result = sqlx::query(
+        "UPDATE chats SET title = ?, updated_at = ? WHERE id = ? AND owner = ? AND title = ?",
+    )
+    .bind(title)
+    .bind(now)
+    .bind(id)
+    .bind(owner)
+    .bind(expected)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn delete_chat(pool: &SqlitePool, owner: &str, id: &str) -> Result<(), StoreError> {
@@ -1032,6 +1068,57 @@ mod tests {
             reasoning: None,
             meta: None,
         }
+    }
+
+    // --- Условное обновление названия чата (specs/chat-title, design.md, решение 6) ---
+
+    #[tokio::test]
+    async fn set_title_if_default_updates_when_title_still_matches() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Новый чат", &ChatSettings::default())
+            .await
+            .expect("чат");
+        let updated = set_title_if_default(&pool, "owner-1", &chat.id, "Название от модели", "Новый чат")
+            .await
+            .expect("обновление названия");
+        assert!(updated);
+        let loaded = load_chat(&pool, "owner-1", &chat.id, &ChatSettings::default())
+            .await
+            .expect("чат");
+        assert_eq!(loaded.title, "Название от модели");
+    }
+
+    #[tokio::test]
+    async fn set_title_if_default_is_noop_when_title_already_changed() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Новый чат", &ChatSettings::default())
+            .await
+            .expect("чат");
+        update_chat(&pool, "owner-1", &chat.id, Some("Название клиента"), None, &ChatSettings::default())
+            .await
+            .expect("переименование");
+
+        let updated = set_title_if_default(&pool, "owner-1", &chat.id, "Название от модели", "Новый чат")
+            .await
+            .expect("обновление названия");
+        assert!(!updated);
+        let loaded = load_chat(&pool, "owner-1", &chat.id, &ChatSettings::default())
+            .await
+            .expect("чат");
+        assert_eq!(loaded.title, "Название клиента");
+    }
+
+    // --- Роль "system" в хранилище (design.md, решение 4) ---
+
+    #[test]
+    fn role_from_str_accepts_system() {
+        assert!(matches!(role_from_str("system"), Ok(Role::System)));
+    }
+
+    #[test]
+    fn role_to_str_round_trips_system() {
+        assert_eq!(role_to_str(Role::System), "system");
+        assert!(matches!(role_from_str(role_to_str(Role::System)), Ok(Role::System)));
     }
 
     // --- 2.2 Открытие пула ---

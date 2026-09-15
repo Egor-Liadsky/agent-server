@@ -5,9 +5,9 @@
 use crate::store::ChatMessage;
 use agentcore::agent::{Message, Role};
 
-/// Заголовок-маркер, которым начинается сообщение-пересказ: `Role` ядра не
-/// содержит `System`, поэтому пересказ идёт первым сообщением роли `user`
-/// (design.md, решение 5).
+/// Заголовок раздела пересказа в системном сообщении (specs/context-summary,
+/// «Раздел SHALL быть явно озаглавлен как краткое содержание предыдущей
+/// части разговора»).
 pub const SUMMARY_MARKER: &str = "Краткое содержание предыдущей части разговора:";
 
 /// Индекс начала дословного хвоста: последние `keep_messages` сообщений,
@@ -41,6 +41,9 @@ fn role_label(role: Role) -> &'static str {
     match role {
         Role::User => "Пользователь",
         Role::Assistant => "Модель",
+        // Системное сообщение в вытесняемой части не хранится и в пересказ
+        // не попадает; ветка нужна только для исчерпывающего match.
+        Role::System => "Система",
     }
 }
 
@@ -89,19 +92,16 @@ fn message_from_stored(message: &ChatMessage) -> Message {
     }
 }
 
-/// Сообщение-пересказ, помещаемое первым в историю запроса.
-pub fn summary_message(summary: &str) -> Message {
-    Message::user(format!("{SUMMARY_MARKER}\n\n{summary}"))
+/// Раздел пересказа для системного сообщения запроса.
+pub fn summary_section(summary: &str) -> String {
+    format!("{SUMMARY_MARKER}\n\n{summary}")
 }
 
-/// Итоговая история запроса: пересказ (если применяется) первым сообщением,
-/// затем дословный хвост, затем новое сообщение пользователя
-/// (specs/context-summary, «Дословный хвост и подстановка пересказа»).
-pub fn assemble_history(summary: Option<&str>, tail: &[ChatMessage], new_message: Message) -> Vec<Message> {
-    let mut history = Vec::with_capacity(tail.len() + 2);
-    if let Some(summary) = summary {
-        history.push(summary_message(summary));
-    }
+/// Итоговая история запроса: дословный хвост, затем новое сообщение
+/// пользователя — пересказ уходит отдельно, разделом системного сообщения
+/// (specs/context-summary, «Пересказ передаётся системным сообщением»).
+pub fn assemble_history(tail: &[ChatMessage], new_message: Message) -> Vec<Message> {
+    let mut history = Vec::with_capacity(tail.len() + 1);
     history.extend(tail.iter().map(message_from_stored));
     history.push(new_message);
     history
@@ -169,24 +169,20 @@ mod tests {
     // --- 9.2 Подстановка пересказа ---
 
     #[test]
-    fn assembled_history_has_summary_tail_and_new_message() {
-        let tail = exchange(&[(5, "в3", "о3")]);
-        let history = assemble_history(Some("итог прошлого"), &tail, Message::user("новый вопрос"));
-        assert_eq!(history.len(), 4);
-        assert!(matches!(history[0].role, Role::User));
-        assert!(history[0].content.starts_with(SUMMARY_MARKER));
-        assert!(history[0].content.contains("итог прошлого"));
-        assert_eq!(history[1].content, "в3");
-        assert_eq!(history[2].content, "о3");
-        assert_eq!(history[3].content, "новый вопрос");
+    fn summary_section_starts_with_marker_and_contains_summary() {
+        let section = summary_section("итог прошлого");
+        assert!(section.starts_with(SUMMARY_MARKER));
+        assert!(section.contains("итог прошлого"));
     }
 
     #[test]
-    fn assembled_history_without_summary_has_only_tail_and_new_message() {
+    fn assembled_history_has_only_tail_and_new_message() {
         let tail = exchange(&[(5, "в3", "о3")]);
-        let history = assemble_history(None, &tail, Message::user("новый вопрос"));
+        let history = assemble_history(&tail, Message::user("новый вопрос"));
         assert_eq!(history.len(), 3);
         assert_eq!(history[0].content, "в3");
+        assert_eq!(history[1].content, "о3");
+        assert_eq!(history[2].content, "новый вопрос");
     }
 
     // --- 9.3 Правило ступени ---
