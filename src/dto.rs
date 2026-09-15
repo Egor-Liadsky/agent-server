@@ -135,6 +135,16 @@ pub struct ChatSettingsDto {
     pub context_strategy: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub context_window_messages: Option<Option<u32>>,
+    /// Автомаршрутизатор памяти этого чата (стратегия `memory_layers`).
+    /// Та же семантика присутствия поля, что и у `summary_enabled`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub memory_router_enabled: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub memory_short_term_tail: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub memory_working_max_entries: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub memory_long_term_max_entries: Option<Option<u32>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -225,6 +235,12 @@ impl ChatSettingsDto {
         defaults.summary_step_messages = self
             .summary_step_messages
             .unwrap_or(defaults.summary_step_messages);
+        defaults.memory_router_enabled = self.memory_router_enabled.unwrap_or(defaults.memory_router_enabled);
+        defaults.memory_short_term_tail = self.memory_short_term_tail.unwrap_or(defaults.memory_short_term_tail);
+        defaults.memory_working_max_entries =
+            self.memory_working_max_entries.unwrap_or(defaults.memory_working_max_entries);
+        defaults.memory_long_term_max_entries =
+            self.memory_long_term_max_entries.unwrap_or(defaults.memory_long_term_max_entries);
         Ok(defaults)
     }
 }
@@ -286,6 +302,37 @@ pub struct ContextDto {
     /// Ветка, из которой собрана история (`branching`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_id: Option<String>,
+    /// Число записей долговременной памяти, подставленных в контекст (`memory_layers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_long_term_entries: Option<u32>,
+    /// Объём долговременной памяти в контексте, в символах (`memory_layers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_long_term_chars: Option<u32>,
+    /// Число записей рабочей памяти, подставленных в контекст (`memory_layers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_working_entries: Option<u32>,
+    /// Объём рабочей памяти в контексте, в символах (`memory_layers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_working_chars: Option<u32>,
+    /// Число сообщений хвоста краткосрочной памяти (`memory_layers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_short_term_messages: Option<u32>,
+    /// Объём хвоста краткосрочной памяти, в символах (`memory_layers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_short_term_chars: Option<u32>,
+    /// Сколько операций `set` маршрутизатора памяти применено (новые ключи,
+    /// `memory_layers`, счётчики относятся к маршрутизации ПРЕДЫДУЩЕГО сообщения).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_router_applied_set: Option<u32>,
+    /// Сколько операций маршрутизатора обновили существующий ключ (`memory_layers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_router_applied_update: Option<u32>,
+    /// Сколько операций `delete` маршрутизатора применено (`memory_layers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_router_applied_delete: Option<u32>,
+    /// Сколько операций маршрутизатора отброшено валидацией (`memory_layers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_router_rejected: Option<u32>,
 }
 
 impl ContextDto {
@@ -299,6 +346,16 @@ impl ContextDto {
             facts_applied: None,
             facts_updated: None,
             branch_id: None,
+            memory_long_term_entries: None,
+            memory_long_term_chars: None,
+            memory_working_entries: None,
+            memory_working_chars: None,
+            memory_short_term_messages: None,
+            memory_short_term_chars: None,
+            memory_router_applied_set: None,
+            memory_router_applied_update: None,
+            memory_router_applied_delete: None,
+            memory_router_rejected: None,
         }
     }
 
@@ -312,6 +369,16 @@ impl ContextDto {
             facts_applied: None,
             facts_updated: None,
             branch_id: None,
+            memory_long_term_entries: None,
+            memory_long_term_chars: None,
+            memory_working_entries: None,
+            memory_working_chars: None,
+            memory_short_term_messages: None,
+            memory_short_term_chars: None,
+            memory_router_applied_set: None,
+            memory_router_applied_update: None,
+            memory_router_applied_delete: None,
+            memory_router_rejected: None,
         }
     }
 
@@ -330,6 +397,16 @@ impl ContextDto {
             facts_applied: Some(facts_applied),
             facts_updated: Some(facts_updated),
             branch_id: None,
+            memory_long_term_entries: None,
+            memory_long_term_chars: None,
+            memory_working_entries: None,
+            memory_working_chars: None,
+            memory_short_term_messages: None,
+            memory_short_term_chars: None,
+            memory_router_applied_set: None,
+            memory_router_applied_update: None,
+            memory_router_applied_delete: None,
+            memory_router_rejected: None,
         }
     }
 
@@ -343,6 +420,51 @@ impl ContextDto {
             facts_applied: None,
             facts_updated: None,
             branch_id: Some(branch_id),
+            memory_long_term_entries: None,
+            memory_long_term_chars: None,
+            memory_working_entries: None,
+            memory_working_chars: None,
+            memory_short_term_messages: None,
+            memory_short_term_chars: None,
+            memory_router_applied_set: None,
+            memory_router_applied_update: None,
+            memory_router_applied_delete: None,
+            memory_router_rejected: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_memory_layers(
+        long_term_entries: u32,
+        long_term_chars: u32,
+        working_entries: u32,
+        working_chars: u32,
+        short_term_messages: u32,
+        short_term_chars: u32,
+        router_applied_set: u32,
+        router_applied_update: u32,
+        router_applied_delete: u32,
+        router_rejected: u32,
+    ) -> Self {
+        Self {
+            strategy: ContextStrategy::MemoryLayers,
+            sent_messages: None,
+            dropped_messages: None,
+            replaced_messages: None,
+            summary_built: None,
+            facts_applied: None,
+            facts_updated: None,
+            branch_id: None,
+            memory_long_term_entries: Some(long_term_entries),
+            memory_long_term_chars: Some(long_term_chars),
+            memory_working_entries: Some(working_entries),
+            memory_working_chars: Some(working_chars),
+            memory_short_term_messages: Some(short_term_messages),
+            memory_short_term_chars: Some(short_term_chars),
+            memory_router_applied_set: Some(router_applied_set),
+            memory_router_applied_update: Some(router_applied_update),
+            memory_router_applied_delete: Some(router_applied_delete),
+            memory_router_rejected: Some(router_rejected),
         }
     }
 }
@@ -712,4 +834,87 @@ pub struct CreateBranchRequest {
     pub from_seq: i64,
     #[serde(default)]
     pub name: Option<String>,
+}
+
+// --- Память (specs/memory-layers) ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkingMemoryEntryDto {
+    pub key: String,
+    pub value: String,
+    pub source: String,
+    pub updated_at: i64,
+}
+
+impl From<store::WorkingMemoryEntry> for WorkingMemoryEntryDto {
+    fn from(entry: store::WorkingMemoryEntry) -> Self {
+        Self { key: entry.key, value: entry.value, source: entry.source, updated_at: entry.updated_at }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkingMemoryResponse {
+    pub entries: Vec<WorkingMemoryEntryDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetWorkingMemoryRequest {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteWorkingMemoryQuery {
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FinishTaskRequest {
+    #[serde(default)]
+    pub carry_forward_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LongTermMemoryEntryDto {
+    pub id: String,
+    pub entry_type: String,
+    pub key: Option<String>,
+    pub value: String,
+    pub source: String,
+    pub source_chat_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl From<store::LongTermMemoryEntry> for LongTermMemoryEntryDto {
+    fn from(entry: store::LongTermMemoryEntry) -> Self {
+        Self {
+            id: entry.id,
+            entry_type: entry.entry_type,
+            key: entry.key,
+            value: entry.value,
+            source: entry.source,
+            source_chat_id: entry.source_chat_id,
+            created_at: entry.created_at,
+            updated_at: entry.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LongTermMemoryResponse {
+    pub entries: Vec<LongTermMemoryEntryDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetLongTermMemoryRequest {
+    pub entry_type: String,
+    #[serde(default)]
+    pub key: Option<String>,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteLongTermMemoryQuery {
+    pub id: String,
 }

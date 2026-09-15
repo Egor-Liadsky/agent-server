@@ -29,6 +29,9 @@ pub struct StrategyCtx<'a> {
     pub state: &'a AppState,
     pub chat: &'a store::Chat,
     pub settings: &'a ChatSettings,
+    /// Владелец чата — нужен `memory_layers` для долговременной памяти,
+    /// область видимости которой шире одного чата.
+    pub owner: &'a str,
 }
 
 #[async_trait]
@@ -94,6 +97,33 @@ impl ContextStrategyImpl for BranchingImpl {
     }
 }
 
+struct MemoryLayersImpl;
+
+#[async_trait]
+impl ContextStrategyImpl for MemoryLayersImpl {
+    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_message: Message) -> Assembled {
+        let outcome = crate::memory::assemble(ctx.state, ctx.chat, ctx.settings, ctx.owner, stored, new_message).await;
+        // Счётчики маршрутизатора относятся к маршрутизации ПРЕДЫДУЩЕГО
+        // сообщения этого чата (design.md, решение 5): маршрутизатор ещё не
+        // отработал на момент сборки текущего запроса, поэтому здесь читается
+        // результат прошлого фонового прогона (`AppState.memory_route_outcomes`).
+        let router = ctx
+            .state
+            .memory_route_outcomes
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(&ctx.chat.id)
+            .copied()
+            .unwrap_or_default();
+        let context = crate::memory::context_dto(&outcome, router);
+        Assembled {
+            context,
+            sections: outcome.sections,
+            history: outcome.history,
+        }
+    }
+}
+
 /// Единственная точка ветвления по стратегии (specs/context-strategies,
 /// «Стратегия контекста задаётся настройкой чата»).
 fn impl_for(strategy: ContextStrategy) -> Box<dyn ContextStrategyImpl + Send + Sync> {
@@ -102,13 +132,7 @@ fn impl_for(strategy: ContextStrategy) -> Box<dyn ContextStrategyImpl + Send + S
         ContextStrategy::SlidingWindow => Box::new(WindowImpl),
         ContextStrategy::Facts => Box::new(FactsImpl),
         ContextStrategy::Branching => Box::new(BranchingImpl),
-        // Полноценная реализация — предмет отдельного изменения
-        // add-memory-layers (src/memory.rs, MemoryLayersImpl); до его
-        // применения стратегия ведёт себя как sliding_window, чтобы
-        // ContextStrategy оставался исчерпывающим match уже сейчас (ядро
-        // agent-cli, откуда пришло значение MemoryLayers, — общая
-        // зависимость обоих изменений).
-        ContextStrategy::MemoryLayers => Box::new(WindowImpl),
+        ContextStrategy::MemoryLayers => Box::new(MemoryLayersImpl),
     }
 }
 
@@ -121,11 +145,12 @@ pub async fn assemble(
     state: &AppState,
     chat: &store::Chat,
     settings: &ChatSettings,
+    owner: &str,
     strategy: ContextStrategy,
     stored: Vec<store::ChatMessage>,
     new_message: Message,
 ) -> Assembled {
-    let ctx = StrategyCtx { state, chat, settings };
+    let ctx = StrategyCtx { state, chat, settings, owner };
     let mut assembled = impl_for(strategy).assemble(&ctx, stored, new_message).await;
     let system_message = crate::system_message::build(&state.config.system_prompt, &assembled.sections);
     assembled.history.insert(0, system_message);
@@ -173,6 +198,7 @@ mod tests {
             &state,
             &chat,
             &chat.settings,
+            "owner-1",
             ContextStrategy::SlidingWindow,
             Vec::new(),
             Message::user("новое"),
@@ -190,6 +216,7 @@ mod tests {
             &state,
             &chat,
             &chat.settings,
+            "owner-1",
             ContextStrategy::Branching,
             Vec::new(),
             Message::user("новое"),
@@ -210,6 +237,7 @@ mod tests {
             &state,
             &chat,
             &chat.settings,
+            "owner-1",
             ContextStrategy::Facts,
             Vec::new(),
             Message::user("новое"),

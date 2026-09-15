@@ -5,6 +5,7 @@ mod context;
 mod dto;
 mod error;
 mod facts;
+mod memory;
 mod middleware;
 mod state;
 mod store;

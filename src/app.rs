@@ -2,9 +2,11 @@
 
 use crate::dto::{
     AppendMessagesRequest, AppendMessagesResponse, BranchDto, BranchesResponse, ChatDto, ChatRequest,
-    ChatResponse, ChatWithMessagesResponse, CreateBranchRequest, CreateChatRequest, FactDto,
-    FactsResponse, GetChatQuery, ListChatsQuery, ListChatsResponse, MessageView, ModelsResponse,
-    SetFactRequest, UpdateChatRequest,
+    ChatResponse, ChatWithMessagesResponse, CreateBranchRequest, CreateChatRequest, DeleteLongTermMemoryQuery,
+    DeleteWorkingMemoryQuery, FactDto, FactsResponse, FinishTaskRequest, GetChatQuery, ListChatsQuery,
+    ListChatsResponse, LongTermMemoryEntryDto, LongTermMemoryResponse, MessageView, ModelsResponse,
+    SetFactRequest, SetLongTermMemoryRequest, SetWorkingMemoryRequest, UpdateChatRequest,
+    WorkingMemoryEntryDto, WorkingMemoryResponse,
 };
 use crate::context;
 use crate::error::ApiError;
@@ -655,7 +657,7 @@ async fn handle_chat_in_existing(
     // спасти чат от context_limit_exceeded, а не сработать после отказа
     // (design.md, решение 6, распространено на все стратегии решением 7).
     let mut assembled =
-        context::assemble(&state, &chat, &settings, strategy, stored.messages, user_message.clone()).await;
+        context::assemble(&state, &chat, &settings, &owner, strategy, stored.messages, user_message.clone()).await;
     let history = std::mem::take(&mut assembled.history);
     // Системное сообщение уходит первым при любой стратегии (design.md,
     // решение 3): его текст переиспользуется как контекст для генерации
@@ -696,6 +698,29 @@ async fn handle_chat_in_existing(
         let facts_updated =
             crate::facts::update_after_exchange(&state, &chat_id, &settings, &prompt, user_row.seq).await;
         assembled.context.facts_updated = Some(facts_updated);
+    }
+
+    // Маршрутизатор памяти — тоже фоновый вызов, после записи обмена, вне
+    // ответа пользователю (design.md, решение 5, «Риски»): результат этого
+    // прогона попадёт в блок `context` СЛЕДУЮЩЕГО ответа этого чата.
+    if strategy == agentcore::config::ContextStrategy::MemoryLayers
+        && crate::memory::effective_router_enabled(&state, &settings)
+    {
+        let route_state = state.clone();
+        let route_chat = chat.clone();
+        let route_settings = settings.clone();
+        let route_owner = owner.clone();
+        let route_prompt = prompt.clone();
+        tokio::spawn(async move {
+            let outcome =
+                crate::memory::route_after_exchange(&route_state, &route_chat, &route_settings, &route_owner, &route_prompt)
+                    .await;
+            route_state
+                .memory_route_outcomes
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .insert(route_chat.id.clone(), outcome);
+        });
     }
 
     // Название генерируется фоном, вне ответа пользователю (design.md,
@@ -1151,6 +1176,239 @@ async fn activate_branch_handler(
     }
 }
 
+// --- Память (specs/memory-layers) ---
+
+async fn get_working_memory_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+) -> Response {
+    match handle_get_working_memory(state, owner, id).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_get_working_memory(
+    state: AppState,
+    owner: String,
+    chat_id: String,
+) -> Result<WorkingMemoryResponse, ApiError> {
+    let defaults = server_defaults(&state);
+    let chat = store::load_chat(&state.db, &owner, &chat_id, &defaults)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    let entries = store::load_working_memory(&state.db, &chat_id, &chat.active_task_id)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(WorkingMemoryResponse { entries: entries.into_iter().map(WorkingMemoryEntryDto::from).collect() })
+}
+
+async fn set_working_memory_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+    Json(body): Json<SetWorkingMemoryRequest>,
+) -> Response {
+    match handle_set_working_memory(state, owner, id, body).await {
+        Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_set_working_memory(
+    state: AppState,
+    owner: String,
+    chat_id: String,
+    body: SetWorkingMemoryRequest,
+) -> Result<WorkingMemoryEntryDto, ApiError> {
+    let defaults = server_defaults(&state);
+    let chat = store::load_chat(&state.db, &owner, &chat_id, &defaults)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    if body.key.chars().count() as u32 > state.config.memory_working_key_max_chars {
+        return Err(ApiError::memory_limit_exceeded(format!(
+            "ключ рабочей памяти не может превышать {} символов",
+            state.config.memory_working_key_max_chars
+        )));
+    }
+    if body.value.chars().count() as u32 > state.config.memory_working_value_max_chars {
+        return Err(ApiError::memory_limit_exceeded(format!(
+            "значение рабочей памяти не может превышать {} символов",
+            state.config.memory_working_value_max_chars
+        )));
+    }
+    let now = agentcore::agent::now_secs();
+    store::set_working_memory(&state.db, &chat_id, &chat.active_task_id, &body.key, &body.value, "manual", now)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(WorkingMemoryEntryDto {
+        key: body.key,
+        value: body.value,
+        source: "manual".to_string(),
+        updated_at: now,
+    })
+}
+
+async fn delete_working_memory_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+    Query(query): Query<DeleteWorkingMemoryQuery>,
+) -> Response {
+    match handle_delete_working_memory(state, owner, id, query.key).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_delete_working_memory(
+    state: AppState,
+    owner: String,
+    chat_id: String,
+    key: String,
+) -> Result<(), ApiError> {
+    let defaults = server_defaults(&state);
+    let chat = store::load_chat(&state.db, &owner, &chat_id, &defaults)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    store::delete_working_memory(&state.db, &chat_id, &chat.active_task_id, &key)
+        .await
+        .map_err(|err| map_store_error(err, ApiError::memory_entry_not_found()))
+}
+
+async fn finish_task_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+    Json(body): Json<FinishTaskRequest>,
+) -> Response {
+    match handle_finish_task(state, owner, id, body.carry_forward_keys).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_finish_task(
+    state: AppState,
+    owner: String,
+    chat_id: String,
+    carry_forward_keys: Vec<String>,
+) -> Result<LongTermMemoryResponse, ApiError> {
+    let defaults = server_defaults(&state);
+    store::load_chat(&state.db, &owner, &chat_id, &defaults)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    let transferred = store::finish_task(&state.db, &owner, &chat_id, &carry_forward_keys)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(LongTermMemoryResponse { entries: transferred.into_iter().map(LongTermMemoryEntryDto::from).collect() })
+}
+
+async fn get_long_term_memory_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+) -> Response {
+    match handle_get_long_term_memory(state, owner).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+/// Потолок числа записей на ручное чтение — заметно шире, чем лимит
+/// подстановки в контекст (`AGENTD_MEMORY_LONG_TERM_MAX_ENTRIES`): просмотр
+/// не должен незаметно обрезать хранимые данные операторским лимитом,
+/// рассчитанным на стоимость запроса к модели.
+const MANUAL_LONG_TERM_LIST_LIMIT: u32 = 1000;
+
+async fn handle_get_long_term_memory(state: AppState, owner: String) -> Result<LongTermMemoryResponse, ApiError> {
+    let entries = store::load_long_term_memory(&state.db, &owner, MANUAL_LONG_TERM_LIST_LIMIT)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(LongTermMemoryResponse { entries: entries.into_iter().map(LongTermMemoryEntryDto::from).collect() })
+}
+
+async fn set_long_term_memory_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Json(body): Json<SetLongTermMemoryRequest>,
+) -> Response {
+    match handle_set_long_term_memory(state, owner, body).await {
+        Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_set_long_term_memory(
+    state: AppState,
+    owner: String,
+    body: SetLongTermMemoryRequest,
+) -> Result<LongTermMemoryEntryDto, ApiError> {
+    if !matches!(body.entry_type.as_str(), "profile" | "decision" | "knowledge") {
+        return Err(ApiError::invalid_request(format!(
+            "неизвестный entry_type долговременной памяти: {}",
+            body.entry_type
+        )));
+    }
+    if let Some(key) = &body.key {
+        if key.chars().count() as u32 > state.config.memory_long_term_key_max_chars {
+            return Err(ApiError::memory_limit_exceeded(format!(
+                "ключ долговременной памяти не может превышать {} символов",
+                state.config.memory_long_term_key_max_chars
+            )));
+        }
+    }
+    if body.value.chars().count() as u32 > state.config.memory_long_term_value_max_chars {
+        return Err(ApiError::memory_limit_exceeded(format!(
+            "значение долговременной памяти не может превышать {} символов",
+            state.config.memory_long_term_value_max_chars
+        )));
+    }
+    let now = agentcore::agent::now_secs();
+    let (id, _applied) = store::set_long_term_memory(
+        &state.db,
+        &owner,
+        &body.entry_type,
+        body.key.as_deref(),
+        &body.value,
+        "manual",
+        None,
+        now,
+    )
+    .await
+    .map_err(ApiError::from_store_error)?;
+    Ok(LongTermMemoryEntryDto {
+        id,
+        entry_type: body.entry_type,
+        key: body.key,
+        value: body.value,
+        source: "manual".to_string(),
+        source_chat_id: None,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+async fn delete_long_term_memory_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Query(query): Query<DeleteLongTermMemoryQuery>,
+) -> Response {
+    match store::delete_long_term_memory(&state.db, &owner, &query.id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => map_store_error(err, ApiError::memory_entry_not_found())
+            .with_request_id(request_id)
+            .into_response(),
+    }
+}
+
 async fn delete_chat_handler(
     State(state): State<AppState>,
     Extension(RequestId(request_id)): Extension<RequestId>,
@@ -1206,6 +1464,22 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/chats/{id}/branches/{branch_id}/activate",
             post(activate_branch_handler),
+        )
+        .route(
+            "/chats/{id}/memory/working",
+            get(get_working_memory_handler)
+                .post(set_working_memory_handler)
+                .delete(delete_working_memory_handler),
+        )
+        .route(
+            "/chats/{id}/memory/working/finish-task",
+            post(finish_task_handler),
+        )
+        .route(
+            "/memory/long-term",
+            get(get_long_term_memory_handler)
+                .post(set_long_term_memory_handler)
+                .delete(delete_long_term_memory_handler),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

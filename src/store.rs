@@ -68,6 +68,9 @@ pub struct Chat {
     pub message_count: i64,
     /// Ветка, активная для новых сообщений и умалчиваемого чтения истории.
     pub active_branch: String,
+    /// Задача, к которой привязана рабочая память чата (design.md, решение 2).
+    /// По умолчанию — идентификатор самого чата.
+    pub active_task_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +205,7 @@ fn chat_from_row(row: &sqlx::sqlite::SqliteRow, defaults: &ChatSettings) -> Resu
         updated_at: row.try_get("updated_at")?,
         message_count: row.try_get::<i64, _>("message_count").unwrap_or(0),
         active_branch: row.try_get("active_branch")?,
+        active_task_id: row.try_get("active_task_id")?,
         id,
         settings,
     })
@@ -236,8 +240,11 @@ pub async fn create_chat(
     // Каждый чат сразу получает корневую ветку и её же — активной
     // (specs/chat-branching, «У чата есть ветки и активная ветка»).
     let root_branch = insert_root_branch(&mut tx, &id, now).await?;
-    sqlx::query("UPDATE chats SET active_branch = ? WHERE id = ?")
+    // Задача рабочей памяти по умолчанию — сам чат (design.md, решение 2):
+    // рабочая память доступна без обязательного явного заведения задачи.
+    sqlx::query("UPDATE chats SET active_branch = ?, active_task_id = ? WHERE id = ?")
         .bind(&root_branch)
+        .bind(&id)
         .bind(&id)
         .execute(&mut *tx)
         .await?;
@@ -245,13 +252,14 @@ pub async fn create_chat(
     tx.commit().await?;
 
     Ok(Chat {
-        id,
+        id: id.clone(),
         title: title.to_string(),
         settings: settings.clone(),
         created_at: now,
         updated_at: now,
         message_count: 0,
         active_branch: root_branch,
+        active_task_id: id,
     })
 }
 
@@ -277,7 +285,7 @@ async fn insert_root_branch(
 /// чужой чат и несуществующий неотличимы (design.md, решение 7).
 pub async fn load_chat(pool: &SqlitePool, owner: &str, id: &str, defaults: &ChatSettings) -> Result<Chat, StoreError> {
     let row = sqlx::query(
-        "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, \
+        "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, c.active_task_id, \
                 (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
          FROM chats c WHERE c.id = ? AND c.owner = ?",
     )
@@ -415,7 +423,7 @@ pub async fn list_chats(
     let rows = match &after {
         Some((updated_at, id)) => {
             sqlx::query(
-                "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, \
+                "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, c.active_task_id, \
                         (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
                  FROM chats c WHERE c.owner = ? \
                    AND (c.updated_at < ? OR (c.updated_at = ? AND c.id < ?)) \
@@ -431,7 +439,7 @@ pub async fn list_chats(
         }
         None => {
             sqlx::query(
-                "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, \
+                "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, c.active_task_id, \
                         (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
                  FROM chats c WHERE c.owner = ? \
                  ORDER BY c.updated_at DESC, c.id DESC LIMIT ?",
@@ -880,6 +888,323 @@ pub async fn delete_fact(pool: &SqlitePool, chat_id: &str, key: &str) -> Result<
     Ok(())
 }
 
+// --- Память: рабочая (чат + задача) и долговременная (владелец) ---
+// (design.md решения 1, 2, 4)
+
+#[derive(Debug, Clone)]
+pub struct WorkingMemoryEntry {
+    pub key: String,
+    pub value: String,
+    pub source: String,
+    pub updated_at: i64,
+}
+
+/// Записи рабочей памяти активной задачи чата, в порядке ключа —
+/// детерминированный порядок важен для сборки раздела в системном
+/// сообщении (specs/memory-layers).
+pub async fn load_working_memory(
+    pool: &SqlitePool,
+    chat_id: &str,
+    task_id: &str,
+) -> Result<Vec<WorkingMemoryEntry>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT key, value, source, updated_at FROM chat_working_memory \
+         WHERE chat_id = ? AND task_id = ? ORDER BY key ASC",
+    )
+    .bind(chat_id)
+    .bind(task_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(WorkingMemoryEntry {
+                key: row.try_get("key")?,
+                value: row.try_get("value")?,
+                source: row.try_get("source")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .collect()
+}
+
+/// Задаёт значение записи рабочей памяти. Побеждает более позднее
+/// `updated_at`, независимо от источника (design.md, решение 4): при
+/// конфликте по `(chat_id, task_id, key)` обновление применяется, только
+/// если `updated_at` не раньше уже сохранённого. Возвращает `true`, если
+/// запись действительно применилась.
+pub async fn set_working_memory(
+    pool: &SqlitePool,
+    chat_id: &str,
+    task_id: &str,
+    key: &str,
+    value: &str,
+    source: &str,
+    updated_at: i64,
+) -> Result<bool, StoreError> {
+    let result = sqlx::query(
+        "INSERT INTO chat_working_memory (id, chat_id, task_id, key, value, source, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (chat_id, task_id, key) DO UPDATE SET \
+             value = excluded.value, source = excluded.source, updated_at = excluded.updated_at \
+         WHERE excluded.updated_at >= chat_working_memory.updated_at",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(chat_id)
+    .bind(task_id)
+    .bind(key)
+    .bind(value)
+    .bind(source)
+    .bind(updated_at)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn delete_working_memory(
+    pool: &SqlitePool,
+    chat_id: &str,
+    task_id: &str,
+    key: &str,
+) -> Result<(), StoreError> {
+    let result = sqlx::query("DELETE FROM chat_working_memory WHERE chat_id = ? AND task_id = ? AND key = ?")
+        .bind(chat_id)
+        .bind(task_id)
+        .bind(key)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct LongTermMemoryEntry {
+    pub id: String,
+    pub entry_type: String,
+    pub key: Option<String>,
+    pub value: String,
+    pub source: String,
+    pub source_chat_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Записи долговременной памяти владельца, самые свежие первыми —
+/// стратегия `memory_layers` вытесняет по `updated_at` (design.md,
+/// решение 5), поэтому порядок уже готов под усечение по лимиту вызывающим
+/// кодом.
+pub async fn load_long_term_memory(
+    pool: &SqlitePool,
+    owner: &str,
+    limit: u32,
+) -> Result<Vec<LongTermMemoryEntry>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT id, entry_type, key, value, source, source_chat_id, created_at, updated_at \
+         FROM owner_long_term_memory WHERE owner = ? ORDER BY updated_at DESC LIMIT ?",
+    )
+    .bind(owner)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(LongTermMemoryEntry {
+                id: row.try_get("id")?,
+                entry_type: row.try_get("entry_type")?,
+                key: row.try_get("key")?,
+                value: row.try_get("value")?,
+                source: row.try_get("source")?,
+                source_chat_id: row.try_get("source_chat_id")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .collect()
+}
+
+/// Задаёт запись долговременной памяти. С ключом — тот же приём
+/// приоритета «побеждает более позднее `updated_at`», что и у рабочей
+/// памяти (design.md, решение 4), конфликт — по `(owner, entry_type, key)`.
+/// Без ключа (`key: None`, свободная заметка) — всегда новая запись: индекс
+/// уникальности на такие строки не распространяется. Возвращает
+/// `(id, применилась ли запись)`.
+pub async fn set_long_term_memory(
+    pool: &SqlitePool,
+    owner: &str,
+    entry_type: &str,
+    key: Option<&str>,
+    value: &str,
+    source: &str,
+    source_chat_id: Option<&str>,
+    updated_at: i64,
+) -> Result<(String, bool), StoreError> {
+    match key {
+        Some(key) => {
+            let id = uuid::Uuid::new_v4().to_string();
+            let result = sqlx::query(
+                "INSERT INTO owner_long_term_memory \
+                     (id, owner, entry_type, key, value, source, source_chat_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT (owner, entry_type, key) WHERE key IS NOT NULL DO UPDATE SET \
+                     value = excluded.value, source = excluded.source, \
+                     source_chat_id = excluded.source_chat_id, updated_at = excluded.updated_at \
+                 WHERE excluded.updated_at >= owner_long_term_memory.updated_at",
+            )
+            .bind(&id)
+            .bind(owner)
+            .bind(entry_type)
+            .bind(key)
+            .bind(value)
+            .bind(source)
+            .bind(source_chat_id)
+            .bind(updated_at)
+            .bind(updated_at)
+            .execute(pool)
+            .await?;
+            if result.rows_affected() == 0 {
+                // Конфликт проигран прежней записи — вернуть её существующий id,
+                // а не свежесгенерированный, которым ничего не записано.
+                let existing_id: String = sqlx::query_scalar(
+                    "SELECT id FROM owner_long_term_memory WHERE owner = ? AND entry_type = ? AND key = ?",
+                )
+                .bind(owner)
+                .bind(entry_type)
+                .bind(key)
+                .fetch_one(pool)
+                .await?;
+                return Ok((existing_id, false));
+            }
+            Ok((id, true))
+        }
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO owner_long_term_memory \
+                     (id, owner, entry_type, key, value, source, source_chat_id, created_at, updated_at) \
+                 VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(owner)
+            .bind(entry_type)
+            .bind(value)
+            .bind(source)
+            .bind(source_chat_id)
+            .bind(updated_at)
+            .bind(updated_at)
+            .execute(pool)
+            .await?;
+            Ok((id, true))
+        }
+    }
+}
+
+pub async fn delete_long_term_memory(pool: &SqlitePool, owner: &str, id: &str) -> Result<(), StoreError> {
+    let result = sqlx::query("DELETE FROM owner_long_term_memory WHERE owner = ? AND id = ?")
+        .bind(owner)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+/// Удаляет запись долговременной памяти по ключу — путь маршрутизатора,
+/// операция `delete` которого не знает `entry_type`/`id` записи, только
+/// `key` (specs/memory-layers).
+pub async fn delete_long_term_memory_by_key(pool: &SqlitePool, owner: &str, key: &str) -> Result<(), StoreError> {
+    let result = sqlx::query("DELETE FROM owner_long_term_memory WHERE owner = ? AND key = ?")
+        .bind(owner)
+        .bind(key)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+/// Завершает активную задачу чата: записи, отмеченные `carry_forward_keys`,
+/// переносятся в долговременную память ДО удаления рабочей памяти прежней
+/// задачи (specs/memory-layers, «Перенос отмеченной записи в долговременную
+/// память при завершении задачи»), затем чат получает новую случайную
+/// задачу. Возвращает перенесённые записи.
+pub async fn finish_task(
+    pool: &SqlitePool,
+    owner: &str,
+    chat_id: &str,
+    carry_forward_keys: &[String],
+) -> Result<Vec<LongTermMemoryEntry>, StoreError> {
+    let mut tx = pool.begin().await?;
+    let task_id: String = sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = ? AND owner = ?")
+        .bind(chat_id)
+        .bind(owner)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+
+    let now = now_secs();
+    let mut transferred = Vec::new();
+    for key in carry_forward_keys {
+        let row = sqlx::query(
+            "SELECT value FROM chat_working_memory WHERE chat_id = ? AND task_id = ? AND key = ?",
+        )
+        .bind(chat_id)
+        .bind(&task_id)
+        .bind(key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else { continue };
+        let value: String = row.try_get("value")?;
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO owner_long_term_memory \
+                 (id, owner, entry_type, key, value, source, source_chat_id, created_at, updated_at) \
+             VALUES (?, ?, 'knowledge', ?, ?, 'router', ?, ?, ?) \
+             ON CONFLICT (owner, entry_type, key) WHERE key IS NOT NULL DO UPDATE SET \
+                 value = excluded.value, source = excluded.source, \
+                 source_chat_id = excluded.source_chat_id, updated_at = excluded.updated_at",
+        )
+        .bind(&id)
+        .bind(owner)
+        .bind(key)
+        .bind(&value)
+        .bind(chat_id)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        transferred.push(LongTermMemoryEntry {
+            id,
+            entry_type: "knowledge".to_string(),
+            key: Some(key.clone()),
+            value,
+            source: "router".to_string(),
+            source_chat_id: Some(chat_id.to_string()),
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    sqlx::query("DELETE FROM chat_working_memory WHERE chat_id = ? AND task_id = ?")
+        .bind(chat_id)
+        .bind(&task_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let new_task_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("UPDATE chats SET active_task_id = ? WHERE id = ?")
+        .bind(&new_task_id)
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(transferred)
+}
+
 /// Записывает обмен (сообщение пользователя и ответ модели) одной
 /// транзакцией `BEGIN IMMEDIATE`: либо оба сообщения появляются в чате,
 /// либо чат не меняется (design.md, решения 2 и 9).
@@ -1068,6 +1393,158 @@ mod tests {
             reasoning: None,
             meta: None,
         }
+    }
+
+    // --- Рабочая память: CRUD и очистка при смене задачи ---
+
+    #[tokio::test]
+    async fn working_memory_set_load_delete_round_trip() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+
+        let applied = set_working_memory(&pool, &chat.id, &chat.active_task_id, "budget", "200000", "manual", 10)
+            .await
+            .expect("запись");
+        assert!(applied);
+
+        let entries = load_working_memory(&pool, &chat.id, &chat.active_task_id).await.expect("чтение");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, "200000");
+        assert_eq!(entries[0].source, "manual");
+
+        delete_working_memory(&pool, &chat.id, &chat.active_task_id, "budget").await.expect("удаление");
+        assert!(load_working_memory(&pool, &chat.id, &chat.active_task_id).await.expect("чтение").is_empty());
+
+        let err = delete_working_memory(&pool, &chat.id, &chat.active_task_id, "budget")
+            .await
+            .expect_err("ключа уже нет");
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn working_memory_is_isolated_per_chat() {
+        let (_dir, pool) = temp_pool().await;
+        let chat_a = create_chat(&pool, "owner-1", "Чат A", &ChatSettings::default()).await.expect("чат A");
+        let chat_b = create_chat(&pool, "owner-1", "Чат B", &ChatSettings::default()).await.expect("чат B");
+
+        set_working_memory(&pool, &chat_a.id, &chat_a.active_task_id, "budget", "100", "manual", 1)
+            .await
+            .expect("запись в чате A");
+
+        let entries_b = load_working_memory(&pool, &chat_b.id, &chat_b.active_task_id).await.expect("чтение B");
+        assert!(entries_b.is_empty(), "рабочая память не видна другому чату того же владельца");
+    }
+
+    #[tokio::test]
+    async fn later_update_wins_regardless_of_source() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+
+        set_working_memory(&pool, &chat.id, &chat.active_task_id, "k", "от роутера", "router", 5)
+            .await
+            .expect("ранняя автоматическая запись");
+        let applied =
+            set_working_memory(&pool, &chat.id, &chat.active_task_id, "k", "от клиента", "manual", 10)
+                .await
+                .expect("поздняя ручная запись");
+        assert!(applied);
+        let entries = load_working_memory(&pool, &chat.id, &chat.active_task_id).await.expect("чтение");
+        assert_eq!(entries[0].value, "от клиента");
+
+        // Обратный порядок по времени: ручная запись раньше, автоматическая позже.
+        let applied =
+            set_working_memory(&pool, &chat.id, &chat.active_task_id, "k2", "от клиента", "manual", 10)
+                .await
+                .expect("ранняя ручная запись");
+        assert!(applied);
+        let applied =
+            set_working_memory(&pool, &chat.id, &chat.active_task_id, "k2", "от роутера", "router", 5)
+                .await
+                .expect("вызов не должен упасть");
+        assert!(!applied, "более ранняя операция не должна применяться поверх более поздней");
+        let entries = load_working_memory(&pool, &chat.id, &chat.active_task_id).await.expect("чтение");
+        let k2 = entries.iter().find(|e| e.key == "k2").expect("запись k2");
+        assert_eq!(k2.value, "от клиента");
+    }
+
+    #[tokio::test]
+    async fn finish_task_transfers_carried_entries_before_clearing_and_rotates_task() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+        let old_task_id = chat.active_task_id.clone();
+
+        set_working_memory(&pool, &chat.id, &old_task_id, "carried", "значение", "manual", 1)
+            .await
+            .expect("запись для переноса");
+        set_working_memory(&pool, &chat.id, &old_task_id, "dropped", "потеряется", "manual", 1)
+            .await
+            .expect("запись без переноса");
+
+        let transferred = finish_task(&pool, "owner-1", &chat.id, &["carried".to_string()])
+            .await
+            .expect("завершение задачи");
+        assert_eq!(transferred.len(), 1);
+        assert_eq!(transferred[0].value, "значение");
+
+        let long_term = load_long_term_memory(&pool, "owner-1", 50).await.expect("долговременная память");
+        assert!(long_term.iter().any(|e| e.key.as_deref() == Some("carried") && e.value == "значение"));
+
+        let reloaded = load_chat(&pool, "owner-1", &chat.id, &ChatSettings::default()).await.expect("чат");
+        assert_ne!(reloaded.active_task_id, old_task_id, "у чата новая активная задача");
+
+        let old_task_entries = load_working_memory(&pool, &chat.id, &old_task_id).await.expect("чтение прежней задачи");
+        assert!(old_task_entries.is_empty(), "рабочая память прежней задачи очищена");
+        let new_task_entries = load_working_memory(&pool, &chat.id, &reloaded.active_task_id)
+            .await
+            .expect("чтение новой задачи");
+        assert!(new_task_entries.is_empty(), "новая задача начинает с пустого набора");
+    }
+
+    // --- Долговременная память: CRUD и изоляция по владельцу ---
+
+    #[tokio::test]
+    async fn long_term_memory_set_load_delete_round_trip() {
+        let (_dir, pool) = temp_pool().await;
+        let (id, applied) =
+            set_long_term_memory(&pool, "owner-1", "decision", Some("auth_provider"), "Clerk", "manual", None, 1)
+                .await
+                .expect("запись");
+        assert!(applied);
+
+        let entries = load_long_term_memory(&pool, "owner-1", 50).await.expect("чтение");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, "Clerk");
+
+        delete_long_term_memory(&pool, "owner-1", &id).await.expect("удаление");
+        assert!(load_long_term_memory(&pool, "owner-1", 50).await.expect("чтение").is_empty());
+
+        let err = delete_long_term_memory(&pool, "owner-1", &id).await.expect_err("записи уже нет");
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn long_term_memory_is_isolated_per_owner() {
+        let (_dir, pool) = temp_pool().await;
+        set_long_term_memory(&pool, "owner-x", "profile", Some("name"), "секрет X", "manual", None, 1)
+            .await
+            .expect("запись владельца X");
+
+        let entries_y = load_long_term_memory(&pool, "owner-y", 50).await.expect("чтение владельца Y");
+        assert!(entries_y.is_empty(), "долговременная память не видна другому владельцу");
+    }
+
+    #[tokio::test]
+    async fn long_term_memory_without_key_never_upserts() {
+        let (_dir, pool) = temp_pool().await;
+        set_long_term_memory(&pool, "owner-1", "knowledge", None, "заметка один", "manual", None, 1)
+            .await
+            .expect("заметка 1");
+        set_long_term_memory(&pool, "owner-1", "knowledge", None, "заметка два", "manual", None, 2)
+            .await
+            .expect("заметка 2");
+
+        let entries = load_long_term_memory(&pool, "owner-1", 50).await.expect("чтение");
+        assert_eq!(entries.len(), 2, "записи без ключа не схлопываются в одну");
     }
 
     // --- Условное обновление названия чата (specs/chat-title, design.md, решение 6) ---
@@ -1607,6 +2084,83 @@ mod tests {
             message_branches.iter().all(|b| *b == active_branch),
             "все сообщения перенесены в активную (корневую) ветку чата"
         );
+    }
+
+    // --- Миграция 0004 (памяти) на существующей БД с данными ---
+
+    #[tokio::test]
+    async fn migration_0004_backfills_active_task_id_and_keeps_old_chats_readable() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let path = dir.path().join("agentd.db");
+        let path_str = path.to_str().expect("путь").to_string();
+
+        // Схема до 0004: применяются миграции 0001–0003, а 0004 остаётся
+        // ожидающей — как на боевой базе перед обновлением сервиса.
+        let legacy_dir = dir.path().join("legacy-migrations");
+        std::fs::create_dir_all(&legacy_dir).expect("каталог старых миграций");
+        for name in ["0001_init.sql", "0002_chat_summaries.sql", "0003_context_strategies.sql"] {
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations").join(name),
+                legacy_dir.join(name),
+            )
+            .expect("копия старой миграции");
+        }
+
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{path_str}"))
+            .expect("адрес базы")
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let legacy_pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .expect("пул старой схемы");
+        sqlx::migrate::Migrator::new(legacy_dir)
+            .await
+            .expect("загрузка старых миграций")
+            .run(&legacy_pool)
+            .await
+            .expect("применение старых миграций");
+
+        sqlx::query(
+            "INSERT INTO chats (id, owner, title, settings, created_at, updated_at) \
+             VALUES ('chat-1', 'owner-1', 'Старый чат', '{}', 1000, 1000)",
+        )
+        .execute(&legacy_pool)
+        .await
+        .expect("вставка чата по старой схеме");
+        sqlx::query(
+            "INSERT INTO chat_branches (id, chat_id, parent_id, fork_seq, name, created_at) \
+             VALUES ('branch-1', 'chat-1', NULL, NULL, 'root', 1000)",
+        )
+        .execute(&legacy_pool)
+        .await
+        .expect("вставка корневой ветки по старой схеме");
+        let root_branch_id = "branch-1".to_string();
+        sqlx::query("UPDATE chats SET active_branch = ? WHERE id = 'chat-1'")
+            .bind(&root_branch_id)
+            .execute(&legacy_pool)
+            .await
+            .expect("активная ветка чата");
+        legacy_pool.close().await;
+
+        // `open_pool` применяет все миграции крейта, включая 0004.
+        let pool = open_pool(&path_str, 5, 5000).await.expect("применение 0004");
+
+        let active_task_id: Option<String> =
+            sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = 'chat-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("активная задача чата");
+        assert_eq!(active_task_id.as_deref(), Some("chat-1"), "бэкофилл задаёт задачу равной id чата");
+
+        let chat = load_chat(&pool, "owner-1", "chat-1", &ChatSettings::default())
+            .await
+            .expect("старый чат читается после миграции 0004");
+        assert_eq!(chat.active_task_id, "chat-1");
+        assert_eq!(chat.title, "Старый чат");
+
+        let working = load_working_memory(&pool, "chat-1", "chat-1").await.expect("рабочая память");
+        assert!(working.is_empty(), "у старого чата рабочей памяти ещё нет");
     }
 
     // --- 8.1 Миграция chat_summaries применяется при открытии пула ---

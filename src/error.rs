@@ -111,6 +111,18 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "branch_not_found", "ветка не найдена")
     }
 
+    /// Запись рабочей или долговременной памяти, которой нет — неотличимо
+    /// от чужой (specs/memory-layers).
+    pub fn memory_entry_not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "memory_entry_not_found", "запись памяти не найдена")
+    }
+
+    /// Ручная правка памяти превышает операторский потолок длины ключа или
+    /// значения (specs/memory-layers, «Операторские умолчания и лимиты памяти»).
+    pub fn memory_limit_exceeded(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "memory_limit_exceeded", message)
+    }
+
     pub fn payload_too_large() -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,

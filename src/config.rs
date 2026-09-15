@@ -29,6 +29,12 @@ pub const DEFAULT_MAX_BRANCH_DEPTH: u32 = 8;
 /// (specs/context-strategies, «Базовый текст системного сообщения
 /// настраивается оператором»).
 pub const DEFAULT_SYSTEM_PROMPT: &str = "Ты — полезный ассистент.";
+pub const DEFAULT_MEMORY_WORKING_MAX_ENTRIES: u32 = 50;
+pub const DEFAULT_MEMORY_WORKING_VALUE_MAX_CHARS: u32 = 500;
+pub const DEFAULT_MEMORY_WORKING_KEY_MAX_CHARS: u32 = 100;
+pub const DEFAULT_MEMORY_LONG_TERM_MAX_ENTRIES: u32 = 100;
+pub const DEFAULT_MEMORY_LONG_TERM_VALUE_MAX_CHARS: u32 = 500;
+pub const DEFAULT_MEMORY_LONG_TERM_KEY_MAX_CHARS: u32 = 100;
 
 pub const API_KEY_VAR: &str = "AGENTD_UPSTREAM_API_KEY";
 
@@ -115,6 +121,25 @@ pub struct AgentdConfig {
     /// Модель для запроса названия чата. `None` — модель сервиса по
     /// умолчанию.
     pub title_model: Option<String>,
+    /// Включает автоматический маршрутизатор записей памяти для стратегии
+    /// `memory_layers` (specs/memory-layers). Включён по умолчанию.
+    pub memory_router_enabled: bool,
+    /// Модель для вызова маршрутизатора памяти. `None` — модель чата.
+    pub memory_router_model: Option<String>,
+    /// Размер хвоста краткосрочной памяти (дословных сообщений).
+    pub memory_short_term_tail_messages: u32,
+    /// Потолок числа записей рабочей памяти, подставляемых в контекст.
+    pub memory_working_max_entries: u32,
+    /// Потолок длины значения записи рабочей памяти в символах.
+    pub memory_working_value_max_chars: u32,
+    /// Потолок длины ключа записи рабочей памяти в символах.
+    pub memory_working_key_max_chars: u32,
+    /// Потолок числа записей долговременной памяти, подставляемых в контекст.
+    pub memory_long_term_max_entries: u32,
+    /// Потолок длины значения записи долговременной памяти в символах.
+    pub memory_long_term_value_max_chars: u32,
+    /// Потолок длины ключа записи долговременной памяти в символах.
+    pub memory_long_term_key_max_chars: u32,
 }
 
 impl AgentdConfig {
@@ -280,6 +305,47 @@ impl AgentdConfig {
             system_prompt: get("AGENTD_SYSTEM_PROMPT").unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
             auto_title: parse_bool_named_default(get("AGENTD_AUTO_TITLE"), "AGENTD_AUTO_TITLE", true)?,
             title_model: get("AGENTD_TITLE_MODEL"),
+            memory_router_enabled: parse_bool_named_default(
+                get("AGENTD_MEMORY_ROUTER_ENABLED"),
+                "AGENTD_MEMORY_ROUTER_ENABLED",
+                true,
+            )?,
+            memory_router_model: get("AGENTD_MEMORY_ROUTER_MODEL"),
+            memory_short_term_tail_messages: parse_nonzero(
+                get("AGENTD_MEMORY_SHORT_TERM_TAIL_MESSAGES"),
+                "AGENTD_MEMORY_SHORT_TERM_TAIL_MESSAGES",
+                DEFAULT_CONTEXT_WINDOW_MESSAGES,
+            )?,
+            memory_working_max_entries: parse_nonzero(
+                get("AGENTD_MEMORY_WORKING_MAX_ENTRIES"),
+                "AGENTD_MEMORY_WORKING_MAX_ENTRIES",
+                DEFAULT_MEMORY_WORKING_MAX_ENTRIES,
+            )?,
+            memory_working_value_max_chars: parse_nonzero(
+                get("AGENTD_MEMORY_WORKING_VALUE_MAX_CHARS"),
+                "AGENTD_MEMORY_WORKING_VALUE_MAX_CHARS",
+                DEFAULT_MEMORY_WORKING_VALUE_MAX_CHARS,
+            )?,
+            memory_working_key_max_chars: parse_nonzero(
+                get("AGENTD_MEMORY_WORKING_KEY_MAX_CHARS"),
+                "AGENTD_MEMORY_WORKING_KEY_MAX_CHARS",
+                DEFAULT_MEMORY_WORKING_KEY_MAX_CHARS,
+            )?,
+            memory_long_term_max_entries: parse_nonzero(
+                get("AGENTD_MEMORY_LONG_TERM_MAX_ENTRIES"),
+                "AGENTD_MEMORY_LONG_TERM_MAX_ENTRIES",
+                DEFAULT_MEMORY_LONG_TERM_MAX_ENTRIES,
+            )?,
+            memory_long_term_value_max_chars: parse_nonzero(
+                get("AGENTD_MEMORY_LONG_TERM_VALUE_MAX_CHARS"),
+                "AGENTD_MEMORY_LONG_TERM_VALUE_MAX_CHARS",
+                DEFAULT_MEMORY_LONG_TERM_VALUE_MAX_CHARS,
+            )?,
+            memory_long_term_key_max_chars: parse_nonzero(
+                get("AGENTD_MEMORY_LONG_TERM_KEY_MAX_CHARS"),
+                "AGENTD_MEMORY_LONG_TERM_KEY_MAX_CHARS",
+                DEFAULT_MEMORY_LONG_TERM_KEY_MAX_CHARS,
+            )?,
         })
     }
 
@@ -796,5 +862,57 @@ mod tests {
         ])
         .expect_err("ожидалась ошибка");
         assert!(format!("{err}").contains("AGENTD_AUTO_TITLE"));
+    }
+
+    // --- AGENTD_MEMORY_* (specs/memory-layers, «Операторские умолчания и лимиты памяти») ---
+
+    #[test]
+    fn memory_settings_default_when_not_set() {
+        let config = config_from(&[(API_KEY_VAR, "secret-key-value")]).expect("конфигурация");
+        assert!(config.memory_router_enabled);
+        assert_eq!(config.memory_router_model, None);
+        assert_eq!(config.memory_short_term_tail_messages, DEFAULT_CONTEXT_WINDOW_MESSAGES);
+        assert_eq!(config.memory_working_max_entries, DEFAULT_MEMORY_WORKING_MAX_ENTRIES);
+        assert_eq!(config.memory_working_value_max_chars, DEFAULT_MEMORY_WORKING_VALUE_MAX_CHARS);
+        assert_eq!(config.memory_working_key_max_chars, DEFAULT_MEMORY_WORKING_KEY_MAX_CHARS);
+        assert_eq!(config.memory_long_term_max_entries, DEFAULT_MEMORY_LONG_TERM_MAX_ENTRIES);
+        assert_eq!(config.memory_long_term_value_max_chars, DEFAULT_MEMORY_LONG_TERM_VALUE_MAX_CHARS);
+        assert_eq!(config.memory_long_term_key_max_chars, DEFAULT_MEMORY_LONG_TERM_KEY_MAX_CHARS);
+    }
+
+    #[test]
+    fn memory_settings_are_read_from_environment() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_MEMORY_ROUTER_ENABLED", "false"),
+            ("AGENTD_MEMORY_ROUTER_MODEL", "router-model"),
+            ("AGENTD_MEMORY_SHORT_TERM_TAIL_MESSAGES", "4"),
+            ("AGENTD_MEMORY_WORKING_MAX_ENTRIES", "10"),
+            ("AGENTD_MEMORY_WORKING_VALUE_MAX_CHARS", "200"),
+            ("AGENTD_MEMORY_WORKING_KEY_MAX_CHARS", "40"),
+            ("AGENTD_MEMORY_LONG_TERM_MAX_ENTRIES", "20"),
+            ("AGENTD_MEMORY_LONG_TERM_VALUE_MAX_CHARS", "300"),
+            ("AGENTD_MEMORY_LONG_TERM_KEY_MAX_CHARS", "50"),
+        ])
+        .expect("конфигурация");
+        assert!(!config.memory_router_enabled);
+        assert_eq!(config.memory_router_model.as_deref(), Some("router-model"));
+        assert_eq!(config.memory_short_term_tail_messages, 4);
+        assert_eq!(config.memory_working_max_entries, 10);
+        assert_eq!(config.memory_working_value_max_chars, 200);
+        assert_eq!(config.memory_working_key_max_chars, 40);
+        assert_eq!(config.memory_long_term_max_entries, 20);
+        assert_eq!(config.memory_long_term_value_max_chars, 300);
+        assert_eq!(config.memory_long_term_key_max_chars, 50);
+    }
+
+    #[test]
+    fn invalid_memory_working_max_entries_fails_startup() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_MEMORY_WORKING_MAX_ENTRIES", "0"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_MEMORY_WORKING_MAX_ENTRIES"));
     }
 }

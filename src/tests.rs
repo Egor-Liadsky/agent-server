@@ -3200,6 +3200,264 @@ async fn chat_created_with_own_title_skips_generation() {
     assert_eq!(loaded.body["title"], "Своё название");
 }
 
+// --- 3.5/5.3 memory_layers: устойчивость маршрутизатора и список разрешённых стратегий ---
+
+#[tokio::test]
+async fn memory_router_failure_does_not_break_main_response_or_change_memory() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    // Первый вызов — основной ответ, второй (маршрутизатор памяти) — отказ.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("основной ответ")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "context_strategy": "memory_layers" } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "бюджет — 200000" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "основной ответ не должен зависеть от маршрутизатора памяти: {}", sent.body);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let owner = crate::store::ANONYMOUS_OWNER.to_string();
+    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+        .await
+        .expect("чат");
+    let working = crate::store::load_working_memory(&state.db, &id, &chat.active_task_id)
+        .await
+        .expect("рабочая память");
+    assert!(working.is_empty(), "отказ маршрутизатора не должен менять состояние памяти");
+}
+
+#[tokio::test]
+async fn memory_layers_is_rejected_when_not_in_allowed_context_strategies() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    let state = state_with_provider(&server, &[("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "summary")]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "prompt": "вопрос",
+            "settings": { "context_strategy": "memory_layers" }
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "context_strategy_not_allowed");
+}
+
+// --- 6.2/6.3 Эндпоинты памяти (specs/memory-layers) ---
+
+fn working_memory_uri(chat_id: &str) -> String {
+    format!("/v1/chats/{chat_id}/memory/working")
+}
+
+fn delete_working_memory_uri(chat_id: &str, key: &str) -> String {
+    format!("/v1/chats/{chat_id}/memory/working?key={key}")
+}
+
+fn finish_task_uri(chat_id: &str) -> String {
+    format!("/v1/chats/{chat_id}/memory/working/finish-task")
+}
+
+fn delete_long_term_memory_uri(id: &str) -> String {
+    format!("/v1/memory/long-term?id={id}")
+}
+
+#[tokio::test]
+async fn working_memory_set_read_delete_over_http() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let set = send(
+        state.clone(),
+        request("POST", &working_memory_uri(&id), Some(serde_json::json!({ "key": "budget", "value": "200000" })), None),
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::OK, "тело: {}", set.body);
+    assert_eq!(set.body["value"], "200000");
+    assert_eq!(set.body["source"], "manual");
+
+    let read = send(state.clone(), request("GET", &working_memory_uri(&id), None, None)).await;
+    assert_eq!(read.body["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(read.body["entries"][0]["key"], "budget");
+
+    let deleted = send(state.clone(), request("DELETE", &delete_working_memory_uri(&id, "budget"), None, None)).await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+
+    let read_after = send(state, request("GET", &working_memory_uri(&id), None, None)).await;
+    assert!(read_after.body["entries"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn foreign_owner_cannot_read_or_write_working_memory() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_CLIENT_TOKENS", "owner-a,owner-b"),
+    ])
+    .await;
+    let created = create_chat(state.clone(), Some("owner-a"), serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let foreign_read = send(state.clone(), request("GET", &working_memory_uri(&id), None, Some("owner-b"))).await;
+    assert_eq!(foreign_read.status, StatusCode::NOT_FOUND, "тело: {}", foreign_read.body);
+
+    let foreign_set = send(
+        state,
+        request(
+            "POST",
+            &working_memory_uri(&id),
+            Some(serde_json::json!({ "key": "k", "value": "v" })),
+            Some("owner-b"),
+        ),
+    )
+    .await;
+    assert_eq!(foreign_set.status, StatusCode::NOT_FOUND, "тело: {}", foreign_set.body);
+}
+
+#[tokio::test]
+async fn manual_working_memory_write_overrides_earlier_automatic_operation_same_tact() {
+    // specs/memory-layers, «Ручная запись переопределяет решение
+    // маршрутизатора в том же такте»: ранняя автоматическая запись (source
+    // router, меньший updated_at), затем ручная HTTP-запись (source manual,
+    // больший updated_at, так как выполнена позже по времени) — итоговое
+    // значение от ручной.
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let owner = crate::store::ANONYMOUS_OWNER.to_string();
+    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+        .await
+        .expect("чат");
+
+    crate::store::set_working_memory(&state.db, &id, &chat.active_task_id, "k", "от роутера", "router", 1)
+        .await
+        .expect("ранняя автоматическая запись");
+
+    let set = send(
+        state.clone(),
+        request("POST", &working_memory_uri(&id), Some(serde_json::json!({ "key": "k", "value": "от клиента" })), None),
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::OK, "тело: {}", set.body);
+
+    let read = send(state, request("GET", &working_memory_uri(&id), None, None)).await;
+    let entries = read.body["entries"].as_array().unwrap();
+    let entry = entries.iter().find(|e| e["key"] == "k").expect("запись k");
+    assert_eq!(entry["value"], "от клиента");
+    assert_eq!(entry["source"], "manual");
+}
+
+#[tokio::test]
+async fn finish_task_over_http_transfers_carried_entries_and_rotates_task() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    send(
+        state.clone(),
+        request("POST", &working_memory_uri(&id), Some(serde_json::json!({ "key": "carried", "value": "значение" })), None),
+    )
+    .await;
+
+    let finished = send(
+        state.clone(),
+        request("POST", &finish_task_uri(&id), Some(serde_json::json!({ "carry_forward_keys": ["carried"] })), None),
+    )
+    .await;
+    assert_eq!(finished.status, StatusCode::OK, "тело: {}", finished.body);
+    let transferred = finished.body["entries"].as_array().unwrap();
+    assert_eq!(transferred.len(), 1);
+    assert_eq!(transferred[0]["value"], "значение");
+
+    let working_after = send(state, request("GET", &working_memory_uri(&id), None, None)).await;
+    assert!(working_after.body["entries"].as_array().unwrap().is_empty(), "рабочая память прежней задачи очищена");
+}
+
+#[tokio::test]
+async fn long_term_memory_set_read_delete_over_http() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+
+    let set = send(
+        state.clone(),
+        request(
+            "POST",
+            "/v1/memory/long-term",
+            Some(serde_json::json!({ "entry_type": "decision", "key": "auth_provider", "value": "Clerk" })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::OK, "тело: {}", set.body);
+    let entry_id = set.body["id"].as_str().unwrap().to_string();
+
+    let read = send(state.clone(), request("GET", "/v1/memory/long-term", None, None)).await;
+    assert_eq!(read.body["entries"].as_array().unwrap().len(), 1);
+
+    let deleted = send(state.clone(), request("DELETE", &delete_long_term_memory_uri(&entry_id), None, None)).await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+
+    let read_after = send(state, request("GET", "/v1/memory/long-term", None, None)).await;
+    assert!(read_after.body["entries"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn foreign_owner_cannot_read_or_delete_long_term_memory() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_CLIENT_TOKENS", "owner-a,owner-b"),
+    ])
+    .await;
+    let set = send(
+        state.clone(),
+        request(
+            "POST",
+            "/v1/memory/long-term",
+            Some(serde_json::json!({ "entry_type": "profile", "key": "name", "value": "секрет" })),
+            Some("owner-a"),
+        ),
+    )
+    .await;
+    let entry_id = set.body["id"].as_str().unwrap().to_string();
+
+    let foreign_read = send(state.clone(), request("GET", "/v1/memory/long-term", None, Some("owner-b"))).await;
+    assert!(foreign_read.body["entries"].as_array().unwrap().is_empty(), "чужая долговременная память не видна");
+
+    let foreign_delete = send(
+        state,
+        request("DELETE", &delete_long_term_memory_uri(&entry_id), None, Some("owner-b")),
+    )
+    .await;
+    assert_eq!(foreign_delete.status, StatusCode::NOT_FOUND, "тело: {}", foreign_delete.body);
+}
+
 // --- 7.3 Эндпоинты веток ---
 
 fn branches_uri(chat_id: &str) -> String {

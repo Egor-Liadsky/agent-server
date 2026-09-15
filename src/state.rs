@@ -26,6 +26,13 @@ pub struct AppState {
     /// Один клиент на весь процесс: соединения к провайдеру переиспользуются.
     pub agent: Arc<ServiceAgent>,
     pub db: SqlitePool,
+    /// Счётчики последнего фонового прогона маршрутизатора памяти по чату
+    /// (стратегия `memory_layers`) — маршрутизатор фоновый, поэтому его
+    /// результат сообщается блоком `context` СЛЕДУЮЩЕГО ответа (design.md,
+    /// решение 5). Не персистентно: перезапуск сервиса обнуляет счётчики,
+    /// это тот же допустимый компромисс, что и однопроцессная SQLite
+    /// (design.md, «Риски»).
+    pub memory_route_outcomes: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::memory::RouteOutcome>>>,
     /// Временный каталог тестовой базы. Держится здесь, чтобы не удалиться
     /// раньше последнего клона состояния; удаляется вместе с последним.
     #[cfg(test)]
@@ -47,6 +54,7 @@ impl AppState {
             config: Arc::new(config),
             agent: Arc::new(agent),
             db,
+            memory_route_outcomes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             _test_db_dir: None,
         })
