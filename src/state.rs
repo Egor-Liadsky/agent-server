@@ -33,6 +33,9 @@ pub struct AppState {
     /// допустимый компромисс, что и однопроцессная SQLite (design.md,
     /// «Риски»).
     pub memory_route_outcomes: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::memory::RouteOutcome>>>,
+    /// Тот же приём, что `memory_route_outcomes`, для фонового трекера
+    /// состояния задачи (specs/task-state, design.md решение 5).
+    pub task_track_outcomes: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::task::TrackOutcome>>>,
     /// Временный каталог тестовой базы. Держится здесь, чтобы не удалиться
     /// раньше последнего клона состояния; удаляется вместе с последним.
     #[cfg(test)]
@@ -55,6 +58,7 @@ impl AppState {
             agent: Arc::new(agent),
             db,
             memory_route_outcomes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            task_track_outcomes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             _test_db_dir: None,
         })

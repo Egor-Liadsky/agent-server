@@ -6,7 +6,8 @@ use crate::dto::{
     DeleteLongTermMemoryQuery, DeleteWorkingMemoryQuery, FactDto, FactsResponse, FinishTaskRequest, GetChatQuery,
     ListChatsQuery, ListChatsResponse, LongTermMemoryEntryDto, LongTermMemoryResponse, MessageView, ModelsResponse,
     ProfileDto, ProfilesResponse, SetFactRequest, SetLongTermMemoryRequest, SetWorkingMemoryRequest,
-    UpdateChatRequest, UpdateProfileRequest, WorkingMemoryEntryDto, WorkingMemoryResponse,
+    TaskStateDto, TaskTransitionDto, TaskTransitionRequest, TaskTransitionResponse, UpdateChatRequest,
+    UpdateProfileRequest, WorkingMemoryEntryDto, WorkingMemoryResponse,
 };
 use crate::context;
 use crate::error::ApiError;
@@ -760,6 +761,28 @@ async fn handle_chat_in_existing(
         });
     }
 
+    // Трекер состояния задачи — тоже фоновый вызов после записи обмена, не
+    // задерживающий ответ пользователю; результат прогона попадёт в блок
+    // `context` СЛЕДУЮЩЕГО ответа этого чата (design.md, решение 5;
+    // specs/task-state, «Автоматический трекер предлагает переход»).
+    if crate::task::effective_enabled(&state, &settings) && crate::task::effective_auto_enabled(&state, &settings) {
+        let track_state = state.clone();
+        let track_chat = chat.clone();
+        let track_settings = settings.clone();
+        let track_owner = owner.clone();
+        let assistant_reply = reply.content.clone();
+        tokio::spawn(async move {
+            let outcome =
+                crate::task::track_after_exchange(&track_state, &track_chat, &track_settings, &track_owner, &assistant_reply)
+                    .await;
+            track_state
+                .task_track_outcomes
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .insert(track_chat.id.clone(), outcome);
+        });
+    }
+
     // Название генерируется фоном, вне ответа пользователю (design.md,
     // решение 5): ответ уже сформирован, ждать вызов модели незачем.
     if crate::title::should_generate(&state, &chat.title, user_row.seq) {
@@ -1341,10 +1364,165 @@ async fn handle_finish_task(
     store::load_chat(&state.db, &owner, &chat_id, &defaults)
         .await
         .map_err(ApiError::from_store_error)?;
-    let transferred = store::finish_task(&state.db, &owner, &chat_id, &carry_forward_keys)
+    let result = store::finish_task(
+        &state.db,
+        &owner,
+        &chat_id,
+        &carry_forward_keys,
+        "manual",
+        "явное завершение задачи",
+    )
+    .await
+    .map_err(ApiError::from_store_error)?;
+    Ok(LongTermMemoryResponse { entries: result.transferred.into_iter().map(LongTermMemoryEntryDto::from).collect() })
+}
+
+// --- Состояние задачи (specs/task-state) ---
+
+/// Отображает `TaskError` в `ApiError`: чужой/несуществующий чат неотличим
+/// от отсутствующего (specs/task-state, «Чужой чат недоступен»), остальные
+/// исходы — один код `task_transition_invalid` с уточняющим текстом.
+fn map_task_error(err: crate::task::TaskError) -> ApiError {
+    match err {
+        crate::task::TaskError::NotFound => ApiError::chat_not_found(),
+        crate::task::TaskError::Backend(err) => ApiError::from_store_error(err),
+        crate::task::TaskError::UnknownStage => {
+            ApiError::task_transition_invalid("неизвестный этап задачи")
+        }
+        crate::task::TaskError::InvalidEdge => {
+            ApiError::task_transition_invalid("переход не входит в допустимые рёбра автомата")
+        }
+        crate::task::TaskError::Paused => {
+            ApiError::task_transition_invalid("задача на паузе: переход отклонён до снятия с паузы")
+        }
+        crate::task::TaskError::StepTooLong => {
+            ApiError::task_transition_invalid("текст шага превышает операторский лимит длины")
+        }
+        crate::task::TaskError::ExpectedActionTooLong => {
+            ApiError::task_transition_invalid("текст ожидаемого действия превышает операторский лимит длины")
+        }
+    }
+}
+
+async fn task_state_dto(state: &AppState, owner: &str, chat_id: &str) -> Result<TaskStateDto, ApiError> {
+    let task = store::load_task_state(&state.db, owner, chat_id)
         .await
         .map_err(ApiError::from_store_error)?;
-    Ok(LongTermMemoryResponse { entries: transferred.into_iter().map(LongTermMemoryEntryDto::from).collect() })
+    let transitions = store::load_task_transitions(&state.db, owner, chat_id)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(TaskStateDto {
+        id: task.id,
+        stage: task.stage,
+        step: task.step,
+        expected_action: task.expected_action,
+        paused: task.paused,
+        resume_brief: task.resume_brief,
+        transitions: transitions.into_iter().map(TaskTransitionDto::from).collect(),
+    })
+}
+
+async fn get_task_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+) -> Response {
+    match task_state_dto(&state, &owner, &id).await {
+        Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn task_transition_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+    Json(body): Json<TaskTransitionRequest>,
+) -> Response {
+    match handle_task_transition(state, owner, id, body).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_task_transition(
+    state: AppState,
+    owner: String,
+    chat_id: String,
+    body: TaskTransitionRequest,
+) -> Result<TaskTransitionResponse, ApiError> {
+    match body.stage.as_deref() {
+        Some("done") => {
+            store::load_chat(&state.db, &owner, &chat_id, &server_defaults(&state))
+                .await
+                .map_err(ApiError::from_store_error)?;
+            let result = store::finish_task(
+                &state.db,
+                &owner,
+                &chat_id,
+                &body.carry_forward_keys,
+                "manual",
+                "переход состояния задачи в done",
+            )
+            .await
+            .map_err(ApiError::from_store_error)?;
+            let task = task_state_dto(&state, &owner, &chat_id).await?;
+            Ok(TaskTransitionResponse { task, new_task_id: Some(result.new_task_id) })
+        }
+        Some(stage) => {
+            crate::task::apply_manual_transition(
+                &state,
+                &owner,
+                &chat_id,
+                stage,
+                body.step.as_deref(),
+                body.expected_action.as_deref(),
+            )
+            .await
+            .map_err(map_task_error)?;
+            let task = task_state_dto(&state, &owner, &chat_id).await?;
+            Ok(TaskTransitionResponse { task, new_task_id: None })
+        }
+        None => {
+            crate::task::update_fields(&state, &owner, &chat_id, body.step.as_deref(), body.expected_action.as_deref())
+                .await
+                .map_err(map_task_error)?;
+            let task = task_state_dto(&state, &owner, &chat_id).await?;
+            Ok(TaskTransitionResponse { task, new_task_id: None })
+        }
+    }
+}
+
+async fn task_pause_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+) -> Response {
+    match crate::task::pause(&state, &owner, &id).await {
+        Ok(_) => match task_state_dto(&state, &owner, &id).await {
+            Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
+            Err(err) => err.with_request_id(request_id).into_response(),
+        },
+        Err(err) => map_task_error(err).with_request_id(request_id).into_response(),
+    }
+}
+
+async fn task_resume_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+) -> Response {
+    match crate::task::resume(&state, &owner, &id).await {
+        Ok(_) => match task_state_dto(&state, &owner, &id).await {
+            Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
+            Err(err) => err.with_request_id(request_id).into_response(),
+        },
+        Err(err) => map_task_error(err).with_request_id(request_id).into_response(),
+    }
 }
 
 async fn get_long_term_memory_handler(
@@ -1684,6 +1862,10 @@ pub fn router(state: AppState) -> Router {
             "/chats/{id}/memory/working/finish-task",
             post(finish_task_handler),
         )
+        .route("/chats/{id}/task", get(get_task_handler))
+        .route("/chats/{id}/task/transition", post(task_transition_handler))
+        .route("/chats/{id}/task/pause", post(task_pause_handler))
+        .route("/chats/{id}/task/resume", post(task_resume_handler))
         .route(
             "/memory/long-term",
             get(get_long_term_memory_handler)

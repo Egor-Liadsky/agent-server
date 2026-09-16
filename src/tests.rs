@@ -4468,3 +4468,472 @@ async fn scenario_on_branching_strategy_checkpoints_and_switches() {
     assert!(!body.contains("[A]"), "ветка B не должна видеть сообщения ветки A: {body}");
     assert!(body.contains("[B]"), "ветка B должна видеть собственные сообщения: {body}");
 }
+
+// --- Состояние задачи (specs/task-state) ---
+
+fn task_uri(chat: &str) -> String {
+    format!("/v1/chats/{chat}/task")
+}
+
+// --- 6.1 Эндпоинты ---
+
+#[tokio::test]
+async fn task_state_of_new_chat_is_planning_over_http() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(state, get(&task_uri(&id))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["stage"], "planning");
+    assert_eq!(sent.body["step"], "");
+    assert_eq!(sent.body["paused"], false);
+    assert!(sent.body["id"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn foreign_chat_task_state_is_unreachable() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "test-key-value"),
+        ("AGENTD_UPSTREAM_BASE_URL", "http://127.0.0.1:1"),
+        ("AGENTD_MODEL", "test-model"),
+        ("AGENTD_CLIENT_TOKENS", "owner-a,owner-b"),
+    ])
+    .await;
+    let created = create_chat(state.clone(), Some("owner-a"), serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(state, request("GET", &task_uri(&id), None, Some("owner-b"))).await;
+    assert_eq!(sent.status, StatusCode::NOT_FOUND, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "chat_not_found");
+}
+
+#[tokio::test]
+async fn allowed_transition_is_applied_and_journaled() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "execution", "step": "правит парсер", "expected_action": "ждёт ответа модели" })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["stage"], "execution");
+    assert_eq!(sent.body["step"], "правит парсер");
+    assert_eq!(sent.body["transitions"].as_array().unwrap().len(), 1);
+    assert_eq!(sent.body["transitions"][0]["source"], "manual");
+    assert!(sent.body["new_task_id"].is_null());
+}
+
+#[tokio::test]
+async fn skipping_a_stage_over_http_is_rejected_with_request_id() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "validation" })), None),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "task_transition_invalid");
+    assert!(!sent.body["error"]["request_id"].as_str().unwrap().is_empty());
+
+    let after = send(state, get(&task_uri(&id))).await;
+    assert_eq!(after.body["stage"], "planning", "состояние не должно меняться при отказе");
+}
+
+#[tokio::test]
+async fn transition_to_done_carries_new_task_id_and_clears_working_memory() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let owner = crate::store::ANONYMOUS_OWNER.to_string();
+    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+        .await
+        .expect("чат");
+    crate::store::set_working_memory(&state.db, &id, &chat.active_task_id, "k", "v", "manual", 1)
+        .await
+        .expect("рабочая память");
+
+    send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "execution" })), None),
+    )
+    .await;
+    send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "validation" })), None),
+    )
+    .await;
+    let done = send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "done" })), None),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::OK, "тело: {}", done.body);
+    let new_task_id = done.body["new_task_id"].as_str().expect("новая задача").to_string();
+    assert_ne!(new_task_id, chat.active_task_id);
+
+    let after = send(state.clone(), get(&task_uri(&id))).await;
+    assert_eq!(after.body["stage"], "planning");
+    assert_eq!(after.body["id"], new_task_id);
+
+    let working = crate::store::load_working_memory(&state.db, &id, &chat.active_task_id).await.expect("память");
+    assert!(working.is_empty(), "рабочая память прежней задачи очищена переходом в done");
+}
+
+// --- 6.2 Журнал переходов ---
+
+#[tokio::test]
+async fn manual_transition_journal_entry_has_manual_source_and_new_task_journal_is_empty() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "execution" })), None),
+    )
+    .await;
+    send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "validation" })), None),
+    )
+    .await;
+    let done = send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "done" })), None),
+    )
+    .await;
+    let new_task_id = done.body["new_task_id"].as_str().unwrap().to_string();
+
+    let after = send(state, get(&task_uri(&id))).await;
+    assert_eq!(after.body["id"], new_task_id);
+    assert!(after.body["transitions"].as_array().unwrap().is_empty(), "журнал новой задачи пуст");
+}
+
+// --- Пауза и возобновление ---
+
+#[tokio::test]
+async fn pause_preserves_state_and_resume_keeps_stage() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "execution", "step": "шаг", "expected_action": "действие" })),
+            None,
+        ),
+    )
+    .await;
+
+    let paused = send(state.clone(), request("POST", &format!("{}/pause", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+    assert_eq!(paused.status, StatusCode::OK, "тело: {}", paused.body);
+    assert_eq!(paused.body["paused"], true);
+    assert_eq!(paused.body["stage"], "execution");
+    assert_eq!(paused.body["step"], "шаг");
+
+    // Явный переход на паузе отклоняется.
+    let rejected = send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "validation" })), None),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "тело: {}", rejected.body);
+
+    // Повторная пауза — не ошибка.
+    let paused_again = send(state.clone(), request("POST", &format!("{}/pause", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+    assert_eq!(paused_again.status, StatusCode::OK);
+
+    let resumed = send(state.clone(), request("POST", &format!("{}/resume", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+    assert_eq!(resumed.status, StatusCode::OK, "тело: {}", resumed.body);
+    assert_eq!(resumed.body["paused"], false);
+    assert_eq!(resumed.body["stage"], "execution");
+}
+
+// --- 5.2/5.3/5.4 Настройки чата, системное сообщение, блок context ---
+
+#[tokio::test]
+async fn task_state_section_is_present_when_enabled_and_absent_when_disabled() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+
+    let enabled = create_chat(state.clone(), None, serde_json::json!({ "settings": { "task_state_enabled": true } })).await;
+    let enabled_id = enabled.body["id"].as_str().unwrap().to_string();
+    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": enabled_id, "prompt": "вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["context"]["task_stage"], "planning");
+    assert_eq!(sent.body["context"]["task_paused"], false);
+    let requests = server.received_requests().await.expect("запросы");
+    let body = String::from_utf8_lossy(&requests[0].body);
+    assert!(body.contains("Состояние задачи:"), "тело: {body}");
+
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+        .mount(&server)
+        .await;
+    let disabled = create_chat(state.clone(), None, serde_json::json!({ "settings": { "task_state_enabled": false } })).await;
+    let disabled_id = disabled.body["id"].as_str().unwrap().to_string();
+    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": disabled_id, "prompt": "вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert!(sent.body["context"]["task_stage"].is_null());
+    let requests = server.received_requests().await.expect("запросы");
+    let body = String::from_utf8_lossy(&requests.last().unwrap().body);
+    assert!(!body.contains("Состояние задачи:"), "тело: {body}");
+}
+
+#[tokio::test]
+async fn client_enables_task_state_over_operator_default_and_disables_tracker() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+        .mount(&server)
+        .await;
+    // Умолчание сервиса выключает и состояние задачи, и трекер.
+    let state = state_with_provider(&server, &[("AGENTD_AUTO_TITLE", "false")]).await;
+    assert!(!state.config.task_state_enabled);
+    assert!(!state.config.task_state_auto_enabled);
+
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "task_state_enabled": true, "task_state_auto_enabled": true } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["context"]["task_stage"], "planning", "клиент включил состояние задачи поверх умолчания");
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let requests_with_auto = server.received_requests().await.expect("запросы").len();
+    assert_eq!(requests_with_auto, 2, "трекер должен вызваться вторым запросом при включённом автотрекере чата");
+
+    let disabled_tracker = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "task_state_enabled": true, "task_state_auto_enabled": false } }),
+    )
+    .await;
+    let id2 = disabled_tracker.body["id"].as_str().unwrap().to_string();
+    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id2, "prompt": "вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let requests_after = server.received_requests().await.expect("запросы").len();
+    assert_eq!(requests_after, requests_with_auto + 1, "клиент выключил трекер поверх умолчания сервиса");
+}
+
+// --- 6.3 Трекер ---
+
+#[tokio::test]
+async fn tracker_applies_valid_proposal_and_next_response_reports_it() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(crate::task::TASK_TRACKER_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply(
+            r#"{"stage":"execution","step":"пишет код","expected_action":"ждёт ревью","reason":"пользователь попросил начать"}"#,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(crate::task::TASK_TRACKER_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_AUTO_TITLE", "false")]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "task_state_enabled": true, "task_state_auto_enabled": true } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let first = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "начнём" }))).await;
+    assert_eq!(first.status, StatusCode::OK, "тело: {}", first.body);
+    assert_eq!(first.body["context"]["task_tracker_applied"], 0, "у первого ответа ещё нет прогона трекера");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let second = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "продолжаем" }))).await;
+    assert_eq!(second.status, StatusCode::OK, "тело: {}", second.body);
+    assert_eq!(second.body["context"]["task_stage"], "execution", "предложение трекера применилось к состоянию");
+    assert_eq!(second.body["context"]["task_tracker_applied"], 1);
+    assert_eq!(second.body["context"]["task_tracker_rejected"], 0);
+}
+
+#[tokio::test]
+async fn tracker_never_applies_done_even_when_edge_is_valid() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(crate::task::TASK_TRACKER_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply(
+            r#"{"stage":"done","reason":"похоже, готово"}"#,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(crate::task::TASK_TRACKER_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_AUTO_TITLE", "false")]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "task_state_enabled": true, "task_state_auto_enabled": true } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "execution" })), None),
+    )
+    .await;
+    send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "validation" })), None),
+    )
+    .await;
+
+    let first = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "готово?" }))).await;
+    assert_eq!(first.status, StatusCode::OK, "тело: {}", first.body);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let second = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "и что дальше" }))).await;
+    assert_eq!(second.status, StatusCode::OK, "тело: {}", second.body);
+    assert_eq!(second.body["context"]["task_stage"], "validation", "предложение done не применяется трекером");
+    assert_eq!(second.body["context"]["task_tracker_rejected"], 1);
+}
+
+#[tokio::test]
+async fn tracker_does_not_run_while_task_is_paused() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_AUTO_TITLE", "false")]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "task_state_enabled": true, "task_state_auto_enabled": true } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    send(state.clone(), request("POST", &format!("{}/pause", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+
+    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let requests = server.received_requests().await.expect("запросы").len();
+    assert_eq!(requests, 1, "трекер не должен вызываться, пока задача на паузе");
+}
+
+#[tokio::test]
+async fn tracker_failure_does_not_break_main_response() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("основной ответ")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_AUTO_TITLE", "false")]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "task_state_enabled": true, "task_state_auto_enabled": true } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "основной ответ не должен зависеть от отказа трекера: {}", sent.body);
+}
+
+// --- 4.4/5.3 Бриф возобновления в системном сообщении ---
+
+#[tokio::test]
+async fn resumed_task_system_message_carries_prior_stage_step_and_resume_brief() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("принято")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({ "settings": { "task_state_enabled": true } })).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "execution", "step": "правит парсер", "expected_action": "ждёт ревью" })),
+            None,
+        ),
+    )
+    .await;
+    send(state.clone(), request("POST", &format!("{}/pause", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+    send(state.clone(), request("POST", &format!("{}/resume", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "продолжаем, без пересказа контекста" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["context"]["task_stage"], "execution");
+    assert_eq!(sent.body["context"]["task_step"], "правит парсер");
+
+    let requests = server.received_requests().await.expect("запросы");
+    let body = String::from_utf8_lossy(&requests[0].body);
+    assert!(body.contains("execution"), "тело: {body}");
+    assert!(body.contains("правит парсер"), "тело: {body}");
+    assert!(body.contains("ждёт ревью"), "тело: {body}");
+}
+

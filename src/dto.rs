@@ -155,6 +155,15 @@ pub struct ChatSettingsDto {
     /// поверх операторского умолчания»).
     #[serde(default, deserialize_with = "double_option")]
     pub profile_id: Option<Option<String>>,
+    /// Состояние задачи (этап, шаг, ожидаемое действие, пауза) этого чата.
+    /// Та же семантика присутствия поля, что и у `summary_enabled`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub task_state_enabled: Option<Option<bool>>,
+    /// Автоматический трекер состояния задачи этого чата. Имеет смысл
+    /// только при включённом состоянии задачи. Та же семантика присутствия
+    /// поля, что и у `summary_enabled`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub task_state_auto_enabled: Option<Option<bool>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -251,6 +260,9 @@ impl ChatSettingsDto {
             self.memory_working_max_entries.unwrap_or(defaults.memory_working_max_entries);
         defaults.memory_long_term_max_entries =
             self.memory_long_term_max_entries.unwrap_or(defaults.memory_long_term_max_entries);
+        defaults.task_state_enabled = self.task_state_enabled.unwrap_or(defaults.task_state_enabled);
+        defaults.task_state_auto_enabled =
+            self.task_state_auto_enabled.unwrap_or(defaults.task_state_auto_enabled);
         Ok(defaults)
     }
 }
@@ -361,6 +373,32 @@ pub struct ContextDto {
     /// усечения. Отсутствует без профиля.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_chars: Option<u32>,
+    /// Этап активной задачи чата (specs/task-state). Отсутствует, если
+    /// состояние задачи для чата выключено.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_stage: Option<String>,
+    /// Текущий шаг активной задачи. Отсутствует при выключенном состоянии
+    /// задачи.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_step: Option<String>,
+    /// Ожидаемое действие активной задачи. Отсутствует при выключенном
+    /// состоянии задачи.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_expected_action: Option<String>,
+    /// Признак паузы активной задачи. Отсутствует при выключенном состоянии
+    /// задачи.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_paused: Option<bool>,
+    /// Число переходов, применённых последним завершившимся прогоном
+    /// автоматического трекера — прогоном по ПРЕДЫДУЩЕМУ сообщению
+    /// (трекер фоновый, design.md решение 5). Отсутствует при выключенном
+    /// состоянии задачи.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_tracker_applied: Option<u32>,
+    /// Число переходов, отклонённых тем же прогоном трекера. Отсутствует
+    /// при выключенном состоянии задачи.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_tracker_rejected: Option<u32>,
 }
 
 impl ContextDto {
@@ -386,6 +424,12 @@ impl ContextDto {
             memory_router_rejected: None,
             profile_id: None,
             profile_chars: None,
+            task_stage: None,
+            task_step: None,
+            task_expected_action: None,
+            task_paused: None,
+            task_tracker_applied: None,
+            task_tracker_rejected: None,
         }
     }
 
@@ -411,6 +455,12 @@ impl ContextDto {
             memory_router_rejected: None,
             profile_id: None,
             profile_chars: None,
+            task_stage: None,
+            task_step: None,
+            task_expected_action: None,
+            task_paused: None,
+            task_tracker_applied: None,
+            task_tracker_rejected: None,
         }
     }
 
@@ -441,6 +491,12 @@ impl ContextDto {
             memory_router_rejected: None,
             profile_id: None,
             profile_chars: None,
+            task_stage: None,
+            task_step: None,
+            task_expected_action: None,
+            task_paused: None,
+            task_tracker_applied: None,
+            task_tracker_rejected: None,
         }
     }
 
@@ -466,6 +522,12 @@ impl ContextDto {
             memory_router_rejected: None,
             profile_id: None,
             profile_chars: None,
+            task_stage: None,
+            task_step: None,
+            task_expected_action: None,
+            task_paused: None,
+            task_tracker_applied: None,
+            task_tracker_rejected: None,
         }
     }
 }
@@ -918,6 +980,64 @@ pub struct SetLongTermMemoryRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeleteLongTermMemoryQuery {
     pub id: String,
+}
+
+// --- Состояние задачи (specs/task-state) ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskTransitionDto {
+    pub from_stage: String,
+    pub to_stage: String,
+    pub source: String,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+impl From<store::TaskTransition> for TaskTransitionDto {
+    fn from(t: store::TaskTransition) -> Self {
+        Self { from_stage: t.from_stage, to_stage: t.to_stage, source: t.source, reason: t.reason, created_at: t.created_at }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskStateDto {
+    pub id: String,
+    pub stage: String,
+    pub step: String,
+    pub expected_action: String,
+    pub paused: bool,
+    pub resume_brief: String,
+    /// Журнал переходов активной задачи, в хронологическом порядке
+    /// (specs/task-state, «Журнал переходов задачи»).
+    pub transitions: Vec<TaskTransitionDto>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TaskTransitionRequest {
+    /// Отсутствие поля — обновление шага/ожидаемого действия без смены
+    /// этапа (specs/task-state, «Обновление шага без смены этапа»).
+    #[serde(default)]
+    pub stage: Option<String>,
+    #[serde(default)]
+    pub step: Option<String>,
+    #[serde(default)]
+    pub expected_action: Option<String>,
+    /// Ключи рабочей памяти для переноса в долговременную, только для
+    /// перехода в `stage: "done"` (specs/task-state, «Переход в done
+    /// завершает задачу»).
+    #[serde(default)]
+    pub carry_forward_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskTransitionResponse {
+    #[serde(flatten)]
+    pub task: TaskStateDto,
+    /// Идентификатор новой активной задачи чата — присутствует только для
+    /// перехода в `done` (specs/task-state, «Ответ на переход в done несёт
+    /// идентификатор новой задачи»).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_task_id: Option<String>,
 }
 
 // --- Профили (specs/user-profiles) ---

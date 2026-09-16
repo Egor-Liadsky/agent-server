@@ -143,6 +143,24 @@ pub async fn assemble(
             .unwrap_or_default();
         crate::memory::merge_router_counters(&mut assembled.context, router);
     }
+    // Раздел состояния задачи соседствует с разделами памяти
+    // (specs/memory-layers, «Модифицированная возможность memory-layers»):
+    // читается заново на каждый запрос, поэтому поля `context` не отстают,
+    // в отличие от счётчиков фонового трекера ниже (design.md, решение 5).
+    if crate::task::effective_enabled(state, settings) {
+        if let Ok(task) = store::load_task_state(&state.db, owner, &chat.id).await {
+            crate::task::merge_into_context(&mut assembled.context, &task);
+            assembled.sections.push(crate::task::system_message_section(&task));
+            let tracker = state
+                .task_track_outcomes
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .get(&chat.id)
+                .copied()
+                .unwrap_or_default();
+            crate::task::merge_tracker_counters(&mut assembled.context, tracker);
+        }
+    }
     // Раздел профиля встаёт ПЕРЕД разделами памяти и стратегии — после того,
     // как они уже собраны, но до сборки системного сообщения (design.md,
     // решение 4): роль и ограничения должны задавать трактовку всего

@@ -37,6 +37,9 @@ pub const DEFAULT_MEMORY_LONG_TERM_VALUE_MAX_CHARS: u32 = 500;
 pub const DEFAULT_MEMORY_LONG_TERM_KEY_MAX_CHARS: u32 = 100;
 pub const DEFAULT_MAX_PROFILES: u32 = 20;
 pub const DEFAULT_PROFILE_MAX_CHARS: u32 = 2000;
+pub const DEFAULT_TASK_STEP_MAX_CHARS: u32 = 500;
+pub const DEFAULT_TASK_EXPECTED_ACTION_MAX_CHARS: u32 = 500;
+pub const DEFAULT_TASK_RESUME_BRIEF_MAX_CHARS: u32 = 2000;
 
 pub const API_KEY_VAR: &str = "AGENTD_UPSTREAM_API_KEY";
 
@@ -152,6 +155,20 @@ pub struct AgentdConfig {
     /// Потолок длины собранного раздела профиля в символах: превышение
     /// усекает раздел, а не отклоняет запрос (design.md, решение 6).
     pub profile_max_chars: u32,
+    /// Операторское умолчание включённости состояния задачи для чатов без
+    /// явного значения (specs/task-state). Выключено по умолчанию.
+    pub task_state_enabled: bool,
+    /// Операторское умолчание включённости автоматического трекера, когда
+    /// состояние задачи включено (specs/task-state).
+    pub task_state_auto_enabled: bool,
+    /// Модель для вызова трекера состояния задачи. `None` — модель чата.
+    pub task_state_model: Option<String>,
+    /// Потолок длины текста текущего шага задачи в символах.
+    pub task_step_max_chars: u32,
+    /// Потолок длины текста ожидаемого действия задачи в символах.
+    pub task_expected_action_max_chars: u32,
+    /// Потолок длины брифа возобновления задачи в символах.
+    pub task_resume_brief_max_chars: u32,
 }
 
 impl AgentdConfig {
@@ -364,6 +381,32 @@ impl AgentdConfig {
                 get("AGENTD_PROFILE_MAX_CHARS"),
                 "AGENTD_PROFILE_MAX_CHARS",
                 DEFAULT_PROFILE_MAX_CHARS,
+            )?,
+            task_state_enabled: parse_bool_named_default(
+                get("AGENTD_TASK_STATE_ENABLED"),
+                "AGENTD_TASK_STATE_ENABLED",
+                false,
+            )?,
+            task_state_auto_enabled: parse_bool_named_default(
+                get("AGENTD_TASK_STATE_AUTO_ENABLED"),
+                "AGENTD_TASK_STATE_AUTO_ENABLED",
+                false,
+            )?,
+            task_state_model: get("AGENTD_TASK_STATE_MODEL"),
+            task_step_max_chars: parse_nonzero(
+                get("AGENTD_TASK_STEP_MAX_CHARS"),
+                "AGENTD_TASK_STEP_MAX_CHARS",
+                DEFAULT_TASK_STEP_MAX_CHARS,
+            )?,
+            task_expected_action_max_chars: parse_nonzero(
+                get("AGENTD_TASK_EXPECTED_ACTION_MAX_CHARS"),
+                "AGENTD_TASK_EXPECTED_ACTION_MAX_CHARS",
+                DEFAULT_TASK_EXPECTED_ACTION_MAX_CHARS,
+            )?,
+            task_resume_brief_max_chars: parse_nonzero(
+                get("AGENTD_TASK_RESUME_BRIEF_MAX_CHARS"),
+                "AGENTD_TASK_RESUME_BRIEF_MAX_CHARS",
+                DEFAULT_TASK_RESUME_BRIEF_MAX_CHARS,
             )?,
         })
     }
@@ -987,5 +1030,58 @@ mod tests {
         ])
         .expect_err("ожидалась ошибка");
         assert!(format!("{err}").contains("AGENTD_MAX_PROFILES"));
+    }
+
+    // --- AGENTD_TASK_STATE_* / AGENTD_TASK_*_MAX_CHARS (specs/task-state) ---
+
+    #[test]
+    fn task_state_settings_default_when_not_set() {
+        let config = config_from(&[(API_KEY_VAR, "secret-key-value")]).expect("конфигурация");
+        assert!(!config.task_state_enabled);
+        assert!(!config.task_state_auto_enabled);
+        assert_eq!(config.task_state_model, None);
+        assert_eq!(config.task_step_max_chars, DEFAULT_TASK_STEP_MAX_CHARS);
+        assert_eq!(config.task_expected_action_max_chars, DEFAULT_TASK_EXPECTED_ACTION_MAX_CHARS);
+        assert_eq!(config.task_resume_brief_max_chars, DEFAULT_TASK_RESUME_BRIEF_MAX_CHARS);
+    }
+
+    #[test]
+    fn task_state_settings_are_read_from_environment() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_TASK_STATE_ENABLED", "true"),
+            ("AGENTD_TASK_STATE_AUTO_ENABLED", "true"),
+            ("AGENTD_TASK_STATE_MODEL", "tracker-model"),
+            ("AGENTD_TASK_STEP_MAX_CHARS", "300"),
+            ("AGENTD_TASK_EXPECTED_ACTION_MAX_CHARS", "250"),
+            ("AGENTD_TASK_RESUME_BRIEF_MAX_CHARS", "1500"),
+        ])
+        .expect("конфигурация");
+        assert!(config.task_state_enabled);
+        assert!(config.task_state_auto_enabled);
+        assert_eq!(config.task_state_model.as_deref(), Some("tracker-model"));
+        assert_eq!(config.task_step_max_chars, 300);
+        assert_eq!(config.task_expected_action_max_chars, 250);
+        assert_eq!(config.task_resume_brief_max_chars, 1500);
+    }
+
+    #[test]
+    fn invalid_task_state_enabled_value_fails_startup() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_TASK_STATE_ENABLED", "magic"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_TASK_STATE_ENABLED"));
+    }
+
+    #[test]
+    fn zero_task_step_max_chars_fails_startup() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_TASK_STEP_MAX_CHARS", "0"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_TASK_STEP_MAX_CHARS"));
     }
 }

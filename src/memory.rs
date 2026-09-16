@@ -283,7 +283,16 @@ pub async fn route_after_exchange(
                 outcome.rejected += 1;
             }
             Ok(ValidatedOp::FinishTask) => {
-                if let Err(err) = store::finish_task(&state.db, owner, &chat.id, &carry_forward_keys).await {
+                if let Err(err) = store::finish_task(
+                    &state.db,
+                    owner,
+                    &chat.id,
+                    &carry_forward_keys,
+                    "manual",
+                    "операция finish_task маршрутизатора памяти",
+                )
+                .await
+                {
                     tracing::warn!(chat_id = %chat.id, error = %err, "не удалось выполнить finish_task маршрутизатора памяти");
                 }
             }

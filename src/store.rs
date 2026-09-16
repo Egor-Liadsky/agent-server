@@ -1125,17 +1125,33 @@ pub async fn delete_long_term_memory_by_key(pool: &SqlitePool, owner: &str, key:
     Ok(())
 }
 
+/// Результат завершения задачи: перенесённые записи долговременной памяти и
+/// идентификатор новой активной задачи чата, которую получил владелец
+/// (specs/task-state, «Переход в done завершает задачу»).
+#[derive(Debug, Clone)]
+pub struct FinishTaskResult {
+    pub transferred: Vec<LongTermMemoryEntry>,
+    pub new_task_id: String,
+}
+
 /// Завершает активную задачу чата: записи, отмеченные `carry_forward_keys`,
 /// переносятся в долговременную память ДО удаления рабочей памяти прежней
 /// задачи (specs/memory-layers, «Перенос отмеченной записи в долговременную
 /// память при завершении задачи»), затем чат получает новую случайную
-/// задачу. Возвращает перенесённые записи.
+/// задачу. Одним и тем же путём проходит и явный вызов завершения задачи, и
+/// переход состояния задачи в `done` (design.md, решение 4): функция всегда
+/// заводит (лениво, если её ещё не было) строку `chat_tasks` прежней задачи,
+/// переводит её в `done` и пишет запись в `chat_task_transitions` с
+/// переданными `source` и `reason` — один код, одна запись в журнале,
+/// откуда бы её ни вызвали.
 pub async fn finish_task(
     pool: &SqlitePool,
     owner: &str,
     chat_id: &str,
     carry_forward_keys: &[String],
-) -> Result<Vec<LongTermMemoryEntry>, StoreError> {
+    source: &str,
+    reason: &str,
+) -> Result<FinishTaskResult, StoreError> {
     let mut tx = pool.begin().await?;
     let task_id: String = sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = ? AND owner = ?")
         .bind(chat_id)
@@ -1145,6 +1161,26 @@ pub async fn finish_task(
         .ok_or(StoreError::NotFound)?;
 
     let now = now_secs();
+
+    // Задача могла ни разу не участвовать в состоянии задачи (design.md,
+    // решение 2 — ленивое создание строки): чтобы журнал завершения был у
+    // любой задачи, строка заводится здесь же, если её ещё не было.
+    sqlx::query(
+        "INSERT OR IGNORE INTO chat_tasks \
+             (id, chat_id, stage, step, expected_action, paused, resume_brief, created_at, updated_at) \
+         VALUES (?, ?, 'planning', '', '', 0, '', ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(chat_id)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    let from_stage: String = sqlx::query_scalar("SELECT stage FROM chat_tasks WHERE id = ?")
+        .bind(&task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
     let mut transferred = Vec::new();
     for key in carry_forward_keys {
         let row = sqlx::query(
@@ -1193,6 +1229,24 @@ pub async fn finish_task(
         .execute(&mut *tx)
         .await?;
 
+    sqlx::query("UPDATE chat_tasks SET stage = 'done', updated_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(&task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO chat_task_transitions (id, task_id, from_stage, to_stage, source, reason, created_at) \
+         VALUES (?, ?, ?, 'done', ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&task_id)
+    .bind(&from_stage)
+    .bind(source)
+    .bind(reason)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
     let new_task_id = uuid::Uuid::new_v4().to_string();
     sqlx::query("UPDATE chats SET active_task_id = ? WHERE id = ?")
         .bind(&new_task_id)
@@ -1201,7 +1255,235 @@ pub async fn finish_task(
         .await?;
 
     tx.commit().await?;
-    Ok(transferred)
+    Ok(FinishTaskResult { transferred, new_task_id })
+}
+
+// --- Состояние задачи: этап, шаг, ожидаемое действие, пауза, журнал
+// переходов (specs/task-state, design.md решения 1-3) ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskState {
+    pub id: String,
+    pub chat_id: String,
+    pub stage: String,
+    pub step: String,
+    pub expected_action: String,
+    pub paused: bool,
+    pub resume_brief: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn task_state_from_row(row: sqlx::sqlite::SqliteRow) -> Result<TaskState, StoreError> {
+    Ok(TaskState {
+        id: row.try_get("id")?,
+        chat_id: row.try_get("chat_id")?,
+        stage: row.try_get("stage")?,
+        step: row.try_get("step")?,
+        expected_action: row.try_get("expected_action")?,
+        paused: row.try_get::<i64, _>("paused")? != 0,
+        resume_brief: row.try_get("resume_brief")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskTransition {
+    pub from_stage: String,
+    pub to_stage: String,
+    pub source: String,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+/// Состояние активной задачи чата, читаемое или создаваемое лениво: чат без
+/// строки в `chat_tasks` (созданный до появления этой возможности или ни
+/// разу её не касавшийся) получает `planning` с пустыми текстами
+/// (specs/task-state, «Чат, созданный до появления состояния задачи»).
+pub async fn load_task_state(pool: &SqlitePool, owner: &str, chat_id: &str) -> Result<TaskState, StoreError> {
+    let task_id: String = sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = ? AND owner = ?")
+        .bind(chat_id)
+        .bind(owner)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+    ensure_task_row(pool, chat_id, &task_id).await
+}
+
+/// Заводит строку задачи, если её ещё нет (design.md, решение 2), и
+/// возвращает актуальное состояние.
+async fn ensure_task_row(pool: &SqlitePool, chat_id: &str, task_id: &str) -> Result<TaskState, StoreError> {
+    let now = now_secs();
+    sqlx::query(
+        "INSERT OR IGNORE INTO chat_tasks \
+             (id, chat_id, stage, step, expected_action, paused, resume_brief, created_at, updated_at) \
+         VALUES (?, ?, 'planning', '', '', 0, '', ?, ?)",
+    )
+    .bind(task_id)
+    .bind(chat_id)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    let row = sqlx::query("SELECT id, chat_id, stage, step, expected_action, paused, resume_brief, created_at, updated_at \
+         FROM chat_tasks WHERE id = ?")
+        .bind(task_id)
+        .fetch_one(pool)
+        .await?;
+    task_state_from_row(row)
+}
+
+/// Журнал переходов задачи, в хронологическом порядке (specs/task-state,
+/// «Журнал переходов задачи»).
+pub async fn load_task_transitions(
+    pool: &SqlitePool,
+    owner: &str,
+    chat_id: &str,
+) -> Result<Vec<TaskTransition>, StoreError> {
+    let task_id: String = sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = ? AND owner = ?")
+        .bind(chat_id)
+        .bind(owner)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+    let rows = sqlx::query(
+        "SELECT from_stage, to_stage, source, reason, created_at FROM chat_task_transitions \
+         WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+    )
+    .bind(&task_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(TaskTransition {
+                from_stage: row.try_get("from_stage")?,
+                to_stage: row.try_get("to_stage")?,
+                source: row.try_get("source")?,
+                reason: row.try_get("reason")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+/// Меняет шаг и/или ожидаемое действие БЕЗ смены этапа: обновление поля без
+/// этапа — не переход автомата и в журнал не пишется (design.md, решение 3).
+pub async fn update_task_fields(
+    pool: &SqlitePool,
+    owner: &str,
+    chat_id: &str,
+    step: Option<&str>,
+    expected_action: Option<&str>,
+) -> Result<TaskState, StoreError> {
+    let task = load_task_state(pool, owner, chat_id).await?;
+    let now = now_secs();
+    sqlx::query("UPDATE chat_tasks SET step = ?, expected_action = ?, updated_at = ? WHERE id = ?")
+        .bind(step.unwrap_or(&task.step))
+        .bind(expected_action.unwrap_or(&task.expected_action))
+        .bind(now)
+        .bind(&task.id)
+        .execute(pool)
+        .await?;
+    ensure_task_row(pool, chat_id, &task.id).await
+}
+
+/// Применяет переход этапа: обновляет строку задачи и пишет запись в
+/// журнал переходов одной транзакцией. Проверка автомата (`can_transition`),
+/// лимитов длины и паузы — забота вызывающего кода (`task.rs`): здесь только
+/// запись уже провалидированного перехода.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_task_transition(
+    pool: &SqlitePool,
+    task_id: &str,
+    from_stage: &str,
+    to_stage: &str,
+    step: Option<&str>,
+    expected_action: Option<&str>,
+    source: &str,
+    reason: &str,
+) -> Result<TaskState, StoreError> {
+    let mut tx = pool.begin().await?;
+    let now = now_secs();
+    let current = sqlx::query(
+        "SELECT id, chat_id, stage, step, expected_action, paused, resume_brief, created_at, updated_at \
+         FROM chat_tasks WHERE id = ?",
+    )
+    .bind(task_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let current = task_state_from_row(current)?;
+
+    sqlx::query("UPDATE chat_tasks SET stage = ?, step = ?, expected_action = ?, updated_at = ? WHERE id = ?")
+        .bind(to_stage)
+        .bind(step.unwrap_or(&current.step))
+        .bind(expected_action.unwrap_or(&current.expected_action))
+        .bind(now)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO chat_task_transitions (id, task_id, from_stage, to_stage, source, reason, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(task_id)
+    .bind(from_stage)
+    .bind(to_stage)
+    .bind(source)
+    .bind(reason)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(TaskState {
+        stage: to_stage.to_string(),
+        step: step.unwrap_or(&current.step).to_string(),
+        expected_action: expected_action.unwrap_or(&current.expected_action).to_string(),
+        updated_at: now,
+        ..current
+    })
+}
+
+/// Ставит задачу на паузу или снимает с неё, сохраняя этап, шаг и ожидаемое
+/// действие; повторная пауза и повторное снятие — идемпотентны
+/// (specs/task-state, «Пауза на любом этапе»). Бриф передаётся только при
+/// постановке на паузу — снятие с паузы его не трогает.
+pub async fn set_task_paused(
+    pool: &SqlitePool,
+    task_id: &str,
+    paused: bool,
+    resume_brief: Option<&str>,
+) -> Result<TaskState, StoreError> {
+    let now = now_secs();
+    match resume_brief {
+        Some(brief) => {
+            sqlx::query("UPDATE chat_tasks SET paused = ?, resume_brief = ?, updated_at = ? WHERE id = ?")
+                .bind(paused)
+                .bind(brief)
+                .bind(now)
+                .bind(task_id)
+                .execute(pool)
+                .await?;
+        }
+        None => {
+            sqlx::query("UPDATE chat_tasks SET paused = ?, updated_at = ? WHERE id = ?")
+                .bind(paused)
+                .bind(now)
+                .bind(task_id)
+                .execute(pool)
+                .await?;
+        }
+    }
+    let row = sqlx::query(
+        "SELECT id, chat_id, stage, step, expected_action, paused, resume_brief, created_at, updated_at \
+         FROM chat_tasks WHERE id = ?",
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await?;
+    task_state_from_row(row)
 }
 
 /// Записывает обмен (сообщение пользователя и ответ модели) одной
@@ -1652,9 +1934,10 @@ mod tests {
             .await
             .expect("запись без переноса");
 
-        let transferred = finish_task(&pool, "owner-1", &chat.id, &["carried".to_string()])
+        let result = finish_task(&pool, "owner-1", &chat.id, &["carried".to_string()], "manual", "тест")
             .await
             .expect("завершение задачи");
+        let transferred = result.transferred;
         assert_eq!(transferred.len(), 1);
         assert_eq!(transferred[0].value, "значение");
 
@@ -1663,6 +1946,7 @@ mod tests {
 
         let reloaded = load_chat(&pool, "owner-1", &chat.id, &ChatSettings::default()).await.expect("чат");
         assert_ne!(reloaded.active_task_id, old_task_id, "у чата новая активная задача");
+        assert_eq!(reloaded.active_task_id, result.new_task_id, "ответ несёт идентификатор новой задачи");
 
         let old_task_entries = load_working_memory(&pool, &chat.id, &old_task_id).await.expect("чтение прежней задачи");
         assert!(old_task_entries.is_empty(), "рабочая память прежней задачи очищена");
@@ -1670,6 +1954,131 @@ mod tests {
             .await
             .expect("чтение новой задачи");
         assert!(new_task_entries.is_empty(), "новая задача начинает с пустого набора");
+    }
+
+    // --- Состояние задачи: ленивое создание, переходы, пауза ---
+
+    #[tokio::test]
+    async fn task_state_of_new_chat_is_planning_with_empty_texts() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+
+        let task = load_task_state(&pool, "owner-1", &chat.id).await.expect("состояние задачи");
+        assert_eq!(task.stage, "planning");
+        assert_eq!(task.step, "");
+        assert_eq!(task.expected_action, "");
+        assert!(!task.paused);
+        assert_eq!(task.id, chat.active_task_id);
+    }
+
+    #[tokio::test]
+    async fn task_state_of_chat_without_chat_tasks_row_is_planning_without_error() {
+        // Симулирует чат, созданный до появления этой возможности: строка в
+        // chat_tasks для его active_task_id никогда не создавалась.
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+        sqlx::query("DELETE FROM chat_tasks WHERE id = ?")
+            .bind(&chat.active_task_id)
+            .execute(&pool)
+            .await
+            .expect("удаление строки задачи");
+
+        let task = load_task_state(&pool, "owner-1", &chat.id).await.expect("состояние задачи без ошибки");
+        assert_eq!(task.stage, "planning");
+    }
+
+    #[tokio::test]
+    async fn write_task_transition_updates_stage_and_writes_journal_entry() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+        let task = load_task_state(&pool, "owner-1", &chat.id).await.expect("состояние задачи");
+
+        let updated = write_task_transition(
+            &pool,
+            &task.id,
+            "planning",
+            "execution",
+            Some("правит парсер"),
+            Some("ждёт ответа модели"),
+            "manual",
+            "явный переход",
+        )
+        .await
+        .expect("переход");
+        assert_eq!(updated.stage, "execution");
+        assert_eq!(updated.step, "правит парсер");
+
+        let transitions = load_task_transitions(&pool, "owner-1", &chat.id).await.expect("журнал");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].from_stage, "planning");
+        assert_eq!(transitions[0].to_stage, "execution");
+        assert_eq!(transitions[0].source, "manual");
+    }
+
+    #[tokio::test]
+    async fn update_task_fields_without_stage_does_not_write_journal_entry() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+
+        let updated = update_task_fields(&pool, "owner-1", &chat.id, Some("новый шаг"), None)
+            .await
+            .expect("обновление шага");
+        assert_eq!(updated.step, "новый шаг");
+        assert_eq!(updated.stage, "planning");
+
+        let transitions = load_task_transitions(&pool, "owner-1", &chat.id).await.expect("журнал");
+        assert!(transitions.is_empty(), "обновление без смены этапа не переход");
+    }
+
+    #[tokio::test]
+    async fn set_task_paused_is_idempotent_and_preserves_state() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+        let task = load_task_state(&pool, "owner-1", &chat.id).await.expect("состояние задачи");
+
+        let paused = set_task_paused(&pool, &task.id, true, Some("бриф возобновления")).await.expect("пауза");
+        assert!(paused.paused);
+        assert_eq!(paused.resume_brief, "бриф возобновления");
+
+        let paused_again = set_task_paused(&pool, &task.id, true, None).await.expect("повторная пауза");
+        assert!(paused_again.paused);
+        assert_eq!(paused_again.resume_brief, "бриф возобновления", "бриф не трогается без нового значения");
+
+        let resumed = set_task_paused(&pool, &task.id, false, None).await.expect("снятие с паузы");
+        assert!(!resumed.paused);
+        assert_eq!(resumed.stage, "planning");
+    }
+
+    #[tokio::test]
+    async fn finish_task_transitions_old_task_to_done_and_journals_it() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+        let old_task_id = chat.active_task_id.clone();
+        load_task_state(&pool, "owner-1", &chat.id).await.expect("ленивое создание строки задачи");
+        write_task_transition(&pool, &old_task_id, "planning", "execution", None, None, "manual", "")
+            .await
+            .expect("переход в execution");
+
+        let result = finish_task(&pool, "owner-1", &chat.id, &[], "manual", "готово")
+            .await
+            .expect("завершение задачи");
+
+        let old_transitions = sqlx::query(
+            "SELECT to_stage, source, reason FROM chat_task_transitions WHERE task_id = ? ORDER BY created_at ASC",
+        )
+        .bind(&old_task_id)
+        .fetch_all(&pool)
+        .await
+        .expect("журнал прежней задачи");
+        assert_eq!(old_transitions.len(), 2, "переход в execution и переход в done");
+        let last: String = old_transitions[1].try_get("to_stage").expect("этап");
+        assert_eq!(last, "done");
+
+        let new_task = load_task_state(&pool, "owner-1", &chat.id).await.expect("новая задача");
+        assert_eq!(new_task.id, result.new_task_id);
+        assert_eq!(new_task.stage, "planning");
+        let new_transitions = load_task_transitions(&pool, "owner-1", &chat.id).await.expect("журнал новой задачи");
+        assert!(new_transitions.is_empty(), "журнал новой задачи пуст");
     }
 
     // --- Долговременная память: CRUD и изоляция по владельцу ---

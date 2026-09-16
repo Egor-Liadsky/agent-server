@@ -144,6 +144,14 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "profile_rejected", message)
     }
 
+    /// Недопустимый переход этапа задачи (пропуск этапа, переход из `done`,
+    /// неизвестный этап), пауза, мешающая переходу, или текст сверх
+    /// операторского лимита (specs/task-state, «Переходы ограничены
+    /// конечным автоматом»).
+    pub fn task_transition_invalid(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "task_transition_invalid", message)
+    }
+
     pub fn payload_too_large() -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,

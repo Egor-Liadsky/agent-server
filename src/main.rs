@@ -12,6 +12,7 @@ mod state;
 mod store;
 mod summary;
 mod system_message;
+mod task;
 mod telemetry;
 mod title;
 mod window;
