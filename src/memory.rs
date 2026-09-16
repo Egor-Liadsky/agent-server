@@ -53,6 +53,20 @@ enum RawMemoryOp {
     },
 }
 
+impl RawMemoryOp {
+    /// Пояснение модели к операции: печатается в журнал вместе с решением по
+    /// операции, поэтому живёт рядом с остальным содержимым и наружу не
+    /// отдаётся (specs/memory-layers, «Тексты записей памяти маскируются в
+    /// журнале»).
+    fn reason(&self) -> Option<&str> {
+        match self {
+            RawMemoryOp::Set { reason, .. }
+            | RawMemoryOp::Delete { reason, .. }
+            | RawMemoryOp::FinishTask { reason } => reason.as_deref(),
+        }
+    }
+}
+
 /// Разбирает ответ модели как список операций памяти — тот же приём, что
 /// `facts::parse_operations`: найти первую `[` и последнюю `]`, распарсить
 /// внутри; неудача разбора — `None`, вызывающий код оставляет память без
@@ -270,14 +284,19 @@ pub async fn route_after_exchange(
     let mut carry_forward_keys = Vec::new();
 
     for raw in operations {
+        // Пояснение модели снимается до валидации: `validate` забирает
+        // операцию по значению, а в журнал пояснение нужно в обеих ветках.
+        let reason = raw.reason().map(str::to_string);
+        let reason_logged = loggable_reason(state, reason.as_deref());
         match validate(raw, &limits) {
-            Err(reason) => {
+            Err(reject) => {
                 let value_logged = state.config.log_content;
                 tracing::info!(
                     chat_id = %chat.id,
-                    reject_reason = reason.as_str(),
+                    reject_reason = reject.as_str(),
                     accepted = false,
                     log_content = value_logged,
+                    reason = ?reason_logged,
                     "операция маршрутизатора памяти отброшена"
                 );
                 outcome.rejected += 1;
@@ -297,7 +316,7 @@ pub async fn route_after_exchange(
                 }
             }
             Ok(ValidatedOp::Set { layer, key, value, entry_type, carry_forward }) => {
-                log_applied(state, chat, layer, "set", &key, &value);
+                log_applied(state, chat, layer, "set", &key, &value, reason_logged);
                 if layer == Layer::Working && carry_forward {
                     carry_forward_keys.push(key.clone());
                 }
@@ -324,7 +343,7 @@ pub async fn route_after_exchange(
                 }
             }
             Ok(ValidatedOp::Delete { layer, key }) => {
-                log_applied(state, chat, layer, "delete", &key, "");
+                log_applied(state, chat, layer, "delete", &key, "", reason_logged);
                 let result = match layer {
                     Layer::Working => store::delete_working_memory(&state.db, &chat.id, &chat.active_task_id, &key).await,
                     Layer::LongTerm => store::delete_long_term_memory_by_key(&state.db, owner, &key).await,
@@ -343,16 +362,22 @@ pub async fn route_after_exchange(
 /// Значение (`value`) в журнале — только при `AGENTD_LOG_CONTENT=true`, тем
 /// же приёмом, что и остальное содержимое (specs/memory-layers, «Тексты
 /// записей памяти маскируются в журнале»).
-fn log_applied(state: &AppState, chat: &store::Chat, layer: Layer, op: &str, key: &str, value: &str) {
+fn log_applied(state: &AppState, chat: &store::Chat, layer: Layer, op: &str, key: &str, value: &str, reason: Option<&str>) {
     let layer_str = match layer {
         Layer::Working => "working",
         Layer::LongTerm => "long_term",
     };
     if state.config.log_content {
-        tracing::info!(chat_id = %chat.id, layer = layer_str, op, key, value, accepted = true, "операция маршрутизатора памяти применена");
+        tracing::info!(chat_id = %chat.id, layer = layer_str, op, key, value, reason = ?reason, accepted = true, "операция маршрутизатора памяти применена");
     } else {
         tracing::info!(chat_id = %chat.id, layer = layer_str, op, key, accepted = true, "операция маршрутизатора памяти применена");
     }
+}
+
+/// Пояснение модели — такое же содержимое, как значение записи, поэтому в
+/// журнал попадает только при `AGENTD_LOG_CONTENT=true`.
+fn loggable_reason<'a>(state: &AppState, reason: Option<&'a str>) -> Option<&'a str> {
+    if state.config.log_content { reason } else { None }
 }
 
 // --- Слоистая память как обёртка над стратегией контекста (design.md, решение 1) ---
@@ -711,10 +736,12 @@ mod tests {
         let chat = store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
 
         let output = captured(|| {
-            log_applied(&state, &chat, Layer::Working, "set", "budget", "секретное значение 200000");
+            let reason = loggable_reason(&state, Some("секретное пояснение"));
+            log_applied(&state, &chat, Layer::Working, "set", "budget", "секретное значение 200000", reason);
         });
         assert!(output.contains("\"key\":\"budget\""), "ключ должен остаться в журнале: {output}");
         assert!(!output.contains("секретное значение"), "значение не должно попасть в журнал: {output}");
+        assert!(!output.contains("секретное пояснение"), "пояснение не должно попасть в журнал: {output}");
     }
 
     #[tokio::test]
@@ -724,8 +751,10 @@ mod tests {
         let chat = store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
 
         let output = captured(|| {
-            log_applied(&state, &chat, Layer::Working, "set", "budget", "видимое значение");
+            let reason = loggable_reason(&state, Some("видимое пояснение"));
+            log_applied(&state, &chat, Layer::Working, "set", "budget", "видимое значение", reason);
         });
         assert!(output.contains("видимое значение"), "значение должно попасть в журнал при AGENTD_LOG_CONTENT=true: {output}");
+        assert!(output.contains("видимое пояснение"), "пояснение должно попасть в журнал при AGENTD_LOG_CONTENT=true: {output}");
     }
 }

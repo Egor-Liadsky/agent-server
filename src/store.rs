@@ -1664,8 +1664,10 @@ pub struct OwnerProfile {
     pub style: String,
     pub format: String,
     pub constraints: Vec<String>,
+    /// Время создания нужно, чтобы частичное изменение не затирало его
+    /// собственным `now`. Времени изменения в структуре нет: колонка
+    /// `updated_at` пишется в БД, но наружу не отдаётся.
     pub created_at: i64,
-    pub updated_at: i64,
 }
 
 fn constraints_from_json(raw: String) -> Vec<String> {
@@ -1682,14 +1684,13 @@ fn row_to_owner_profile(row: sqlx::sqlite::SqliteRow) -> Result<OwnerProfile, St
         format: row.try_get("format")?,
         constraints: constraints_from_json(constraints_json),
         created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
     })
 }
 
 /// Собственные профили владельца, свежие первыми.
 pub async fn list_owner_profiles(pool: &SqlitePool, owner: &str) -> Result<Vec<OwnerProfile>, StoreError> {
     let rows = sqlx::query(
-        "SELECT id, name, persona, style, format, constraints, created_at, updated_at \
+        "SELECT id, name, persona, style, format, constraints, created_at \
          FROM owner_profiles WHERE owner = ? ORDER BY created_at DESC",
     )
     .bind(owner)
@@ -1712,7 +1713,7 @@ pub async fn count_owner_profiles(pool: &SqlitePool, owner: &str) -> Result<u32,
 /// несуществующего (specs/user-profiles, «Чужой профиль не читается»).
 pub async fn load_owner_profile(pool: &SqlitePool, owner: &str, id: &str) -> Result<OwnerProfile, StoreError> {
     let row = sqlx::query(
-        "SELECT id, name, persona, style, format, constraints, created_at, updated_at \
+        "SELECT id, name, persona, style, format, constraints, created_at \
          FROM owner_profiles WHERE owner = ? AND id = ?",
     )
     .bind(owner)
@@ -1763,7 +1764,6 @@ pub async fn create_owner_profile(
         format: format.to_string(),
         constraints: constraints.to_vec(),
         created_at: now,
-        updated_at: now,
     })
 }
 
@@ -1811,7 +1811,6 @@ pub async fn update_owner_profile(
         format: format.to_string(),
         constraints: constraints.to_vec(),
         created_at: existing.created_at,
-        updated_at: now,
     })
 }
 
