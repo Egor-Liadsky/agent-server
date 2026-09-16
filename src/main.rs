@@ -7,6 +7,7 @@ mod error;
 mod facts;
 mod memory;
 mod middleware;
+mod profile;
 mod state;
 mod store;
 mod summary;

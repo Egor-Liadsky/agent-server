@@ -143,6 +143,37 @@ pub async fn assemble(
             .unwrap_or_default();
         crate::memory::merge_router_counters(&mut assembled.context, router);
     }
+    // Раздел профиля встаёт ПЕРЕД разделами памяти и стратегии — после того,
+    // как они уже собраны, но до сборки системного сообщения (design.md,
+    // решение 4): роль и ограничения должны задавать трактовку всего
+    // остального.
+    if let Some(profile_id) = crate::profile::effective_profile_id(state, settings) {
+        if let Ok(Some(profile)) = crate::profile::find(state, owner, &profile_id).await {
+            let built = crate::profile::build_section(&profile, state.config.profile_max_chars);
+            if state.config.log_content {
+                tracing::info!(
+                    profile_id = %profile_id,
+                    persona = %profile.persona,
+                    style = %profile.style,
+                    format = %profile.format,
+                    constraints = ?profile.constraints,
+                    chars = built.chars,
+                    truncated = built.truncated,
+                    "профиль применён к запросу"
+                );
+            } else {
+                tracing::info!(
+                    profile_id = %profile_id,
+                    chars = built.chars,
+                    truncated = built.truncated,
+                    "профиль применён к запросу"
+                );
+            }
+            assembled.context.profile_id = Some(profile_id);
+            assembled.context.profile_chars = Some(built.chars);
+            assembled.sections.insert(0, built.section);
+        }
+    }
     let system_message = crate::system_message::build(&state.config.system_prompt, &assembled.sections);
     assembled.history.insert(0, system_message);
     assembled
@@ -295,6 +326,228 @@ mod tests {
         let summary_at = system.find(crate::summary::SUMMARY_MARKER).expect("раздел пересказа");
         assert!(long_term_at < working_at, "долговременная память должна идти раньше рабочей");
         assert!(working_at < summary_at, "разделы памяти должны идти раньше раздела стратегии");
+    }
+
+    // --- Профиль как раздел, встающий первым (specs/user-profiles) ---
+
+    #[tokio::test]
+    async fn profile_section_precedes_memory_and_strategy_sections() {
+        let _guard = crate::state::test_lock();
+        let state = AppState::for_tests().await;
+        let settings = ChatSettings {
+            context_strategy: Some(ContextStrategy::Summary),
+            summary_enabled: Some(true),
+            memory_layers_enabled: Some(true),
+            profile_id: Some("teacher".to_string()),
+            ..ChatSettings::default()
+        };
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
+        store::set_long_term_memory(&state.db, "owner-1", "decision", Some("auth"), "Clerk", "manual", None, 1)
+            .await
+            .expect("долговременная запись");
+        store::set_working_memory(&state.db, &chat.id, &chat.active_task_id, "target", "iOS 17+", "manual", 1)
+            .await
+            .expect("рабочая запись");
+        let stored: Vec<store::ChatMessage> = (1..=25)
+            .map(|seq| {
+                if seq % 2 == 1 {
+                    dummy_message(Role::User, seq, &format!("вопрос {seq}"))
+                } else {
+                    dummy_message(Role::Assistant, seq, &format!("ответ {seq}"))
+                }
+            })
+            .collect();
+        store::save_summary(&state.db, &chat.id, "итог прошлого", stored[4].seq).await.expect("пересказ сохранён");
+
+        let assembled = assemble(
+            &state,
+            &chat,
+            &settings,
+            "owner-1",
+            ContextStrategy::Summary,
+            stored,
+            Message::user("новое"),
+        )
+        .await;
+
+        let system = &assembled.history[0].content;
+        let profile_at = system.find("Профиль:").expect("раздел профиля");
+        let long_term_at = system.find("Долговременная память:").expect("раздел долговременной памяти");
+        let working_at = system.find("Рабочая память задачи:").expect("раздел рабочей памяти");
+        let summary_at = system.find(crate::summary::SUMMARY_MARKER).expect("раздел пересказа");
+        assert!(profile_at < long_term_at, "профиль должен идти раньше долговременной памяти");
+        assert!(long_term_at < working_at);
+        assert!(working_at < summary_at);
+        assert_eq!(assembled.context.profile_id.as_deref(), Some("teacher"));
+        assert!(assembled.context.profile_chars.unwrap_or(0) > 0);
+    }
+
+    #[tokio::test]
+    async fn operator_default_profile_applies_when_chat_settings_leave_it_unset() {
+        let _guard = crate::state::test_lock();
+        let state = AppState::with_env(&[
+            (crate::config::API_KEY_VAR, "test-key-value"),
+            ("AGENTD_UPSTREAM_BASE_URL", "http://127.0.0.1:1"),
+            ("AGENTD_MODEL", "test-model"),
+            ("AGENTD_DEFAULT_PROFILE", "teacher"),
+        ])
+        .await;
+        let settings = ChatSettings::default();
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
+        let assembled = assemble(
+            &state,
+            &chat,
+            &settings,
+            "owner-1",
+            ContextStrategy::Summary,
+            Vec::new(),
+            Message::user("новое"),
+        )
+        .await;
+        assert_eq!(assembled.context.profile_id.as_deref(), Some("teacher"));
+        assert!(assembled.history[0].content.contains("Профиль:"));
+    }
+
+    #[tokio::test]
+    async fn chat_setting_overrides_operator_default_profile() {
+        let _guard = crate::state::test_lock();
+        let state = AppState::with_env(&[
+            (crate::config::API_KEY_VAR, "test-key-value"),
+            ("AGENTD_UPSTREAM_BASE_URL", "http://127.0.0.1:1"),
+            ("AGENTD_MODEL", "test-model"),
+            ("AGENTD_DEFAULT_PROFILE", "teacher"),
+        ])
+        .await;
+        let settings = ChatSettings { profile_id: Some("reviewer".to_string()), ..ChatSettings::default() };
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
+        let assembled = assemble(
+            &state,
+            &chat,
+            &settings,
+            "owner-1",
+            ContextStrategy::Summary,
+            Vec::new(),
+            Message::user("новое"),
+        )
+        .await;
+        assert_eq!(assembled.context.profile_id.as_deref(), Some("reviewer"));
+    }
+
+    #[tokio::test]
+    async fn no_profile_leaves_section_order_unchanged() {
+        let _guard = crate::state::test_lock();
+        let state = AppState::for_tests().await;
+        let settings = ChatSettings {
+            context_strategy: Some(ContextStrategy::Summary),
+            summary_enabled: Some(true),
+            memory_layers_enabled: Some(true),
+            ..ChatSettings::default()
+        };
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
+        let assembled = assemble(
+            &state,
+            &chat,
+            &settings,
+            "owner-1",
+            ContextStrategy::Summary,
+            Vec::new(),
+            Message::user("новое"),
+        )
+        .await;
+        let system = &assembled.history[0].content;
+        assert!(!system.contains("Профиль:"));
+        assert!(assembled.context.profile_id.is_none());
+        assert!(assembled.context.profile_chars.is_none());
+    }
+
+    /// Профиль подставляется при каждой стратегии контекста и вместе со
+    /// слоистой памятью, не меняя счётчиков стратегии (specs/user-profiles,
+    /// «Профиль работает при каждой стратегии контекста», «Профиль и
+    /// слоистая память применяются вместе»).
+    #[tokio::test]
+    async fn profile_applies_over_every_strategy_without_changing_strategy_counters() {
+        for strategy in ContextStrategy::ALL {
+            let _guard = crate::state::test_lock();
+            let state = AppState::for_tests().await;
+            let without_profile = ChatSettings { context_strategy: Some(strategy), ..ChatSettings::default() };
+            let chat_a = store::create_chat(&state.db, "owner-1", "Чат", &without_profile).await.expect("чат");
+            let baseline = assemble(
+                &state,
+                &chat_a,
+                &without_profile,
+                "owner-1",
+                strategy,
+                Vec::new(),
+                Message::user("новое"),
+            )
+            .await;
+
+            let with_profile = ChatSettings {
+                context_strategy: Some(strategy),
+                profile_id: Some("teacher".to_string()),
+                ..ChatSettings::default()
+            };
+            let chat_b = store::create_chat(&state.db, "owner-1", "Чат", &with_profile).await.expect("чат");
+            let with_profile_assembled = assemble(
+                &state,
+                &chat_b,
+                &with_profile,
+                "owner-1",
+                strategy,
+                Vec::new(),
+                Message::user("новое"),
+            )
+            .await;
+
+            assert!(
+                with_profile_assembled.history[0].content.contains("Профиль:"),
+                "стратегия {strategy:?}: раздел профиля должен присутствовать"
+            );
+            let mut baseline_context = baseline.context.clone();
+            baseline_context.profile_id = with_profile_assembled.context.profile_id.clone();
+            baseline_context.profile_chars = with_profile_assembled.context.profile_chars;
+            // У ветвления `branch_id` — случайный идентификатор новой ветки
+            // каждого чата, к профилю отношения не имеющий.
+            baseline_context.branch_id = with_profile_assembled.context.branch_id.clone();
+            assert_eq!(
+                baseline_context, with_profile_assembled.context,
+                "стратегия {strategy:?}: профиль не должен менять счётчики стратегии"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_and_memory_layers_apply_together() {
+        let _guard = crate::state::test_lock();
+        let state = AppState::for_tests().await;
+        let settings = ChatSettings {
+            context_strategy: Some(ContextStrategy::Summary),
+            memory_layers_enabled: Some(true),
+            profile_id: Some("teacher".to_string()),
+            ..ChatSettings::default()
+        };
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
+        store::set_long_term_memory(&state.db, "owner-1", "decision", Some("auth"), "Clerk", "manual", None, 1)
+            .await
+            .expect("долговременная запись");
+        store::set_working_memory(&state.db, &chat.id, &chat.active_task_id, "target", "iOS 17+", "manual", 1)
+            .await
+            .expect("рабочая запись");
+
+        let assembled = assemble(
+            &state,
+            &chat,
+            &settings,
+            "owner-1",
+            ContextStrategy::Summary,
+            Vec::new(),
+            Message::user("новое"),
+        )
+        .await;
+        let system = &assembled.history[0].content;
+        assert!(system.contains("Профиль:"));
+        assert!(system.contains("Долговременная память:"));
+        assert!(system.contains("Рабочая память задачи:"));
     }
 
     #[tokio::test]

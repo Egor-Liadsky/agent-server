@@ -1372,6 +1372,179 @@ async fn insert_message(
     })
 }
 
+// --- Собственные профили владельца (specs/user-profiles) ---
+
+#[derive(Debug, Clone)]
+pub struct OwnerProfile {
+    pub id: String,
+    pub name: String,
+    pub persona: String,
+    pub style: String,
+    pub format: String,
+    pub constraints: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn constraints_from_json(raw: String) -> Vec<String> {
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+fn row_to_owner_profile(row: sqlx::sqlite::SqliteRow) -> Result<OwnerProfile, StoreError> {
+    let constraints_json: String = row.try_get("constraints")?;
+    Ok(OwnerProfile {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        persona: row.try_get("persona")?,
+        style: row.try_get("style")?,
+        format: row.try_get("format")?,
+        constraints: constraints_from_json(constraints_json),
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+/// Собственные профили владельца, свежие первыми.
+pub async fn list_owner_profiles(pool: &SqlitePool, owner: &str) -> Result<Vec<OwnerProfile>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT id, name, persona, style, format, constraints, created_at, updated_at \
+         FROM owner_profiles WHERE owner = ? ORDER BY created_at DESC",
+    )
+    .bind(owner)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(row_to_owner_profile).collect()
+}
+
+/// Число собственных профилей владельца — для проверки операторского лимита
+/// на создании (`AGENTD_MAX_PROFILES`).
+pub async fn count_owner_profiles(pool: &SqlitePool, owner: &str) -> Result<u32, StoreError> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM owner_profiles WHERE owner = ?")
+        .bind(owner)
+        .fetch_one(pool)
+        .await?;
+    Ok(count as u32)
+}
+
+/// Один собственный профиль владельца. Чужой профиль неотличим от
+/// несуществующего (specs/user-profiles, «Чужой профиль не читается»).
+pub async fn load_owner_profile(pool: &SqlitePool, owner: &str, id: &str) -> Result<OwnerProfile, StoreError> {
+    let row = sqlx::query(
+        "SELECT id, name, persona, style, format, constraints, created_at, updated_at \
+         FROM owner_profiles WHERE owner = ? AND id = ?",
+    )
+    .bind(owner)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(row) => row_to_owner_profile(row),
+        None => Err(StoreError::NotFound),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_owner_profile(
+    pool: &SqlitePool,
+    owner: &str,
+    name: &str,
+    persona: &str,
+    style: &str,
+    format: &str,
+    constraints: &[String],
+) -> Result<OwnerProfile, StoreError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_secs();
+    let constraints_json = serde_json::to_string(constraints)
+        .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать ограничения: {err}")))?;
+    sqlx::query(
+        "INSERT INTO owner_profiles \
+             (id, owner, name, persona, style, format, constraints, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(owner)
+    .bind(name)
+    .bind(persona)
+    .bind(style)
+    .bind(format)
+    .bind(&constraints_json)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(OwnerProfile {
+        id,
+        name: name.to_string(),
+        persona: persona.to_string(),
+        style: style.to_string(),
+        format: format.to_string(),
+        constraints: constraints.to_vec(),
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+/// Частичное изменение: незаданное поле сохраняет прежнее значение
+/// (specs/user-profiles, «Частичное изменение профиля»).
+#[allow(clippy::too_many_arguments)]
+pub async fn update_owner_profile(
+    pool: &SqlitePool,
+    owner: &str,
+    id: &str,
+    name: Option<&str>,
+    persona: Option<&str>,
+    style: Option<&str>,
+    format: Option<&str>,
+    constraints: Option<&[String]>,
+) -> Result<OwnerProfile, StoreError> {
+    let existing = load_owner_profile(pool, owner, id).await?;
+    let name = name.unwrap_or(&existing.name);
+    let persona = persona.unwrap_or(&existing.persona);
+    let style = style.unwrap_or(&existing.style);
+    let format = format.unwrap_or(&existing.format);
+    let constraints = constraints.unwrap_or(&existing.constraints);
+    let now = now_secs();
+    let constraints_json = serde_json::to_string(constraints)
+        .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать ограничения: {err}")))?;
+    sqlx::query(
+        "UPDATE owner_profiles SET name = ?, persona = ?, style = ?, format = ?, constraints = ?, updated_at = ? \
+         WHERE owner = ? AND id = ?",
+    )
+    .bind(name)
+    .bind(persona)
+    .bind(style)
+    .bind(format)
+    .bind(&constraints_json)
+    .bind(now)
+    .bind(owner)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(OwnerProfile {
+        id: id.to_string(),
+        name: name.to_string(),
+        persona: persona.to_string(),
+        style: style.to_string(),
+        format: format.to_string(),
+        constraints: constraints.to_vec(),
+        created_at: existing.created_at,
+        updated_at: now,
+    })
+}
+
+pub async fn delete_owner_profile(pool: &SqlitePool, owner: &str, id: &str) -> Result<(), StoreError> {
+    let result = sqlx::query("DELETE FROM owner_profiles WHERE owner = ? AND id = ?")
+        .bind(owner)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1544,6 +1717,54 @@ mod tests {
 
         let entries = load_long_term_memory(&pool, "owner-1", 50).await.expect("чтение");
         assert_eq!(entries.len(), 2, "записи без ключа не схлопываются в одну");
+    }
+
+    // --- Профили владельца: CRUD и изоляция по владельцу (specs/user-profiles) ---
+
+    #[tokio::test]
+    async fn owner_profile_create_load_update_delete_round_trip() {
+        let (_dir, pool) = temp_pool().await;
+        let created = create_owner_profile(
+            &pool,
+            "owner-1",
+            "Мой профиль",
+            "персона",
+            "стиль",
+            "",
+            &["ограничение 1".to_string()],
+        )
+        .await
+        .expect("создание");
+
+        let loaded = load_owner_profile(&pool, "owner-1", &created.id).await.expect("чтение");
+        assert_eq!(loaded.name, "Мой профиль");
+        assert_eq!(loaded.format, "");
+        assert_eq!(loaded.constraints, vec!["ограничение 1".to_string()]);
+
+        let updated = update_owner_profile(&pool, "owner-1", &created.id, None, None, None, Some("маркдаун"), None)
+            .await
+            .expect("частичное изменение");
+        assert_eq!(updated.format, "маркдаун");
+        assert_eq!(updated.name, "Мой профиль", "остальные поля не затёрты");
+        assert_eq!(updated.persona, "персона");
+
+        delete_owner_profile(&pool, "owner-1", &created.id).await.expect("удаление");
+        let err = load_owner_profile(&pool, "owner-1", &created.id).await.expect_err("профиль удалён");
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn owner_profile_is_isolated_per_owner() {
+        let (_dir, pool) = temp_pool().await;
+        let created = create_owner_profile(&pool, "owner-x", "Профиль X", "персона X", "", "", &[])
+            .await
+            .expect("создание владельцем X");
+
+        let list_y = list_owner_profiles(&pool, "owner-y").await.expect("список владельца Y");
+        assert!(list_y.is_empty(), "профиль не виден другому владельцу");
+
+        let err = load_owner_profile(&pool, "owner-y", &created.id).await.expect_err("чужой профиль");
+        assert!(matches!(err, StoreError::NotFound));
     }
 
     // --- Условное обновление названия чата (specs/chat-title, design.md, решение 6) ---

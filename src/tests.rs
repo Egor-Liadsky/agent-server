@@ -2051,6 +2051,70 @@ fn debug_logs_api_and_upstream_bodies() {
     assert!(output.contains("ответ модели"), "нет текста ответа модели: {output}");
 }
 
+/// Прогоняет `/v1/chat` в чате с назначенным встроенным профилем `teacher`
+/// и возвращает текст перехваченного журнала — для проверки, что тексты
+/// полей профиля журналируются только при `AGENTD_LOG_CONTENT=true`
+/// (specs/user-profiles, «Тексты профиля маскируются в журнале»).
+fn captured_chat_log_with_profile(extra: &[(&str, &str)]) -> String {
+    let capture = crate::telemetry::capture::Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(capture.clone())
+        .finish();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    tracing::subscriber::with_default(subscriber, || {
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")),
+                )
+                .mount(&server)
+                .await;
+            let state = state_with_provider(&server, extra).await;
+            let created = create_chat(
+                state.clone(),
+                None,
+                serde_json::json!({ "settings": { "profile_id": "teacher" } }),
+            )
+            .await;
+            let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+            let sent = send(state, post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+            assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+        })
+    });
+
+    capture.text()
+}
+
+#[test]
+fn profile_fields_are_not_logged_by_default() {
+    let _guard = test_lock();
+    let output = captured_chat_log_with_profile(&[]);
+
+    assert!(output.contains("\"profile_id\":\"teacher\""), "нет идентификатора профиля: {output}");
+    assert!(output.contains("\"chars\":"), "нет размера раздела: {output}");
+    assert!(
+        !output.contains("терпеливый преподаватель") && !output.contains("Простой язык"),
+        "текст полей профиля попал в журнал: {output}"
+    );
+}
+
+#[test]
+fn profile_fields_are_logged_when_log_content_enabled() {
+    let _guard = test_lock();
+    let output = captured_chat_log_with_profile(&[("AGENTD_LOG_CONTENT", "true")]);
+
+    assert!(output.contains("\"profile_id\":\"teacher\""), "нет идентификатора профиля: {output}");
+    assert!(output.contains("терпеливый преподаватель"), "текст персоны профиля не попал в журнал: {output}");
+}
+
 #[test]
 fn without_debug_bodies_are_not_logged() {
     let _guard = test_lock();
@@ -3611,6 +3675,326 @@ async fn foreign_owner_cannot_read_or_delete_long_term_memory() {
     )
     .await;
     assert_eq!(foreign_delete.status, StatusCode::NOT_FOUND, "тело: {}", foreign_delete.body);
+}
+
+// --- Профили (specs/user-profiles) ---
+
+fn profile_uri(id: &str) -> String {
+    format!("/v1/profiles/{id}")
+}
+
+#[tokio::test]
+async fn owner_without_own_profiles_sees_exactly_three_built_in() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let list = send(state, request("GET", "/v1/profiles", None, None)).await;
+    assert_eq!(list.status, StatusCode::OK, "тело: {}", list.body);
+    let profiles = list.body["profiles"].as_array().unwrap();
+    assert_eq!(profiles.len(), 3);
+    assert!(profiles.iter().all(|p| p["built_in"] == true));
+    let ids: Vec<&str> = profiles.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"teacher"));
+    assert!(ids.contains(&"psychologist"));
+    assert!(ids.contains(&"reviewer"));
+}
+
+#[tokio::test]
+async fn created_profile_is_visible_in_list_with_non_built_in_flag() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = send(
+        state.clone(),
+        request(
+            "POST",
+            "/v1/profiles",
+            Some(serde_json::json!({ "name": "Свой", "style": "кратко" })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "тело: {}", created.body);
+    assert_eq!(created.body["built_in"], false);
+
+    let list = send(state, request("GET", "/v1/profiles", None, None)).await;
+    let profiles = list.body["profiles"].as_array().unwrap();
+    assert_eq!(profiles.len(), 4);
+    assert!(profiles.iter().any(|p| p["name"] == "Свой" && p["built_in"] == false));
+}
+
+#[tokio::test]
+async fn profile_without_any_preference_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = send(
+        state,
+        request("POST", "/v1/profiles", Some(serde_json::json!({ "name": "Пустой" })), None),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(created.body["error"]["code"], "profile_rejected");
+}
+
+#[tokio::test]
+async fn patching_profile_changes_only_given_field() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = send(
+        state.clone(),
+        request(
+            "POST",
+            "/v1/profiles",
+            Some(serde_json::json!({ "name": "Свой", "persona": "персона", "format": "списком" })),
+            None,
+        ),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state,
+        request("PATCH", &profile_uri(&id), Some(serde_json::json!({ "format": "прозой" })), None),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+    assert_eq!(patched.body["format"], "прозой");
+    assert_eq!(patched.body["persona"], "персона", "остальные поля не затёрты");
+    assert_eq!(patched.body["name"], "Свой");
+}
+
+#[tokio::test]
+async fn deleted_profile_returns_404_and_leaves_list() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = send(
+        state.clone(),
+        request("POST", "/v1/profiles", Some(serde_json::json!({ "name": "Свой", "style": "кратко" })), None),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let deleted = send(state.clone(), request("DELETE", &profile_uri(&id), None, None)).await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+
+    let read = send(state.clone(), request("GET", &profile_uri(&id), None, None)).await;
+    assert_eq!(read.status, StatusCode::NOT_FOUND);
+
+    let list = send(state, request("GET", "/v1/profiles", None, None)).await;
+    assert_eq!(list.body["profiles"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn built_in_profile_cannot_be_changed_or_deleted() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+
+    let patched = send(
+        state.clone(),
+        request("PATCH", &profile_uri("teacher"), Some(serde_json::json!({ "style": "иначе" })), None),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::BAD_REQUEST, "тело: {}", patched.body);
+    assert_eq!(patched.body["error"]["code"], "profile_rejected");
+
+    let deleted = send(state.clone(), request("DELETE", &profile_uri("teacher"), None, None)).await;
+    assert_eq!(deleted.status, StatusCode::BAD_REQUEST, "тело: {}", deleted.body);
+    assert_eq!(deleted.body["error"]["code"], "profile_rejected");
+
+    let read = send(state, request("GET", &profile_uri("teacher"), None, None)).await;
+    assert_eq!(read.status, StatusCode::OK);
+    assert_eq!(read.body["style"], "Простой язык, короткие предложения, примеры перед абстракцией.");
+}
+
+#[tokio::test]
+async fn foreign_owner_cannot_read_or_modify_profile() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_CLIENT_TOKENS", "owner-a,owner-b"),
+    ])
+    .await;
+    let created = send(
+        state.clone(),
+        request(
+            "POST",
+            "/v1/profiles",
+            Some(serde_json::json!({ "name": "Секретный", "style": "кратко" })),
+            Some("owner-a"),
+        ),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let foreign_list = send(state.clone(), request("GET", "/v1/profiles", None, Some("owner-b"))).await;
+    let profiles = foreign_list.body["profiles"].as_array().unwrap();
+    assert_eq!(profiles.len(), 3, "чужой профиль не виден в списке владельца Y");
+
+    let foreign_read = send(state.clone(), request("GET", &profile_uri(&id), None, Some("owner-b"))).await;
+    assert_eq!(foreign_read.status, StatusCode::NOT_FOUND);
+
+    let foreign_delete = send(state, request("DELETE", &profile_uri(&id), None, Some("owner-b"))).await;
+    assert_eq!(foreign_delete.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn creating_profile_beyond_operator_limit_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_MAX_PROFILES", "1"),
+    ])
+    .await;
+    let first = send(
+        state.clone(),
+        request("POST", "/v1/profiles", Some(serde_json::json!({ "name": "Первый", "style": "кратко" })), None),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::CREATED, "тело: {}", first.body);
+
+    let second = send(
+        state.clone(),
+        request("POST", "/v1/profiles", Some(serde_json::json!({ "name": "Второй", "style": "длинно" })), None),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::BAD_REQUEST, "тело: {}", second.body);
+    assert_eq!(second.body["error"]["code"], "profile_rejected");
+
+    let list = send(state, request("GET", "/v1/profiles", None, None)).await;
+    let own: Vec<_> = list.body["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["built_in"] == false)
+        .collect();
+    assert_eq!(own.len(), 1, "число профилей владельца не изменилось");
+}
+
+/// Неизвестный `profile_id` в `POST /v1/chat` отклоняется до обращения к
+/// провайдеру: сервер-заглушка без настроенного мока подтверждает, что
+/// запрос к провайдеру не уходит — иначе ответ был бы ошибкой провайдера, а
+/// не `profile_invalid` (specs/user-profiles, «Несуществующий профиль в
+/// запросе чата»).
+#[tokio::test]
+async fn unknown_profile_id_in_chat_call_is_rejected_before_calling_provider() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "prompt": "вопрос",
+            "settings": { "profile_id": "no-such-profile" }
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "profile_invalid");
+}
+
+#[tokio::test]
+async fn foreign_profile_id_in_chat_call_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        (API_KEY_VAR, "secret-key-value"),
+        ("AGENTD_CLIENT_TOKENS", "owner-a,owner-b"),
+    ])
+    .await;
+    let created_profile = send(
+        state.clone(),
+        request(
+            "POST",
+            "/v1/profiles",
+            Some(serde_json::json!({ "name": "Секретный", "style": "кратко" })),
+            Some("owner-a"),
+        ),
+    )
+    .await;
+    let profile_id = created_profile.body["id"].as_str().unwrap().to_string();
+    let chat = create_chat(state.clone(), Some("owner-b"), serde_json::json!({})).await;
+    let chat_id = chat.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(
+        state,
+        request(
+            "POST",
+            "/v1/chat",
+            Some(serde_json::json!({
+                "chat_id": chat_id,
+                "prompt": "вопрос",
+                "settings": { "profile_id": profile_id }
+            })),
+            Some("owner-b"),
+        ),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "profile_invalid");
+}
+
+#[tokio::test]
+async fn unknown_profile_id_in_chat_settings_is_rejected_with_400() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "profile_id": "no-such-profile" } }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(created.body["error"]["code"], "profile_invalid");
+}
+
+/// Один и тот же вопрос под тремя встроенными профилями даёт три разных
+/// системных сообщения в телах запросов, пойманных `wiremock`
+/// (specs/user-profiles, «Один вопрос под тремя профилями»).
+#[tokio::test]
+async fn same_question_under_three_profiles_yields_three_different_system_messages() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_AUTO_TITLE", "false")]).await;
+
+    let mut bodies = Vec::new();
+    for profile_id in ["teacher", "psychologist", "reviewer"] {
+        let created = create_chat(
+            state.clone(),
+            None,
+            serde_json::json!({ "settings": { "profile_id": profile_id } }),
+        )
+        .await;
+        let id = created.body["id"].as_str().unwrap().to_string();
+        let sent = send(
+            state.clone(),
+            post_chat(serde_json::json!({ "chat_id": id, "prompt": "один и тот же вопрос" })),
+        )
+        .await;
+        assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+        bodies.push(profile_id);
+    }
+
+    let requests = server.received_requests().await.expect("запросы");
+    let system_messages: Vec<String> = requests
+        .iter()
+        .map(|r| {
+            let body: serde_json::Value = serde_json::from_slice(&r.body).expect("тело запроса провайдеру");
+            body["messages"][0]["content"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(system_messages.len(), 3);
+    assert_ne!(system_messages[0], system_messages[1]);
+    assert_ne!(system_messages[1], system_messages[2]);
+    assert_ne!(system_messages[0], system_messages[2]);
+    assert!(system_messages[0].contains("терпеливый преподаватель"));
+    assert!(system_messages[1].contains("внимательный собеседник"));
+    assert!(system_messages[2].contains("строгий технический ревьюер"));
 }
 
 // --- 7.3 Эндпоинты веток ---

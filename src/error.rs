@@ -123,6 +123,27 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "memory_limit_exceeded", message)
     }
 
+    /// Несуществующий или чужой профиль в `profile_id`
+    /// (specs/user-profiles, «Неизвестный профиль отклоняется явной
+    /// ошибкой»).
+    pub fn profile_invalid(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "profile_invalid", message)
+    }
+
+    /// Профиль по идентификатору из `GET/PATCH/DELETE /v1/profiles/{id}` не
+    /// найден или принадлежит другому владельцу — неотличимо
+    /// (specs/user-profiles, «Чужой профиль не читается»).
+    pub fn profile_not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "profile_not_found", "профиль не найден")
+    }
+
+    /// Изменение или удаление встроенного профиля, создание профиля без
+    /// единого непустого поля предпочтений, создание сверх
+    /// `AGENTD_MAX_PROFILES` (specs/user-profiles).
+    pub fn profile_rejected(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "profile_rejected", message)
+    }
+
     pub fn payload_too_large() -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,

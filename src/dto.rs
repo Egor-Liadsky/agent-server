@@ -148,6 +148,13 @@ pub struct ChatSettingsDto {
     pub memory_working_max_entries: Option<Option<u32>>,
     #[serde(default, deserialize_with = "double_option")]
     pub memory_long_term_max_entries: Option<Option<u32>>,
+    /// Профиль этого чата: встроенный или собственный владельца. Та же
+    /// семантика присутствия поля, что и у `summary_enabled` — поля нет,
+    /// сохранённое значение остаётся, `null` снимает профиль, значение
+    /// задаёт (specs/user-profiles, «Профиль выбирается настройкой чата
+    /// поверх операторского умолчания»).
+    #[serde(default, deserialize_with = "double_option")]
+    pub profile_id: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -279,7 +286,7 @@ pub struct ChatResponse {
 /// Что действующая стратегия сделала со сборкой истории этого запроса.
 /// Поля, не имеющие смысла для стратегии, опускаются, а не несут ноль/`false`
 /// (specs/context-strategies, «Ответ сообщает, что сделала стратегия»).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextDto {
     pub strategy: ContextStrategy,
     /// Сколько сообщений отправлено провайдеру (`sliding_window`, `facts`,
@@ -346,6 +353,14 @@ pub struct ContextDto {
     /// включена).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_router_rejected: Option<u32>,
+    /// Идентификатор применённого профиля (specs/user-profiles,
+    /// «Наблюдаемость подстановки профиля»). Отсутствует без профиля.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// Объём собранного раздела профиля в символах, после возможного
+    /// усечения. Отсутствует без профиля.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_chars: Option<u32>,
 }
 
 impl ContextDto {
@@ -369,6 +384,8 @@ impl ContextDto {
             memory_router_applied_update: None,
             memory_router_applied_delete: None,
             memory_router_rejected: None,
+            profile_id: None,
+            profile_chars: None,
         }
     }
 
@@ -392,6 +409,8 @@ impl ContextDto {
             memory_router_applied_update: None,
             memory_router_applied_delete: None,
             memory_router_rejected: None,
+            profile_id: None,
+            profile_chars: None,
         }
     }
 
@@ -420,6 +439,8 @@ impl ContextDto {
             memory_router_applied_update: None,
             memory_router_applied_delete: None,
             memory_router_rejected: None,
+            profile_id: None,
+            profile_chars: None,
         }
     }
 
@@ -443,6 +464,8 @@ impl ContextDto {
             memory_router_applied_update: None,
             memory_router_applied_delete: None,
             memory_router_rejected: None,
+            profile_id: None,
+            profile_chars: None,
         }
     }
 }
@@ -895,4 +918,70 @@ pub struct SetLongTermMemoryRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeleteLongTermMemoryQuery {
     pub id: String,
+}
+
+// --- Профили (specs/user-profiles) ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileDto {
+    pub id: String,
+    pub name: String,
+    pub persona: String,
+    pub style: String,
+    pub format: String,
+    pub constraints: Vec<String>,
+    /// Встроенный профиль (`teacher`/`psychologist`/`reviewer`) только для
+    /// чтения; собственный профиль владельца — `false`
+    /// (specs/user-profiles, «Ручное управление профилями через HTTP»).
+    pub built_in: bool,
+}
+
+impl From<crate::profile::Profile> for ProfileDto {
+    fn from(profile: crate::profile::Profile) -> Self {
+        Self {
+            id: profile.id,
+            name: profile.name,
+            persona: profile.persona,
+            style: profile.style,
+            format: profile.format,
+            constraints: profile.constraints,
+            built_in: profile.built_in,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfilesResponse {
+    pub profiles: Vec<ProfileDto>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateProfileRequest {
+    pub name: String,
+    #[serde(default)]
+    pub persona: String,
+    #[serde(default)]
+    pub style: String,
+    #[serde(default)]
+    pub format: String,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+}
+
+/// Частичное изменение: незаданное поле сохраняет прежнее значение
+/// (specs/user-profiles, «Частичное изменение профиля»).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateProfileRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub persona: Option<String>,
+    #[serde(default)]
+    pub style: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub constraints: Option<Vec<String>>,
 }

@@ -2,11 +2,11 @@
 
 use crate::dto::{
     AppendMessagesRequest, AppendMessagesResponse, BranchDto, BranchesResponse, ChatDto, ChatRequest,
-    ChatResponse, ChatWithMessagesResponse, CreateBranchRequest, CreateChatRequest, DeleteLongTermMemoryQuery,
-    DeleteWorkingMemoryQuery, FactDto, FactsResponse, FinishTaskRequest, GetChatQuery, ListChatsQuery,
-    ListChatsResponse, LongTermMemoryEntryDto, LongTermMemoryResponse, MessageView, ModelsResponse,
-    SetFactRequest, SetLongTermMemoryRequest, SetWorkingMemoryRequest, UpdateChatRequest,
-    WorkingMemoryEntryDto, WorkingMemoryResponse,
+    ChatResponse, ChatWithMessagesResponse, CreateBranchRequest, CreateChatRequest, CreateProfileRequest,
+    DeleteLongTermMemoryQuery, DeleteWorkingMemoryQuery, FactDto, FactsResponse, FinishTaskRequest, GetChatQuery,
+    ListChatsQuery, ListChatsResponse, LongTermMemoryEntryDto, LongTermMemoryResponse, MessageView, ModelsResponse,
+    ProfileDto, ProfilesResponse, SetFactRequest, SetLongTermMemoryRequest, SetWorkingMemoryRequest,
+    UpdateChatRequest, UpdateProfileRequest, WorkingMemoryEntryDto, WorkingMemoryResponse,
 };
 use crate::context;
 use crate::error::ApiError;
@@ -370,14 +370,16 @@ fn validate_settings_for_storage(state: &AppState, settings: &ChatSettings) -> R
 /// проверяет результат. `base` — умолчания сервиса при создании чата или
 /// разовом запросе без чата, сохранённые настройки чата — при работе с
 /// существующим чатом.
-fn merge_settings(
+async fn merge_settings(
     state: &AppState,
+    owner: &str,
     base: ChatSettings,
     dto: Option<crate::dto::ChatSettingsDto>,
     purpose: SettingsPurpose,
 ) -> Result<ChatSettings, ApiError> {
     let context_strategy_override = dto.as_ref().and_then(|d| d.context_strategy.clone());
     let context_window_override = dto.as_ref().and_then(|d| d.context_window_messages);
+    let profile_override = dto.as_ref().and_then(|d| d.profile_id.clone());
     let mut settings = match dto {
         Some(dto) => dto.apply_to(base).map_err(ApiError::invalid_request)?,
         None => base,
@@ -389,11 +391,41 @@ fn merge_settings(
     effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
     validate_summary_settings(state, &settings)?;
     apply_context_strategy(state, &mut settings, context_strategy_override, context_window_override)?;
+    apply_profile(state, owner, &mut settings, profile_override).await?;
     match purpose {
         SettingsPurpose::Call => validate_settings_for_call(state, &settings)?,
         SettingsPurpose::Storage => validate_settings_for_storage(state, &settings)?,
     }
     Ok(settings)
+}
+
+/// Разбор и проверка `profile_id`, вне `ChatSettingsDto::apply_to`: тот же
+/// приём, что и у `context_strategy` — собственный код ошибки
+/// (`profile_invalid`), а не общий `invalid_request`
+/// (specs/user-profiles, «Неизвестный профиль отклоняется явной ошибкой»;
+/// design.md, решение 5). Проверяется на пути и сохранения, и вызова:
+/// сохранить ссылку на несуществующий или чужой профиль, которая сорвёт
+/// каждый следующий запрос, нельзя.
+async fn apply_profile(
+    state: &AppState,
+    owner: &str,
+    settings: &mut ChatSettings,
+    profile_override: Option<Option<String>>,
+) -> Result<(), ApiError> {
+    if let Some(value) = profile_override {
+        settings.profile_id = value;
+    }
+    if let Some(id) = settings.profile_id.clone() {
+        let found = crate::profile::find(state, owner, &id)
+            .await
+            .map_err(ApiError::from_store_error)?;
+        if found.is_none() {
+            return Err(ApiError::profile_invalid(format!(
+                "неизвестный профиль: {id}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Разбор и проверка `context_strategy`/`context_window_messages`, вне
@@ -579,7 +611,7 @@ async fn handle_chat(
 
     match request.chat_id.clone() {
         Some(chat_id) => handle_chat_in_existing(state, request_id, owner, chat_id, request).await,
-        None => handle_chat_without_storage(state, request_id, request).await,
+        None => handle_chat_without_storage(state, request_id, owner, request).await,
     }
 }
 
@@ -589,10 +621,12 @@ async fn handle_chat(
 async fn handle_chat_without_storage(
     state: AppState,
     request_id: String,
+    owner: String,
     request: ChatRequest,
 ) -> Result<ChatResponse, ApiError> {
     let history = history_from(&request)?;
-    let settings = merge_settings(&state, server_defaults(&state), request.settings, SettingsPurpose::Call)?;
+    let settings =
+        merge_settings(&state, &owner, server_defaults(&state), request.settings, SettingsPurpose::Call).await?;
     let model = settings
         .model
         .clone()
@@ -635,7 +669,8 @@ async fn handle_chat_in_existing(
     let chat = store::load_chat(&state.db, &owner, &chat_id, &defaults)
         .await
         .map_err(ApiError::from_store_error)?;
-    let settings = merge_settings(&state, chat.settings.clone(), request.settings, SettingsPurpose::Call)?;
+    let settings =
+        merge_settings(&state, &owner, chat.settings.clone(), request.settings, SettingsPurpose::Call).await?;
     let model = settings
         .model
         .clone()
@@ -784,7 +819,8 @@ async fn handle_create_chat(
     body: CreateChatRequest,
 ) -> Result<ChatDto, ApiError> {
     let title = validate_title(body.title)?.unwrap_or_else(|| DEFAULT_CHAT_TITLE.to_string());
-    let settings = merge_settings(&state, server_defaults(&state), body.settings, SettingsPurpose::Storage)?;
+    let settings =
+        merge_settings(&state, &owner, server_defaults(&state), body.settings, SettingsPurpose::Storage).await?;
     let chat = store::create_chat(&state.db, &owner, &title, &settings)
         .await
         .map_err(ApiError::from_store_error)?;
@@ -919,7 +955,7 @@ async fn handle_patch_chat(
             let chat = store::load_chat(&state.db, &owner, &id, &defaults)
                 .await
                 .map_err(ApiError::from_store_error)?;
-            Some(merge_settings(&state, chat.settings, Some(dto), SettingsPurpose::Storage)?)
+            Some(merge_settings(&state, &owner, chat.settings, Some(dto), SettingsPurpose::Storage).await?)
         }
         None => None,
     };
@@ -1411,6 +1447,177 @@ async fn delete_long_term_memory_handler(
     }
 }
 
+// --- Профили (specs/user-profiles) ---
+
+async fn get_profiles_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+) -> Response {
+    match handle_get_profiles(state, owner).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_get_profiles(state: AppState, owner: String) -> Result<ProfilesResponse, ApiError> {
+    let profiles = crate::profile::list(&state, &owner)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    Ok(ProfilesResponse { profiles: profiles.into_iter().map(ProfileDto::from).collect() })
+}
+
+async fn create_profile_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Json(body): Json<CreateProfileRequest>,
+) -> Response {
+    match handle_create_profile(state, owner, body).await {
+        Ok(dto) => (StatusCode::CREATED, Json(dto)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_create_profile(
+    state: AppState,
+    owner: String,
+    body: CreateProfileRequest,
+) -> Result<ProfileDto, ApiError> {
+    if body.name.trim().is_empty() {
+        return Err(ApiError::invalid_request("название профиля не может быть пустым"));
+    }
+    if !crate::profile::has_any_preference(&body.persona, &body.style, &body.format, &body.constraints) {
+        return Err(ApiError::profile_rejected(
+            "профиль должен содержать хотя бы одно непустое поле предпочтений",
+        ));
+    }
+    let existing = store::count_owner_profiles(&state.db, &owner)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    if existing >= state.config.max_profiles {
+        return Err(ApiError::profile_rejected(format!(
+            "превышен предел собственных профилей владельца ({})",
+            state.config.max_profiles
+        )));
+    }
+    let created = store::create_owner_profile(
+        &state.db,
+        &owner,
+        &body.name,
+        &body.persona,
+        &body.style,
+        &body.format,
+        &body.constraints,
+    )
+    .await
+    .map_err(ApiError::from_store_error)?;
+    Ok(ProfileDto::from(crate::profile::Profile {
+        id: created.id,
+        name: created.name,
+        persona: created.persona,
+        style: created.style,
+        format: created.format,
+        constraints: created.constraints,
+        built_in: false,
+    }))
+}
+
+async fn get_profile_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+) -> Response {
+    match handle_get_profile(state, owner, id).await {
+        Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_get_profile(state: AppState, owner: String, id: String) -> Result<ProfileDto, ApiError> {
+    let profile = crate::profile::find(&state, &owner, &id)
+        .await
+        .map_err(ApiError::from_store_error)?
+        .ok_or_else(ApiError::profile_not_found)?;
+    Ok(ProfileDto::from(profile))
+}
+
+async fn patch_profile_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateProfileRequest>,
+) -> Response {
+    match handle_patch_profile(state, owner, id, body).await {
+        Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
+        Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn handle_patch_profile(
+    state: AppState,
+    owner: String,
+    id: String,
+    body: UpdateProfileRequest,
+) -> Result<ProfileDto, ApiError> {
+    if crate::profile::find_built_in(&id).is_some() {
+        return Err(ApiError::profile_rejected("встроенный профиль нельзя изменить"));
+    }
+    if let Some(name) = &body.name
+        && name.trim().is_empty()
+    {
+        return Err(ApiError::invalid_request("название профиля не может быть пустым"));
+    }
+    let updated = store::update_owner_profile(
+        &state.db,
+        &owner,
+        &id,
+        body.name.as_deref(),
+        body.persona.as_deref(),
+        body.style.as_deref(),
+        body.format.as_deref(),
+        body.constraints.as_deref(),
+    )
+    .await
+    .map_err(|err| map_store_error(err, ApiError::profile_not_found()))?;
+    if !crate::profile::has_any_preference(&updated.persona, &updated.style, &updated.format, &updated.constraints)
+    {
+        return Err(ApiError::profile_rejected(
+            "профиль должен содержать хотя бы одно непустое поле предпочтений",
+        ));
+    }
+    Ok(ProfileDto::from(crate::profile::Profile {
+        id: updated.id,
+        name: updated.name,
+        persona: updated.persona,
+        style: updated.style,
+        format: updated.format,
+        constraints: updated.constraints,
+        built_in: false,
+    }))
+}
+
+async fn delete_profile_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+) -> Response {
+    if crate::profile::find_built_in(&id).is_some() {
+        return ApiError::profile_rejected("встроенный профиль нельзя удалить")
+            .with_request_id(request_id)
+            .into_response();
+    }
+    match store::delete_owner_profile(&state.db, &owner, &id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => map_store_error(err, ApiError::profile_not_found())
+            .with_request_id(request_id)
+            .into_response(),
+    }
+}
+
 async fn delete_chat_handler(
     State(state): State<AppState>,
     Extension(RequestId(request_id)): Extension<RequestId>,
@@ -1482,6 +1689,16 @@ pub fn router(state: AppState) -> Router {
             get(get_long_term_memory_handler)
                 .post(set_long_term_memory_handler)
                 .delete(delete_long_term_memory_handler),
+        )
+        .route(
+            "/profiles",
+            get(get_profiles_handler).post(create_profile_handler),
+        )
+        .route(
+            "/profiles/{id}",
+            get(get_profile_handler)
+                .patch(patch_profile_handler)
+                .delete(delete_profile_handler),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

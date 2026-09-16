@@ -35,6 +35,8 @@ pub const DEFAULT_MEMORY_WORKING_KEY_MAX_CHARS: u32 = 100;
 pub const DEFAULT_MEMORY_LONG_TERM_MAX_ENTRIES: u32 = 100;
 pub const DEFAULT_MEMORY_LONG_TERM_VALUE_MAX_CHARS: u32 = 500;
 pub const DEFAULT_MEMORY_LONG_TERM_KEY_MAX_CHARS: u32 = 100;
+pub const DEFAULT_MAX_PROFILES: u32 = 20;
+pub const DEFAULT_PROFILE_MAX_CHARS: u32 = 2000;
 
 pub const API_KEY_VAR: &str = "AGENTD_UPSTREAM_API_KEY";
 
@@ -141,6 +143,15 @@ pub struct AgentdConfig {
     pub memory_long_term_value_max_chars: u32,
     /// Потолок длины ключа записи долговременной памяти в символах.
     pub memory_long_term_key_max_chars: u32,
+    /// Операторское умолчание профиля для чатов без явной настройки
+    /// (specs/user-profiles). Пусто — запрос собирается без раздела
+    /// профиля.
+    pub default_profile: Option<String>,
+    /// Потолок числа собственных профилей владельца.
+    pub max_profiles: u32,
+    /// Потолок длины собранного раздела профиля в символах: превышение
+    /// усекает раздел, а не отклоняет запрос (design.md, решение 6).
+    pub profile_max_chars: u32,
 }
 
 impl AgentdConfig {
@@ -346,6 +357,13 @@ impl AgentdConfig {
                 get("AGENTD_MEMORY_LONG_TERM_KEY_MAX_CHARS"),
                 "AGENTD_MEMORY_LONG_TERM_KEY_MAX_CHARS",
                 DEFAULT_MEMORY_LONG_TERM_KEY_MAX_CHARS,
+            )?,
+            default_profile: get("AGENTD_DEFAULT_PROFILE"),
+            max_profiles: parse_nonzero(get("AGENTD_MAX_PROFILES"), "AGENTD_MAX_PROFILES", DEFAULT_MAX_PROFILES)?,
+            profile_max_chars: parse_nonzero(
+                get("AGENTD_PROFILE_MAX_CHARS"),
+                "AGENTD_PROFILE_MAX_CHARS",
+                DEFAULT_PROFILE_MAX_CHARS,
             )?,
         })
     }
@@ -935,5 +953,39 @@ mod tests {
         ])
         .expect_err("ожидалась ошибка");
         assert!(format!("{err}").contains("AGENTD_MEMORY_LAYERS_ENABLED"));
+    }
+
+    // --- AGENTD_DEFAULT_PROFILE / AGENTD_MAX_PROFILES / AGENTD_PROFILE_MAX_CHARS (specs/user-profiles) ---
+
+    #[test]
+    fn profile_settings_default_when_not_set() {
+        let config = config_from(&[(API_KEY_VAR, "secret-key-value")]).expect("конфигурация");
+        assert_eq!(config.default_profile, None);
+        assert_eq!(config.max_profiles, DEFAULT_MAX_PROFILES);
+        assert_eq!(config.profile_max_chars, DEFAULT_PROFILE_MAX_CHARS);
+    }
+
+    #[test]
+    fn profile_settings_are_read_from_environment() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_DEFAULT_PROFILE", "teacher"),
+            ("AGENTD_MAX_PROFILES", "5"),
+            ("AGENTD_PROFILE_MAX_CHARS", "500"),
+        ])
+        .expect("конфигурация");
+        assert_eq!(config.default_profile.as_deref(), Some("teacher"));
+        assert_eq!(config.max_profiles, 5);
+        assert_eq!(config.profile_max_chars, 500);
+    }
+
+    #[test]
+    fn invalid_max_profiles_value_fails_startup() {
+        let err = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_MAX_PROFILES", "0"),
+        ])
+        .expect_err("ожидалась ошибка");
+        assert!(format!("{err}").contains("AGENTD_MAX_PROFILES"));
     }
 }
