@@ -3,6 +3,7 @@
 use crate::config::AgentdConfig;
 use agentcore::agent::{Agent, AgentReply, Message, OllamaAgent};
 use agentcore::config::{ChatSettings, Config, Provider};
+use agentcore::invariants::InvariantSet;
 use agentcore::logging::ExchangeLog;
 use agentupstream::UpstreamAgent;
 use anyhow::Result;
@@ -25,6 +26,10 @@ pub struct AppState {
     pub config: Arc<AgentdConfig>,
     /// Один клиент на весь процесс: соединения к провайдеру переиспользуются.
     pub agent: Arc<ServiceAgent>,
+    /// Активные инварианты: загружены один раз при старте из
+    /// `AGENTD_INVARIANTS_PATH`, не приходят с запросом (design.md,
+    /// «Отдельный тип `InvariantSet`»).
+    pub invariants: Arc<InvariantSet>,
     pub db: SqlitePool,
     /// Счётчики последнего фонового прогона маршрутизатора памяти по чату
     /// (слоистая память) — маршрутизатор фоновый, поэтому его результат
@@ -47,6 +52,10 @@ impl AppState {
     /// ошибка старта, как и отсутствующий ключ провайдера.
     pub async fn new(config: AgentdConfig) -> Result<Self> {
         let agent = build_agent(&config)?;
+        let invariants = match &config.invariants_path {
+            Some(path) => InvariantSet::load(std::path::Path::new(path))?,
+            None => InvariantSet::default(),
+        };
         let db = crate::store::open_pool(
             &config.db_path,
             config.db_max_connections,
@@ -56,6 +65,7 @@ impl AppState {
         Ok(Self {
             config: Arc::new(config),
             agent: Arc::new(agent),
+            invariants: Arc::new(invariants),
             db,
             memory_route_outcomes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             task_track_outcomes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),

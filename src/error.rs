@@ -21,7 +21,10 @@ pub struct ErrorBody {
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: StatusCode,
-    pub code: &'static str,
+    /// `String`, а не `&'static str`: `policy_rejected` подставляет сюда код
+    /// конкретной стадии конвейера (например `invariant_violation`), а не
+    /// общий код семейства.
+    pub code: String,
     pub message: String,
     /// Полный текст для журнала: клиенту он не уходит.
     pub log_detail: Option<String>,
@@ -32,7 +35,7 @@ impl ApiError {
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
-            code,
+            code: code.to_string(),
             message: message.into(),
             log_detail: None,
             request_id: None,
@@ -160,21 +163,18 @@ impl ApiError {
         )
     }
 
+    /// Код отказа — код конкретной стадии конвейера (например
+    /// `invariant_violation`), не общий код семейства: так отказ одной
+    /// стадии остаётся отличим от отказа другой уже на уровне `error.code`
+    /// (spec.md, «Причина отказа не путается с другими отказами»).
     pub fn policy_rejected(code: String, reason: String) -> Self {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
-            code: "policy_rejected",
+            code,
             message: reason,
-            log_detail: Some(format!("код отказа политики: {code}")),
+            log_detail: None,
             request_id: None,
         }
-        .with_policy_code(code)
-    }
-
-    /// Код отказа политики попадает клиенту вместе с причиной.
-    fn with_policy_code(mut self, code: String) -> Self {
-        self.message = format!("{}: {}", code, self.message);
-        self
     }
 
     pub fn rate_limited() -> Self {
@@ -188,7 +188,7 @@ impl ApiError {
     pub fn internal(detail: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal_error",
+            code: "internal_error".to_string(),
             message: "внутренняя ошибка сервиса".to_string(),
             log_detail: Some(detail.into()),
             request_id: None,
@@ -223,7 +223,7 @@ impl ApiError {
     pub fn storage_error(detail: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "storage_error",
+            code: "storage_error".to_string(),
             message: "хранилище временно недоступно".to_string(),
             log_detail: Some(detail.into()),
             request_id: None,
@@ -249,7 +249,7 @@ impl ApiError {
         match err.downcast_ref::<AgentError>() {
             Some(AgentError::Timeout { .. }) => Self {
                 status: StatusCode::GATEWAY_TIMEOUT,
-                code: "upstream_timeout",
+                code: "upstream_timeout".to_string(),
                 message: "провайдер модели не ответил в отведённое время".to_string(),
                 log_detail: Some(format!("{err:#}")),
                 request_id: None,
@@ -267,7 +267,7 @@ impl ApiError {
                 };
                 Self {
                     status: mapped,
-                    code,
+                    code: code.to_string(),
                     message: format!("провайдер модели вернул ошибку (код {status})"),
                     log_detail: Some(format!("{err:#}")),
                     request_id: None,
@@ -275,14 +275,14 @@ impl ApiError {
             }
             Some(AgentError::Transport(_)) => Self {
                 status: StatusCode::BAD_GATEWAY,
-                code: "upstream_error",
+                code: "upstream_error".to_string(),
                 message: "не удалось обратиться к провайдеру модели".to_string(),
                 log_detail: Some(format!("{err:#}")),
                 request_id: None,
             },
             Some(AgentError::Decode(_)) => Self {
                 status: StatusCode::BAD_GATEWAY,
-                code: "upstream_error",
+                code: "upstream_error".to_string(),
                 message: "ответ провайдера модели не удалось разобрать".to_string(),
                 log_detail: Some(format!("{err:#}")),
                 request_id: None,

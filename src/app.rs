@@ -84,6 +84,20 @@ fn contains_api_key(value: &serde_json::Value) -> bool {
     }
 }
 
+/// Инварианты — конфигурация оператора: тело запроса с полем `invariants`
+/// отклоняется явно, тем же приёмом, что и клиентский `api_key` (spec.md,
+/// «Клиент не может подменить или дополнить инварианты»).
+fn contains_invariants_field(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.contains_key("invariants")
+                || map.values().any(contains_invariants_field)
+        }
+        serde_json::Value::Array(items) => items.iter().any(contains_invariants_field),
+        _ => false,
+    }
+}
+
 /// Приближённая оценка размера истории в токенах: точного токенизатора
 /// провайдера (`deepseek-v4-flash`/`deepseek-v4-pro` через `agentupstream`, либо Ollama) у сервиса
 /// нет, поэтому размер оценивается по длине текста, а не подсчитывается
@@ -607,6 +621,11 @@ async fn handle_chat(
             "ключ провайдера задаёт сервис: поле api_key в запросе не принимается",
         ));
     }
+    if contains_invariants_field(&body) {
+        return Err(ApiError::invalid_request(
+            "инварианты задаёт конфигурация сервиса: поле invariants в запросе не принимается",
+        ));
+    }
     let request: ChatRequest = serde_json::from_value(body)
         .map_err(|err| ApiError::invalid_request(format!("тело запроса не разобрано: {err}")))?;
 
@@ -636,8 +655,10 @@ async fn handle_chat_without_storage(
     let limit = effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
     check_context_limit(&history, limit)?;
 
-    let pipeline = Pipeline::new(state.agent.clone());
-    let context = RequestContext::new(request_id.clone(), history, settings);
+    let pipeline = Pipeline::new(state.agent.clone())
+        .with_output_policies(agentcore::invariants::default_output_policies(state.agent.clone()));
+    let context = RequestContext::new(request_id.clone(), history, settings)
+        .with_invariants((*state.invariants).clone());
     let (reply, policy) = run_pipeline(&pipeline, context, &request_id).await?;
     Ok(ChatResponse::new(request_id, model, &reply, policy))
 }
@@ -704,8 +725,10 @@ async fn handle_chat_in_existing(
     let limit = effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
     check_context_limit(&history, limit)?;
 
-    let pipeline = Pipeline::new(state.agent.clone());
-    let pipeline_context = RequestContext::new(request_id.clone(), history, settings.clone());
+    let pipeline = Pipeline::new(state.agent.clone())
+        .with_output_policies(agentcore::invariants::default_output_policies(state.agent.clone()));
+    let pipeline_context = RequestContext::new(request_id.clone(), history, settings.clone())
+        .with_invariants((*state.invariants).clone());
     let (reply, policy) = run_pipeline(&pipeline, pipeline_context, &request_id).await?;
 
     let mut assistant_meta = reply.meta.clone();

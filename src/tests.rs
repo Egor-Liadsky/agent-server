@@ -303,7 +303,13 @@ async fn chat_returns_reply_from_provider() {
     assert_eq!(sent.body["usage"]["reasoning_tokens"], 3);
     assert!(sent.body["timing"]["duration_ms"].is_number());
     assert_eq!(sent.body["policy"]["input"], serde_json::json!([]));
-    assert_eq!(sent.body["policy"]["output"], serde_json::json!([]));
+    // `invariant-guard` — регистрируется по умолчанию (openspec/changes/
+    // add-invariant-guardrails) и всегда проходит без служебного вызова к
+    // модели, пока `AGENTD_INVARIANTS_PATH` не задан этому состоянию теста.
+    assert_eq!(
+        sent.body["policy"]["output"],
+        serde_json::json!([{"stage": "invariant-guard", "action": "pass"}])
+    );
     assert!(sent.body["policy"]["judge"].is_null());
     assert_eq!(sent.body["request_id"], sent.request_id_header);
 }
@@ -5005,3 +5011,108 @@ async fn resumed_task_system_message_carries_prior_stage_step_and_resume_brief()
     assert!(body.contains("ждёт ревью"), "тело: {body}");
 }
 
+
+// --- Инварианты: `AGENTD_INVARIANTS_PATH`, отказ `invariant_violation`,
+// отклонение клиентского поля `invariants`
+// (openspec/changes/add-invariant-guardrails) ---
+
+/// Маркер в теле служебного запроса `InvariantGuard` (см. приглашение в
+/// `agentcore::invariants::InvariantGuard::prompt`): отличает его от
+/// основного диалогового вызова на одном и том же `/chat/completions`.
+const INVARIANT_GUARD_CALL_MARKER: &str = "ОТВЕТ МОДЕЛИ";
+
+fn write_invariants_file(dir: &std::path::Path) -> String {
+    let path = dir.join("invariants.toml");
+    std::fs::write(
+        &path,
+        r#"
+[[invariant]]
+id = "no-client-side-secrets"
+statement = "ключ провайдера принадлежит сервису, не клиенту"
+category = "security"
+"#,
+    )
+    .expect("запись файла инвариантов");
+    path.to_str().expect("путь к файлу инвариантов").to_string()
+}
+
+#[tokio::test]
+async fn invariant_violation_is_rejected_with_dedicated_code_and_request_id() {
+    let _guard = test_lock();
+    let dir = tempfile::tempdir().expect("временная директория");
+    let invariants_path = write_invariants_file(dir.path());
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(INVARIANT_GUARD_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply(
+            r#"{"violated": true, "invariant_id": "no-client-side-secrets", "explanation": "предложил вынести ключ в тело запроса"}"#,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(INVARIANT_GUARD_CALL_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply(
+            "вот твой ключ провайдера, положи его в тело запроса",
+        )))
+        .mount(&server)
+        .await;
+
+    let state = state_with_provider(&server, &[("AGENTD_INVARIANTS_PATH", &invariants_path)]).await;
+    let sent = send(state, post_chat(serde_json::json!({ "prompt": "как передать ключ клиенту?" }))).await;
+
+    assert_eq!(sent.status, StatusCode::UNPROCESSABLE_ENTITY, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "invariant_violation");
+    assert!(
+        sent.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no-client-side-secrets"),
+        "тело: {}",
+        sent.body
+    );
+    assert_eq!(sent.body["error"]["request_id"], sent.request_id_header);
+    assert!(!sent.request_id_header.is_empty());
+}
+
+#[tokio::test]
+async fn missing_invariants_path_behaves_like_before_the_change() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&server)
+        .await;
+
+    // Без AGENTD_INVARIANTS_PATH: набор инвариантов пуст, InvariantGuard не
+    // выполняет служебный вызов (spec.md, «Пустой источник»).
+    let state = state_with_provider(&server, &[]).await;
+    let sent = send(state, post_chat(serde_json::json!({ "prompt": "привет" }))).await;
+
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["content"], "ответ модели");
+    assert_eq!(server.received_requests().await.expect("запросы").len(), 1);
+}
+
+#[tokio::test]
+async fn client_supplied_invariants_field_is_rejected_before_calling_provider() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    let state = state_with_provider(&server, &[]).await;
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "prompt": "привет",
+            "invariants": [{"id": "x", "statement": "y", "category": "z"}]
+        })),
+    )
+    .await;
+
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "invalid_request");
+    assert_eq!(server.received_requests().await.expect("запросы").len(), 0);
+}

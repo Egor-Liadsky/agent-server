@@ -169,6 +169,11 @@ pub struct AgentdConfig {
     pub task_expected_action_max_chars: u32,
     /// Потолок длины брифа возобновления задачи в символах.
     pub task_resume_brief_max_chars: u32,
+    /// Путь к файлу инвариантов (`invariants.toml`). Не задан — набор
+    /// инвариантов пуст, конвейер ведёт себя как без `InvariantGuard`
+    /// (design.md, «Формат файла — `invariants.toml`»): в отличие от
+    /// `AGENTD_UPSTREAM_API_KEY`, отсутствие переменной не фатально.
+    pub invariants_path: Option<String>,
 }
 
 impl AgentdConfig {
@@ -408,6 +413,7 @@ impl AgentdConfig {
                 "AGENTD_TASK_RESUME_BRIEF_MAX_CHARS",
                 DEFAULT_TASK_RESUME_BRIEF_MAX_CHARS,
             )?,
+            invariants_path: get("AGENTD_INVARIANTS_PATH"),
         })
     }
 
@@ -1083,5 +1089,23 @@ mod tests {
         ])
         .expect_err("ожидалась ошибка");
         assert!(format!("{err}").contains("AGENTD_TASK_STEP_MAX_CHARS"));
+    }
+
+    // --- AGENTD_INVARIANTS_PATH (openspec/changes/add-invariant-guardrails) ---
+
+    #[test]
+    fn invariants_path_defaults_to_none_and_is_not_fatal() {
+        let config = config_from(&[(API_KEY_VAR, "secret-key-value")]).expect("конфигурация");
+        assert_eq!(config.invariants_path, None);
+    }
+
+    #[test]
+    fn invariants_path_is_read_from_environment() {
+        let config = config_from(&[
+            (API_KEY_VAR, "secret-key-value"),
+            ("AGENTD_INVARIANTS_PATH", "/etc/agentd/invariants.toml"),
+        ])
+        .expect("конфигурация");
+        assert_eq!(config.invariants_path.as_deref(), Some("/etc/agentd/invariants.toml"));
     }
 }
