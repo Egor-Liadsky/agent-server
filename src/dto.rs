@@ -395,6 +395,13 @@ pub struct ContextDto {
     /// состоянии задачи.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_tracker_applied: Option<u32>,
+    /// Число предложений того же прогона трекера, применённых как
+    /// обновление шага и ожидаемого действия без смены этапа. Такие
+    /// предложения не считаются ни применёнными переходами, ни
+    /// отклонёнными (specs/task-state, «Ответ различает обновление полей и
+    /// переход»). Отсутствует при выключенном состоянии задачи.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_tracker_updated: Option<u32>,
     /// Число переходов, отклонённых тем же прогоном трекера. Отсутствует
     /// при выключенном состоянии задачи.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -429,6 +436,7 @@ impl ContextDto {
             task_expected_action: None,
             task_paused: None,
             task_tracker_applied: None,
+            task_tracker_updated: None,
             task_tracker_rejected: None,
         }
     }
@@ -460,6 +468,7 @@ impl ContextDto {
             task_expected_action: None,
             task_paused: None,
             task_tracker_applied: None,
+            task_tracker_updated: None,
             task_tracker_rejected: None,
         }
     }
@@ -496,6 +505,7 @@ impl ContextDto {
             task_expected_action: None,
             task_paused: None,
             task_tracker_applied: None,
+            task_tracker_updated: None,
             task_tracker_rejected: None,
         }
     }
@@ -527,6 +537,7 @@ impl ContextDto {
             task_expected_action: None,
             task_paused: None,
             task_tracker_applied: None,
+            task_tracker_updated: None,
             task_tracker_rejected: None,
         }
     }

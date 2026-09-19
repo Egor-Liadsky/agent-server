@@ -4607,6 +4607,149 @@ async fn transition_to_done_carries_new_task_id_and_clears_working_memory() {
     assert!(working.is_empty(), "рабочая память прежней задачи очищена переходом в done");
 }
 
+#[tokio::test]
+async fn transition_to_done_outside_validation_is_rejected_and_keeps_task() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let owner = crate::store::ANONYMOUS_OWNER.to_string();
+
+    for stage in ["planning", "clarification", "execution"] {
+        let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+        let id = created.body["id"].as_str().unwrap().to_string();
+        let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+            .await
+            .expect("чат");
+        crate::store::set_working_memory(&state.db, &id, &chat.active_task_id, "k", "v", "manual", 1)
+            .await
+            .expect("рабочая память");
+        if stage != "planning" {
+            send(
+                state.clone(),
+                request(
+                    "POST",
+                    &format!("{}/transition", task_uri(&id)),
+                    Some(serde_json::json!({ "stage": "clarification" })),
+                    None,
+                ),
+            )
+            .await;
+        }
+        if stage == "execution" {
+            send(
+                state.clone(),
+                request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "execution" })), None),
+            )
+            .await;
+        }
+
+        let done = send(
+            state.clone(),
+            request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "done" })), None),
+        )
+        .await;
+        assert_eq!(done.status, StatusCode::BAD_REQUEST, "этап {stage}, тело: {}", done.body);
+        assert_eq!(done.body["error"]["code"], "task_transition_invalid");
+        assert!(
+            done.body["error"]["message"].as_str().unwrap().contains("допустимые рёбра"),
+            "этап {stage}, тело: {}",
+            done.body
+        );
+
+        let after_chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+            .await
+            .expect("чат");
+        assert_eq!(after_chat.active_task_id, chat.active_task_id, "этап {stage}: задача не ротируется");
+        let working = crate::store::load_working_memory(&state.db, &id, &chat.active_task_id).await.expect("память");
+        assert_eq!(working.len(), 1, "этап {stage}: рабочая память не очищается");
+        let after = send(state.clone(), get(&task_uri(&id))).await;
+        assert_eq!(after.body["stage"], stage, "этап не меняется при отказе");
+    }
+}
+
+#[tokio::test]
+async fn transition_to_done_while_paused_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let owner = crate::store::ANONYMOUS_OWNER.to_string();
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+        .await
+        .expect("чат");
+    for stage in ["clarification", "execution", "validation"] {
+        send(
+            state.clone(),
+            request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": stage })), None),
+        )
+        .await;
+    }
+    send(state.clone(), request("POST", &format!("{}/pause", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+
+    let done = send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "done" })), None),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::BAD_REQUEST, "тело: {}", done.body);
+    assert!(done.body["error"]["message"].as_str().unwrap().contains("паузе"), "тело: {}", done.body);
+
+    let after_chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+        .await
+        .expect("чат");
+    assert_eq!(after_chat.active_task_id, chat.active_task_id, "задача на паузе не завершается");
+}
+
+#[tokio::test]
+async fn finish_task_endpoint_is_not_restricted_by_stage() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let owner = crate::store::ANONYMOUS_OWNER.to_string();
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+        .await
+        .expect("чат");
+
+    // Ротация задачи в рабочей памяти — другой путь с другим смыслом, ребром
+    // `validation → done` он не ограничен (design.md, решение 3).
+    let finished = send(state.clone(), request("POST", &finish_task_uri(&id), Some(serde_json::json!({})), None)).await;
+    assert_eq!(finished.status, StatusCode::OK, "тело: {}", finished.body);
+    let after_chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+        .await
+        .expect("чат");
+    assert_ne!(after_chat.active_task_id, chat.active_task_id, "задача ротирована");
+}
+
+#[tokio::test]
+async fn unknown_stage_name_is_rejected_with_its_own_reason() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let unknown = send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "mystery" })), None),
+    )
+    .await;
+    assert_eq!(unknown.status, StatusCode::BAD_REQUEST, "тело: {}", unknown.body);
+    assert_eq!(unknown.body["error"]["code"], "task_transition_invalid");
+    assert_eq!(unknown.body["error"]["message"], "неизвестный этап задачи");
+
+    // Известный, но недопустимый из текущего этапа переход сохраняет свою
+    // причину (specs/task-state, ADDED Requirements).
+    let invalid_edge = send(
+        state.clone(),
+        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "execution" })), None),
+    )
+    .await;
+    assert_eq!(invalid_edge.status, StatusCode::BAD_REQUEST, "тело: {}", invalid_edge.body);
+    assert_eq!(invalid_edge.body["error"]["message"], "переход не входит в допустимые рёбра автомата");
+
+    let after = send(state, get(&task_uri(&id))).await;
+    assert_eq!(after.body["stage"], "planning", "состояние не меняется ни при одном из отказов");
+}
+
 // --- 6.2 Журнал переходов ---
 
 #[tokio::test]
@@ -4907,6 +5050,105 @@ async fn tracker_never_applies_done_even_when_edge_is_valid() {
     assert_eq!(second.status, StatusCode::OK, "тело: {}", second.body);
     assert_eq!(second.body["context"]["task_stage"], "validation", "предложение done не применяется трекером");
     assert_eq!(second.body["context"]["task_tracker_rejected"], 1);
+}
+
+#[tokio::test]
+async fn tracker_request_carries_both_user_message_and_assistant_reply() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(crate::task::TASK_TRACKER_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply(
+            r#"{"stage":"clarification","step":"шаг","expected_action":"действие","reason":"причина"}"#,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(crate::task::TASK_TRACKER_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("МЕТКА-ОТВЕТА-МОДЕЛИ")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_AUTO_TITLE", "false")]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "task_state_enabled": true, "task_state_auto_enabled": true } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "МЕТКА-РЕПЛИКИ-ПОЛЬЗОВАТЕЛЯ" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let requests = server.received_requests().await.expect("запросы");
+    let tracker_body = requests
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).to_string())
+        .find(|body| body.contains(crate::task::TASK_TRACKER_MARKER))
+        .expect("запрос трекера");
+    assert!(tracker_body.contains("МЕТКА-РЕПЛИКИ-ПОЛЬЗОВАТЕЛЯ"), "вход трекера без реплики пользователя: {tracker_body}");
+    assert!(tracker_body.contains("МЕТКА-ОТВЕТА-МОДЕЛИ"), "вход трекера без ответа модели: {tracker_body}");
+}
+
+#[tokio::test]
+async fn tracker_proposal_with_current_stage_updates_fields_without_transition() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(crate::task::TASK_TRACKER_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply(
+            r#"{"stage":"clarification","step":"новый шаг","expected_action":"новое действие","reason":"вопросы уточнились"}"#,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(crate::task::TASK_TRACKER_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[("AGENTD_AUTO_TITLE", "false")]).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "task_state_enabled": true, "task_state_auto_enabled": true } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "clarification", "step": "старый шаг", "expected_action": "старое действие" })),
+            None,
+        ),
+    )
+    .await;
+    let before = send(state.clone(), get(&task_uri(&id))).await;
+    let transitions_before = before.body["transitions"].as_array().unwrap().len();
+
+    send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "отвечаю на вопросы" }))).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let after = send(state.clone(), get(&task_uri(&id))).await;
+    assert_eq!(after.body["stage"], "clarification", "этап не меняется предложением с текущим этапом");
+    assert_eq!(after.body["step"], "новый шаг");
+    assert_eq!(after.body["expected_action"], "новое действие");
+    assert_eq!(
+        after.body["transitions"].as_array().unwrap().len(),
+        transitions_before,
+        "журнал переходов не растёт при обновлении полей"
+    );
+
+    let second = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "продолжаем" }))).await;
+    assert_eq!(second.body["context"]["task_tracker_updated"], 1);
+    assert_eq!(second.body["context"]["task_tracker_applied"], 0);
+    assert_eq!(second.body["context"]["task_tracker_rejected"], 0);
 }
 
 #[tokio::test]

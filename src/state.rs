@@ -12,13 +12,23 @@ use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// Сколько раз сервис создавал клиента провайдера. Диагностика: клиент
-/// создаётся один раз при старте, а не на каждый входящий запрос.
-static AGENT_CREATIONS: AtomicUsize = AtomicUsize::new(0);
+// Сколько раз сервис создавал клиента провайдера. Диагностика: клиент
+// создаётся один раз при старте, а не на каждый входящий запрос.
+//
+// Счётчик именно потоковый, а не общий на процесс: тесты идут параллельно,
+// и каждый из них создаёт своё состояние. С общим счётчиком измерение
+// теста сбивалось чужим созданием состояния между двумя чтениями
+// (`left: 2, right: 1`) — тест проходил в одиночку и падал в полном
+// прогоне. `build_agent` вызывается синхронно, до первой точки `await` в
+// `AppState::new`, поэтому всегда исполняется на том же потоке, что и
+// создающий состояние тест.
+thread_local! {
+    static AGENT_CREATIONS: AtomicUsize = const { AtomicUsize::new(0) };
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn agent_creations() -> usize {
-    AGENT_CREATIONS.load(Ordering::SeqCst)
+    AGENT_CREATIONS.with(|counter| counter.load(Ordering::SeqCst))
 }
 
 #[derive(Clone)]
@@ -94,7 +104,7 @@ impl Agent for ServiceAgent {
 }
 
 fn build_agent(config: &AgentdConfig) -> Result<ServiceAgent> {
-    AGENT_CREATIONS.fetch_add(1, Ordering::SeqCst);
+    AGENT_CREATIONS.with(|counter| counter.fetch_add(1, Ordering::SeqCst));
     // Ключ и адрес провайдера принадлежат сервису и берутся из его
     // переменных окружения, а не из пользовательского конфига клиента.
     let core_config = Config {

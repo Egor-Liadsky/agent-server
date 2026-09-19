@@ -74,7 +74,8 @@ pub fn can_transition(from: TaskStage, to: TaskStage) -> bool {
 /// записывается в журнал так же, как `memory::RejectReason`.
 #[derive(Debug)]
 pub enum TaskError {
-    /// Задача уже в этапе `done`, переходы из него запрещены.
+    /// Имя этапа не входит в закрытый набор этапов (specs/task-state,
+    /// «Неизвестный этап отличается от недопустимого перехода»).
     UnknownStage,
     /// Переход не входит в список допустимых рёбер (включая пропуск этапа
     /// и переход из `done`).
@@ -164,7 +165,10 @@ pub async fn apply_manual_transition(
 ) -> Result<store::TaskState, TaskError> {
     let current = store::load_task_state(&state.db, owner, chat_id).await?;
     let from = TaskStage::parse(&current.stage).ok_or(TaskError::UnknownStage)?;
-    let to = TaskStage::parse(to_stage).ok_or(TaskError::InvalidEdge)?;
+    // Имя вне закрытого набора этапов — отдельная причина отказа, отличная
+    // от недопустимого ребра (specs/task-state, «Неизвестный этап
+    // отличается от недопустимого перехода»).
+    let to = TaskStage::parse(to_stage).ok_or(TaskError::UnknownStage)?;
     if current.paused {
         return Err(TaskError::Paused);
     }
@@ -179,6 +183,23 @@ pub async fn apply_manual_transition(
             .await?;
     log_transition(state, chat_id, from.as_str(), to.as_str(), "manual", step, expected_action, "");
     Ok(updated)
+}
+
+/// Проверяет, что задачу можно завершить переходом в `done`: ребро
+/// `validation → done` и отсутствие паузы (specs/task-state, «Переход в
+/// done завершает задачу»). Завершение идёт отдельным путём через
+/// `store::finish_task`, но правило автомата остаётся здесь, а не в
+/// обработчике HTTP (design.md, решение 3).
+pub async fn check_can_finish(state: &AppState, owner: &str, chat_id: &str) -> Result<(), TaskError> {
+    let current = store::load_task_state(&state.db, owner, chat_id).await?;
+    if current.paused {
+        return Err(TaskError::Paused);
+    }
+    let from = TaskStage::parse(&current.stage).ok_or(TaskError::UnknownStage)?;
+    if !can_transition(from, TaskStage::Done) {
+        return Err(TaskError::InvalidEdge);
+    }
+    Ok(())
 }
 
 /// Пишет запись в журнал сервиса о применённом переходе: тексты шага,
@@ -217,6 +238,38 @@ fn log_transition(
             expected_action_chars = expected_action.map(|s| s.chars().count()),
             reason_chars = reason.chars().count(),
             "переход состояния задачи применён"
+        );
+    }
+}
+
+/// Пишет запись об обновлении шага и ожидаемого действия без смены этапа
+/// по предложению трекера. Маскирование текстов — то же, что у
+/// `log_transition` (specs/task-state, «Тексты состояния задачи
+/// маскируются в журнале»).
+fn log_fields_update(
+    state: &AppState,
+    chat_id: &str,
+    stage: &str,
+    step: Option<&str>,
+    expected_action: Option<&str>,
+) {
+    if state.config.log_content {
+        tracing::info!(
+            chat_id = %chat_id,
+            stage,
+            source = "auto",
+            step,
+            expected_action,
+            "шаг и ожидаемое действие обновлены без смены этапа"
+        );
+    } else {
+        tracing::info!(
+            chat_id = %chat_id,
+            stage,
+            source = "auto",
+            step_chars = step.map(|s| s.chars().count()),
+            expected_action_chars = expected_action.map(|s| s.chars().count()),
+            "шаг и ожидаемое действие обновлены без смены этапа"
         );
     }
 }
@@ -352,6 +405,7 @@ pub fn merge_into_context(context: &mut ContextDto, task: &store::TaskState) {
 /// ПРЕДЫДУЩЕМУ сообщению, трекер фоновый (design.md, решение 5).
 pub fn merge_tracker_counters(context: &mut ContextDto, outcome: TrackOutcome) {
     context.task_tracker_applied = Some(outcome.applied);
+    context.task_tracker_updated = Some(outcome.updated);
     context.task_tracker_rejected = Some(outcome.rejected);
 }
 
@@ -380,26 +434,39 @@ fn parse_proposal(content: &str) -> Option<RawTrackerProposal> {
     serde_json::from_str(&content[start..=end]).ok()
 }
 
-fn tracker_prompt(task: &store::TaskState, assistant_reply: &str) -> String {
+/// Промпт трекера подаёт обе реплики последнего обмена отдельными блоками
+/// (design.md, решение 1): критерий перехода в `execution` — подтверждение
+/// пользователя, и оно живёт только в его сообщении, поэтому по одному
+/// ответу модели этот переход непроверяем.
+fn tracker_prompt(task: &store::TaskState, user_message: &str, assistant_reply: &str) -> String {
     format!(
         "Текущее состояние задачи: этап {}, шаг «{}», ожидаемое действие «{}».\n\n\
-         Последний ответ модели пользователю:\n{}\n\n\
-         {TASK_TRACKER_MARKER} на основе этого ответа, если он сдвигает задачу вперёд, назад или \
-         не меняет её. Переход в clarification предлагай, когда план собран и ответ задаёт \
-         пользователю уточняющие вопросы по этому плану. Переход из clarification в execution \
-         предлагай только тогда, когда ответ отражает явное подтверждение пользователем \
-         готовности приступить к выполнению — просто уточняющий вопрос для этого недостаточен. \
-         Ответь только JSON-объектом вида \
+         Последнее сообщение пользователя:\n{}\n\n\
+         Последний ответ модели:\n{}\n\n\
+         {TASK_TRACKER_MARKER} на основе этого обмена, если он сдвигает задачу вперёд, назад или \
+         не меняет её. Переход в clarification предлагай, когда план собран и последний ответ \
+         модели задаёт пользователю уточняющие вопросы по этому плану. Переход из clarification \
+         в execution предлагай тогда, когда последнее сообщение пользователя подтверждает \
+         готовность приступить к выполнению — отвечает на заданные вопросы или прямо требует \
+         начать работу. Прямое требование начать («начинай выполнение», «пиши код») достаточно \
+         само по себе: неотвеченные вопросы и новые вопросы в ответе модели его не отменяют — \
+         решать, хватает ли данных, пользователь уже решил. Если этап не \
+         меняется, всё равно верни текущий этап с обновлёнными шагом и ожидаемым действием по \
+         этому обмену. Ответь только JSON-объектом вида \
          {{\"stage\":\"planning\"|\"clarification\"|\"execution\"|\"validation\"|\"done\",\"step\":\"...\",\
          \"expected_action\":\"...\",\"reason\":\"...\"}} — этапом, который, по-твоему, сейчас \
          действителен, текущим шагом, ожидаемым действием и краткой причиной.",
-        task.stage, task.step, task.expected_action, assistant_reply
+        task.stage, task.step, task.expected_action, user_message, assistant_reply
     )
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TrackOutcome {
     pub applied: u32,
+    /// Предложения с ТЕКУЩИМ этапом, применённые как обновление шага и
+    /// ожидаемого действия: это не ребро автомата и не отказ
+    /// (specs/task-state, «Ответ различает обновление полей и переход»).
+    pub updated: u32,
     pub rejected: u32,
 }
 
@@ -417,6 +484,7 @@ pub async fn track_after_exchange(
     chat: &store::Chat,
     settings: &ChatSettings,
     owner: &str,
+    user_message: &str,
     assistant_reply: &str,
 ) -> TrackOutcome {
     let current = match store::load_task_state(&state.db, owner, &chat.id).await {
@@ -430,7 +498,7 @@ pub async fn track_after_exchange(
         return TrackOutcome::default();
     }
 
-    let prompt = tracker_prompt(&current, assistant_reply);
+    let prompt = tracker_prompt(&current, user_message, assistant_reply);
     let mut tracker_settings = settings.clone();
     if let Some(model) = &state.config.task_state_model {
         tracker_settings.model = Some(model.clone());
@@ -480,6 +548,48 @@ pub async fn track_after_exchange(
         outcome.rejected += 1;
         return outcome;
     };
+    // Предложение с текущим этапом — не ребро автомата, а обновление шага и
+    // ожидаемого действия (specs/task-state, «Предложение текущего этапа
+    // обновляет шаг и ожидаемое действие»). Без этой ветки шаг замерзает на
+    // значениях, записанных при входе в этап, и системное сообщение начинает
+    // работать против автомата (design.md, решение 2).
+    if to == from {
+        if check_text_limits(proposal.step.as_deref(), proposal.expected_action.as_deref(), &limits).is_err() {
+            log_reject("text_too_long");
+            outcome.rejected += 1;
+            return outcome;
+        }
+        if proposal.step.is_none() && proposal.expected_action.is_none() {
+            return outcome;
+        }
+        // Запись в журнал переходов не делается: журнал остаётся журналом
+        // переходов (add-task-state-machine, решение 3).
+        match store::update_task_fields(
+            &state.db,
+            owner,
+            &chat.id,
+            proposal.step.as_deref(),
+            proposal.expected_action.as_deref(),
+        )
+        .await
+        {
+            Ok(_) => {
+                log_fields_update(
+                    state,
+                    &chat.id,
+                    from.as_str(),
+                    proposal.step.as_deref(),
+                    proposal.expected_action.as_deref(),
+                );
+                outcome.updated += 1;
+            }
+            Err(err) => {
+                tracing::warn!(chat_id = %chat.id, error = %err, "не удалось обновить шаг и ожидаемое действие по предложению трекера");
+                outcome.rejected += 1;
+            }
+        }
+        return outcome;
+    }
     if !can_transition(from, to) {
         log_reject("invalid_edge");
         outcome.rejected += 1;

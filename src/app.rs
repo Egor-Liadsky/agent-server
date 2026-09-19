@@ -793,11 +793,21 @@ async fn handle_chat_in_existing(
         let track_chat = chat.clone();
         let track_settings = settings.clone();
         let track_owner = owner.clone();
+        // Трекеру нужны обе реплики обмена: критерий перехода в `execution` —
+        // подтверждение пользователя, и оно есть только в его сообщении
+        // (specs/task-state, «Вход трекера содержит обе реплики обмена»).
+        let track_prompt = prompt.clone();
         let assistant_reply = reply.content.clone();
         tokio::spawn(async move {
-            let outcome =
-                crate::task::track_after_exchange(&track_state, &track_chat, &track_settings, &track_owner, &assistant_reply)
-                    .await;
+            let outcome = crate::task::track_after_exchange(
+                &track_state,
+                &track_chat,
+                &track_settings,
+                &track_owner,
+                &track_prompt,
+                &assistant_reply,
+            )
+            .await;
             track_state
                 .task_track_outcomes
                 .lock()
@@ -1481,6 +1491,10 @@ async fn handle_task_transition(
             store::load_chat(&state.db, &owner, &chat_id, &server_defaults(&state))
                 .await
                 .map_err(ApiError::from_store_error)?;
+            // Завершение идёт отдельным путём, но подчиняется тому же
+            // автомату: ребро `validation → done` и отсутствие паузы
+            // (specs/task-state, «Переход в done завершает задачу»).
+            crate::task::check_can_finish(&state, &owner, &chat_id).await.map_err(map_task_error)?;
             let result = store::finish_task(
                 &state.db,
                 &owner,
