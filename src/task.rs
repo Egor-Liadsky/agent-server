@@ -22,6 +22,7 @@ pub const TASK_TRACKER_MARKER: &str = "Верни JSON с предлагаемы
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStage {
     Planning,
+    Clarification,
     Execution,
     Validation,
     Done,
@@ -31,6 +32,7 @@ impl TaskStage {
     pub fn parse(value: &str) -> Option<TaskStage> {
         match value {
             "planning" => Some(TaskStage::Planning),
+            "clarification" => Some(TaskStage::Clarification),
             "execution" => Some(TaskStage::Execution),
             "validation" => Some(TaskStage::Validation),
             "done" => Some(TaskStage::Done),
@@ -41,6 +43,7 @@ impl TaskStage {
     pub fn as_str(self) -> &'static str {
         match self {
             TaskStage::Planning => "planning",
+            TaskStage::Clarification => "clarification",
             TaskStage::Execution => "execution",
             TaskStage::Validation => "validation",
             TaskStage::Done => "done",
@@ -48,11 +51,15 @@ impl TaskStage {
     }
 }
 
-/// Допустимые рёбра автомата (design.md, решение 3): пропуск этапа и
+/// Допустимые рёбра автомата (design.md, решение 1): пропуск этапа и
 /// переход из `done` отклоняются, переход в тот же этап не входит в список
 /// — он не ребро, а обновление шага/ожидаемого действия без смены этапа.
-const EDGES: [(TaskStage, TaskStage); 5] = [
-    (TaskStage::Planning, TaskStage::Execution),
+/// Прямое ребро `planning → execution` отсутствует: уточнение плана
+/// обязательно проходит через `clarification` (design.md, решение 1).
+const EDGES: [(TaskStage, TaskStage); 7] = [
+    (TaskStage::Planning, TaskStage::Clarification),
+    (TaskStage::Clarification, TaskStage::Execution),
+    (TaskStage::Clarification, TaskStage::Planning),
     (TaskStage::Execution, TaskStage::Validation),
     (TaskStage::Validation, TaskStage::Done),
     (TaskStage::Validation, TaskStage::Execution),
@@ -378,8 +385,12 @@ fn tracker_prompt(task: &store::TaskState, assistant_reply: &str) -> String {
         "Текущее состояние задачи: этап {}, шаг «{}», ожидаемое действие «{}».\n\n\
          Последний ответ модели пользователю:\n{}\n\n\
          {TASK_TRACKER_MARKER} на основе этого ответа, если он сдвигает задачу вперёд, назад или \
-         не меняет её. Ответь только JSON-объектом вида \
-         {{\"stage\":\"planning\"|\"execution\"|\"validation\"|\"done\",\"step\":\"...\",\
+         не меняет её. Переход в clarification предлагай, когда план собран и ответ задаёт \
+         пользователю уточняющие вопросы по этому плану. Переход из clarification в execution \
+         предлагай только тогда, когда ответ отражает явное подтверждение пользователем \
+         готовности приступить к выполнению — просто уточняющий вопрос для этого недостаточен. \
+         Ответь только JSON-объектом вида \
+         {{\"stage\":\"planning\"|\"clarification\"|\"execution\"|\"validation\"|\"done\",\"step\":\"...\",\
          \"expected_action\":\"...\",\"reason\":\"...\"}} — этапом, который, по-твоему, сейчас \
          действителен, текущим шагом, ожидаемым действием и краткой причиной.",
         task.stage, task.step, task.expected_action, assistant_reply
@@ -522,11 +533,18 @@ mod tests {
 
     #[test]
     fn all_designed_edges_are_allowed() {
-        assert!(can_transition(TaskStage::Planning, TaskStage::Execution));
+        assert!(can_transition(TaskStage::Planning, TaskStage::Clarification));
+        assert!(can_transition(TaskStage::Clarification, TaskStage::Execution));
+        assert!(can_transition(TaskStage::Clarification, TaskStage::Planning));
         assert!(can_transition(TaskStage::Execution, TaskStage::Validation));
         assert!(can_transition(TaskStage::Validation, TaskStage::Done));
         assert!(can_transition(TaskStage::Validation, TaskStage::Execution));
         assert!(can_transition(TaskStage::Execution, TaskStage::Planning));
+    }
+
+    #[test]
+    fn direct_planning_to_execution_is_rejected() {
+        assert!(!can_transition(TaskStage::Planning, TaskStage::Execution));
     }
 
     #[test]
@@ -701,9 +719,9 @@ mod tests {
         runtime.block_on(store::load_task_state(&state.db, "owner-1", &chat.id)).expect("состояние задачи");
 
         let output = captured(|| {
-            let _ = runtime.block_on(apply_manual_transition(&state, "owner-1", &chat.id, "execution", Some("секретный шаг"), None));
+            let _ = runtime.block_on(apply_manual_transition(&state, "owner-1", &chat.id, "clarification", Some("секретный шаг"), None));
         });
-        assert!(output.contains("\"to_stage\":\"execution\""), "этап должен остаться в журнале: {output}");
+        assert!(output.contains("\"to_stage\":\"clarification\""), "этап должен остаться в журнале: {output}");
         assert!(!output.contains("секретный шаг"), "текст шага не должен попасть в журнал: {output}");
     }
 
@@ -718,7 +736,7 @@ mod tests {
         runtime.block_on(store::load_task_state(&state.db, "owner-1", &chat.id)).expect("состояние задачи");
 
         let output = captured(|| {
-            let _ = runtime.block_on(apply_manual_transition(&state, "owner-1", &chat.id, "execution", Some("видимый шаг"), None));
+            let _ = runtime.block_on(apply_manual_transition(&state, "owner-1", &chat.id, "clarification", Some("видимый шаг"), None));
         });
         assert!(output.contains("видимый шаг"), "текст шага должен попасть в журнал при AGENTD_LOG_CONTENT=true: {output}");
     }
