@@ -215,6 +215,10 @@ fn router_prompt(long_term: &[store::LongTermMemoryEntry], working: &[store::Wor
         "Текущая долговременная память (профиль, решения, знания):\n{long_term_text}\n\n\
          Текущая рабочая память активной задачи:\n{working_text}\n\n\
          Новое сообщение пользователя:\n{user_message}\n\n\
+         Правило выбора слоя: working — значение ценно только для текущей задачи и не нужно \
+         после её завершения (промежуточные решения, статусы, параметры именно этой задачи); \
+         long_term — факт верен независимо от задачи (профиль пользователя, постоянные решения, \
+         знания на будущее). При сомнении выбирай working.\n\n\
          {MEMORY_ROUTER_MARKER} — только то, что нужно изменить. Каждый элемент — \
          {{\"layer\":\"working\"|\"long_term\",\"op\":\"set\",\"key\":\"...\",\"value\":\"...\",\
          \"entry_type\":\"profile\"|\"decision\"|\"knowledge\" (только для long_term),\
@@ -545,6 +549,13 @@ mod tests {
     fn empty_operations_array_parses_as_empty() {
         let ops = parse_operations("[]").expect("пустой массив — валидный ответ");
         assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn router_prompt_states_layer_choice_rule() {
+        let prompt = router_prompt(&[], &[], "тест");
+        assert!(prompt.contains("Правило выбора слоя"), "промпт должен объяснять критерий working/long_term: {prompt}");
+        assert!(prompt.contains("При сомнении выбирай working"));
     }
 
     // --- 3.2 Валидация операций ---
