@@ -155,6 +155,23 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "task_transition_invalid", message)
     }
 
+    /// Описания инструментов в запросе не прошли проверку: имя, число,
+    /// уникальность или схема аргументов.
+    pub fn tools_invalid(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "tools_invalid", message)
+    }
+
+    /// Присланные результаты инструментов не отвечают на вызовы последнего
+    /// ответа модели.
+    pub fn tool_results_mismatch(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "tool_results_mismatch", message)
+    }
+
+    /// Модель чата не умеет вызывать инструменты.
+    pub fn tools_unsupported(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "tools_unsupported", message)
+    }
+
     pub fn payload_too_large() -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -299,6 +316,19 @@ impl ApiError {
                 Self::invalid_request(message.clone())
             }
             Some(AgentError::Unauthorized { .. }) => Self::internal(format!("{err:#}")),
+            Some(AgentError::ToolsUnsupported { model, .. }) => {
+                let mut error = Self::tools_unsupported(match model {
+                    Some(model) => format!("модель {model} не поддерживает вызов инструментов"),
+                    None => "модель не поддерживает вызов инструментов".to_string(),
+                });
+                error.log_detail = Some(format!("{err:#}"));
+                error
+            }
+            // Сервер инструментов и цикл вызовов живут у клиента: на сервисе
+            // эти ошибки не возникают, как и отсутствие ключа выше.
+            Some(AgentError::ToolServerUnavailable { .. } | AgentError::ToolLoopLimit { .. }) => {
+                Self::internal(format!("{err:#}"))
+            }
             None => Self::internal(format!("{err:#}")),
         }
     }

@@ -2,7 +2,7 @@
 //! ни про `ApiError` — отображение ошибок хранилища в HTTP живёт в
 //! `src/error.rs`.
 
-use agentcore::agent::{Message, MessageMeta, Role};
+use agentcore::agent::{Message, MessageMeta, Role, ToolCall};
 use agentcore::config::ChatSettings;
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -81,6 +81,11 @@ pub struct ChatMessage {
     pub reasoning: Option<String>,
     pub meta: Option<MessageMeta>,
     pub created_at: i64,
+    /// Вызовы инструментов у ответа модели; пусто у прочих сообщений и у
+    /// строк, записанных до миграции `0007`.
+    pub tool_calls: Vec<ToolCall>,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
 }
 
 /// Новое сообщение перед записью: без `id` и `seq` — их назначает
@@ -91,6 +96,9 @@ pub struct NewMessage {
     pub content: String,
     pub reasoning: Option<String>,
     pub meta: Option<MessageMeta>,
+    pub tool_calls: Vec<ToolCall>,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
 }
 
 impl NewMessage {
@@ -100,6 +108,37 @@ impl NewMessage {
             content: message.content,
             reasoning: message.reasoning,
             meta: message.meta,
+            tool_calls: message.tool_calls,
+            tool_call_id: message.tool_call_id,
+            tool_name: message.tool_name,
+        }
+    }
+}
+
+impl ChatMessage {
+    /// Сообщение ядра из сохранённого: одно место переноса полей для всех
+    /// стратегий контекста.
+    pub fn to_message(&self) -> Message {
+        Message {
+            role: self.role,
+            content: self.content.clone(),
+            reasoning: self.reasoning.clone(),
+            meta: self.meta.clone(),
+            tool_calls: self.tool_calls.clone(),
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: self.tool_name.clone(),
+        }
+    }
+
+    pub fn into_message(self) -> Message {
+        Message {
+            role: self.role,
+            content: self.content,
+            reasoning: self.reasoning,
+            meta: self.meta,
+            tool_calls: self.tool_calls,
+            tool_call_id: self.tool_call_id,
+            tool_name: self.tool_name,
         }
     }
 }
@@ -112,6 +151,7 @@ fn role_to_str(role: Role) -> &'static str {
         // запрос (design.md, решение 4). Ветка нужна только для
         // исчерпывающего match.
         Role::System => "system",
+        Role::Tool => "tool",
     }
 }
 
@@ -125,6 +165,7 @@ fn role_from_str(value: &str) -> Result<Role, StoreError> {
         "user" => Ok(Role::User),
         "assistant" => Ok(Role::Assistant),
         "system" => Ok(Role::System),
+        "tool" => Ok(Role::Tool),
         other => Err(StoreError::Backend(anyhow::anyhow!(
             "неизвестная роль сообщения в хранилище: {other}"
         ))),
@@ -547,7 +588,7 @@ async fn branch_messages_upto(
     let rows = match upto_seq {
         Some(upto) => {
             sqlx::query(
-                "SELECT seq, role, content, reasoning, meta, created_at FROM messages \
+                "SELECT seq, role, content, reasoning, meta, created_at, tool_calls, tool_call_id, tool_name FROM messages \
                  WHERE branch_id = ? AND seq <= ? ORDER BY seq ASC",
             )
             .bind(branch_id)
@@ -557,7 +598,7 @@ async fn branch_messages_upto(
         }
         None => {
             sqlx::query(
-                "SELECT seq, role, content, reasoning, meta, created_at FROM messages \
+                "SELECT seq, role, content, reasoning, meta, created_at, tool_calls, tool_call_id, tool_name FROM messages \
                  WHERE branch_id = ? ORDER BY seq ASC",
             )
             .bind(branch_id)
@@ -577,6 +618,12 @@ fn rows_to_messages(rows: &[sqlx::sqlite::SqliteRow]) -> Result<Vec<ChatMessage>
             .map(|raw| serde_json::from_str(&raw))
             .transpose()
             .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось разобрать телеметрию сообщения: {err}")))?;
+        let tool_calls: Option<String> = row.try_get("tool_calls")?;
+        let tool_calls = tool_calls
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()
+            .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось разобрать вызовы инструментов: {err}")))?
+            .unwrap_or_default();
         messages.push(ChatMessage {
             seq: row.try_get("seq")?,
             role: role_from_str(&role)?,
@@ -584,6 +631,9 @@ fn rows_to_messages(rows: &[sqlx::sqlite::SqliteRow]) -> Result<Vec<ChatMessage>
             reasoning: row.try_get("reasoning")?,
             meta,
             created_at: row.try_get("created_at")?,
+            tool_calls,
+            tool_call_id: row.try_get("tool_call_id")?,
+            tool_name: row.try_get("tool_name")?,
         });
     }
     Ok(messages)
@@ -638,7 +688,7 @@ pub async fn load_messages(
         // появления веток.
         let fetch_limit = i64::from(limit) + 1;
         let rows = sqlx::query(
-            "SELECT seq, role, content, reasoning, meta, created_at FROM messages \
+            "SELECT seq, role, content, reasoning, meta, created_at, tool_calls, tool_call_id, tool_name FROM messages \
              WHERE branch_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
         )
         .bind(&target_branch)
@@ -1488,7 +1538,10 @@ pub async fn set_task_paused(
 
 /// Записывает обмен (сообщение пользователя и ответ модели) одной
 /// транзакцией `BEGIN IMMEDIATE`: либо оба сообщения появляются в чате,
-/// либо чат не меняется (design.md, решения 2 и 9).
+/// либо чат не меняется (design.md, решения 2 и 9). Обработчик чата пишет
+/// через `append_messages`, потому что ход с инструментами состоит из
+/// произвольного числа сообщений; обёртка осталась для тестов хранилища.
+#[cfg(test)]
 pub async fn append_exchange(
     pool: &SqlitePool,
     owner: &str,
@@ -1628,9 +1681,17 @@ async fn insert_message(
         .transpose()
         .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать телеметрию: {err}")))?;
 
+    // Пустой список вызовов пишется как NULL: так же выглядят строки,
+    // записанные до миграции, и чтение у них одно.
+    let tool_calls_json = (!message.tool_calls.is_empty())
+        .then(|| serde_json::to_string(&message.tool_calls))
+        .transpose()
+        .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать вызовы инструментов: {err}")))?;
+
     sqlx::query(
-        "INSERT INTO messages (id, chat_id, branch_id, seq, role, content, reasoning, meta, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (id, chat_id, branch_id, seq, role, content, reasoning, meta, created_at, \
+         tool_calls, tool_call_id, tool_name) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(chat_id)
@@ -1641,6 +1702,9 @@ async fn insert_message(
     .bind(&message.reasoning)
     .bind(&meta_json)
     .bind(now)
+    .bind(&tool_calls_json)
+    .bind(&message.tool_call_id)
+    .bind(&message.tool_name)
     .execute(&mut *tx)
     .await?;
 
@@ -1651,6 +1715,9 @@ async fn insert_message(
         reasoning: message.reasoning.clone(),
         meta: message.meta.clone(),
         created_at: now,
+        tool_calls: message.tool_calls.clone(),
+        tool_call_id: message.tool_call_id.clone(),
+        tool_name: message.tool_name.clone(),
     })
 }
 
@@ -1845,6 +1912,9 @@ mod tests {
             content: content.to_string(),
             reasoning: None,
             meta: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
         }
     }
 
@@ -2435,6 +2505,7 @@ mod tests {
                 content: "ответ".to_string(),
                 reasoning: Some("рассуждение".to_string()),
                 meta: Some(meta.clone()),
+                ..new_message(Role::Assistant, "")
             },
         )
         .await
@@ -2483,6 +2554,7 @@ mod tests {
                     content: "ответ".to_string(),
                     reasoning: Some("рассуждение".to_string()),
                     meta: Some(meta),
+                    ..new_message(Role::Assistant, "")
                 },
             ],
         )
@@ -3122,5 +3194,116 @@ mod tests {
         assert_eq!(a, a_again);
         assert_ne!(a, b);
         assert_ne!(a, ANONYMOUS_OWNER);
+    }
+
+    // --- Вызовы инструментов (миграция 0007) ---
+
+    #[tokio::test]
+    async fn tool_calls_round_trip_through_storage() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default())
+            .await
+            .expect("чат");
+        let call = ToolCall {
+            id: "call_0".to_string(),
+            name: "git_status".to_string(),
+            arguments: serde_json::json!({ "repo_path": "/tmp/r" }),
+        };
+        append_messages(
+            &pool,
+            "owner-1",
+            &chat.id,
+            vec![
+                new_message(Role::User, "статус?"),
+                NewMessage::from_message(Message::assistant_with_tool_calls("", vec![call.clone()])),
+                NewMessage::from_message(Message::tool_result("call_0", "git_status", "clean")),
+            ],
+        )
+        .await
+        .expect("дозапись");
+
+        let page = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
+        assert_eq!(page.messages.len(), 3);
+        assert!(page.messages[0].tool_calls.is_empty());
+        assert_eq!(page.messages[1].tool_calls, vec![call]);
+        assert!(matches!(page.messages[2].role, Role::Tool));
+        assert_eq!(page.messages[2].tool_call_id.as_deref(), Some("call_0"));
+        assert_eq!(page.messages[2].tool_name.as_deref(), Some("git_status"));
+
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT tool_calls FROM messages WHERE chat_id = ? AND seq = 1")
+                .bind(&chat.id)
+                .fetch_one(&pool)
+                .await
+                .expect("строка");
+        assert!(raw.is_none(), "пустой список вызовов хранится как NULL");
+    }
+
+    #[tokio::test]
+    async fn migration_0007_keeps_old_messages_readable() {
+        let dir = tempfile::tempdir().expect("временный каталог");
+        let path = dir.path().join("agentd.db");
+        let path_str = path.to_str().expect("путь").to_string();
+
+        // Схема до 0007: 0001–0006 применены, 0007 ожидает — как на боевой
+        // базе перед обновлением сервиса.
+        let legacy_dir = dir.path().join("legacy-migrations");
+        std::fs::create_dir_all(&legacy_dir).expect("каталог старых миграций");
+        for name in [
+            "0001_init.sql",
+            "0002_chat_summaries.sql",
+            "0003_context_strategies.sql",
+            "0004_memory_layers.sql",
+            "0005_user_profiles.sql",
+            "0006_task_state.sql",
+        ] {
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations").join(name),
+                legacy_dir.join(name),
+            )
+            .expect("копия старой миграции");
+        }
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{path_str}"))
+            .expect("адрес базы")
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let legacy_pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .expect("пул старой схемы");
+        sqlx::migrate::Migrator::new(legacy_dir)
+            .await
+            .expect("загрузка старых миграций")
+            .run(&legacy_pool)
+            .await
+            .expect("применение старых миграций");
+
+        // Таблица chats до 0007 не менялась, поэтому чат создаётся обычным
+        // кодом, а сообщения — по старому набору колонок.
+        let chat = create_chat(&legacy_pool, "owner-1", "Старый чат", &ChatSettings::default())
+            .await
+            .expect("чат по старой схеме");
+        for (seq, role) in [(1i64, "user"), (2, "assistant")] {
+            sqlx::query(
+                "INSERT INTO messages (id, chat_id, branch_id, seq, role, content, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, 1000)",
+            )
+            .bind(format!("msg-{seq}"))
+            .bind(&chat.id)
+            .bind(&chat.active_branch)
+            .bind(seq)
+            .bind(role)
+            .bind(format!("сообщение {seq}"))
+            .execute(&legacy_pool)
+            .await
+            .expect("вставка сообщения по старой схеме");
+        }
+        legacy_pool.close().await;
+
+        let pool = open_pool(&path_str, 5, 5000).await.expect("применение 0007");
+        let page = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
+        assert_eq!(page.messages.len(), 2);
+        assert!(page.messages.iter().all(|m| m.tool_calls.is_empty()));
+        assert!(page.messages.iter().all(|m| m.tool_call_id.is_none() && m.tool_name.is_none()));
     }
 }

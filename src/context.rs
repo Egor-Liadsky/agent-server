@@ -33,15 +33,15 @@ pub struct StrategyCtx<'a> {
 
 #[async_trait]
 trait ContextStrategyImpl {
-    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_message: Message) -> Assembled;
+    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> Assembled;
 }
 
 struct SummaryImpl;
 
 #[async_trait]
 impl ContextStrategyImpl for SummaryImpl {
-    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_message: Message) -> Assembled {
-        let compaction = compact_history(ctx.state, &ctx.chat.id, ctx.settings, stored, new_message).await;
+    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> Assembled {
+        let compaction = compact_history(ctx.state, &ctx.chat.id, ctx.settings, stored, new_messages).await;
         Assembled {
             context: ContextDto::for_summary(compaction.replaced_messages, compaction.summary_built),
             sections: compaction.summary_section.into_iter().collect(),
@@ -54,8 +54,8 @@ struct WindowImpl;
 
 #[async_trait]
 impl ContextStrategyImpl for WindowImpl {
-    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_message: Message) -> Assembled {
-        let outcome = crate::window::assemble(stored, effective_window(ctx.state, ctx.settings), new_message);
+    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> Assembled {
+        let outcome = crate::window::assemble(stored, effective_window(ctx.state, ctx.settings), new_messages);
         Assembled {
             context: crate::window::context_dto(&outcome),
             sections: Vec::new(),
@@ -68,9 +68,9 @@ struct FactsImpl;
 
 #[async_trait]
 impl ContextStrategyImpl for FactsImpl {
-    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_message: Message) -> Assembled {
+    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> Assembled {
         let window_size = effective_window(ctx.state, ctx.settings);
-        let outcome = crate::facts::assemble(ctx.state, &ctx.chat.id, window_size, stored, new_message).await;
+        let outcome = crate::facts::assemble(ctx.state, &ctx.chat.id, window_size, stored, new_messages).await;
         let context = crate::facts::context_dto(&outcome);
         Assembled {
             context,
@@ -84,8 +84,8 @@ struct BranchingImpl;
 
 #[async_trait]
 impl ContextStrategyImpl for BranchingImpl {
-    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_message: Message) -> Assembled {
-        let outcome = crate::branch::assemble(ctx.state, ctx.chat, stored, new_message).await;
+    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> Assembled {
+        let outcome = crate::branch::assemble(ctx.state, ctx.chat, stored, new_messages).await;
         Assembled {
             context: ContextDto::for_branching(outcome.sent_messages, outcome.branch_id),
             sections: Vec::new(),
@@ -120,10 +120,10 @@ pub async fn assemble(
     owner: &str,
     strategy: ContextStrategy,
     stored: Vec<store::ChatMessage>,
-    new_message: Message,
+    new_messages: Vec<Message>,
 ) -> Assembled {
     let ctx = StrategyCtx { state, chat, settings };
-    let mut assembled = impl_for(strategy).assemble(&ctx, stored, new_message).await;
+    let mut assembled = impl_for(strategy).assemble(&ctx, stored, new_messages).await;
     if crate::memory::effective_layers_enabled(state, settings) {
         let memory = crate::memory::layers(state, chat, settings, owner).await;
         crate::memory::merge_into_context(&mut assembled.context, &memory, &assembled.history);
@@ -194,6 +194,10 @@ pub async fn assemble(
     }
     let system_message = crate::system_message::build(&state.config.system_prompt, &assembled.sections);
     assembled.history.insert(0, system_message);
+    // Висячий вызов инструмента остаётся в истории, если клиент упал
+    // посреди хода или ветка создана от середины хода; провайдер такую
+    // историю отвергает, поэтому она выравнивается перед каждым вызовом.
+    assembled.history = agentcore::agent::close_dangling_tool_calls(&assembled.history);
     assembled
 }
 
@@ -241,7 +245,7 @@ mod tests {
             "owner-1",
             ContextStrategy::SlidingWindow,
             Vec::new(),
-            Message::user("новое"),
+            vec![Message::user("новое")],
         )
         .await;
         assert!(matches!(assembled.history[0].role, Role::System));
@@ -259,7 +263,7 @@ mod tests {
             "owner-1",
             ContextStrategy::Branching,
             Vec::new(),
-            Message::user("новое"),
+            vec![Message::user("новое")],
         )
         .await;
         assert!(matches!(assembled.history[0].role, Role::System));
@@ -280,7 +284,7 @@ mod tests {
             "owner-1",
             ContextStrategy::Facts,
             Vec::new(),
-            Message::user("новое"),
+            vec![Message::user("новое")],
         )
         .await;
         assert!(matches!(assembled.history[0].role, Role::System));
@@ -291,7 +295,17 @@ mod tests {
     // --- Слоистая память как обёртка над стратегией (decouple-memory-layers) ---
 
     fn dummy_message(role: Role, seq: i64, content: &str) -> store::ChatMessage {
-        store::ChatMessage { seq, role, content: content.to_string(), reasoning: None, meta: None, created_at: 0 }
+        store::ChatMessage {
+            seq,
+            role,
+            content: content.to_string(),
+            reasoning: None,
+            meta: None,
+            created_at: 0,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        }
     }
 
     #[tokio::test]
@@ -334,7 +348,7 @@ mod tests {
             "owner-1",
             ContextStrategy::Summary,
             stored,
-            Message::user("новое"),
+            vec![Message::user("новое")],
         )
         .await;
 
@@ -384,7 +398,7 @@ mod tests {
             "owner-1",
             ContextStrategy::Summary,
             stored,
-            Message::user("новое"),
+            vec![Message::user("новое")],
         )
         .await;
 
@@ -419,7 +433,7 @@ mod tests {
             "owner-1",
             ContextStrategy::Summary,
             Vec::new(),
-            Message::user("новое"),
+            vec![Message::user("новое")],
         )
         .await;
         assert_eq!(assembled.context.profile_id.as_deref(), Some("teacher"));
@@ -445,7 +459,7 @@ mod tests {
             "owner-1",
             ContextStrategy::Summary,
             Vec::new(),
-            Message::user("новое"),
+            vec![Message::user("новое")],
         )
         .await;
         assert_eq!(assembled.context.profile_id.as_deref(), Some("reviewer"));
@@ -469,7 +483,7 @@ mod tests {
             "owner-1",
             ContextStrategy::Summary,
             Vec::new(),
-            Message::user("новое"),
+            vec![Message::user("новое")],
         )
         .await;
         let system = &assembled.history[0].content;
@@ -496,7 +510,7 @@ mod tests {
                 "owner-1",
                 strategy,
                 Vec::new(),
-                Message::user("новое"),
+                vec![Message::user("новое")],
             )
             .await;
 
@@ -513,7 +527,7 @@ mod tests {
                 "owner-1",
                 strategy,
                 Vec::new(),
-                Message::user("новое"),
+                vec![Message::user("новое")],
             )
             .await;
 
@@ -559,7 +573,7 @@ mod tests {
             "owner-1",
             ContextStrategy::Summary,
             Vec::new(),
-            Message::user("новое"),
+            vec![Message::user("новое")],
         )
         .await;
         let system = &assembled.history[0].content;
@@ -583,7 +597,7 @@ mod tests {
                 .expect("рабочая запись");
 
             let assembled =
-                assemble(&state, &chat, &settings, "owner-1", strategy, Vec::new(), Message::user("новое")).await;
+                assemble(&state, &chat, &settings, "owner-1", strategy, Vec::new(), vec![Message::user("новое")]).await;
 
             let system = &assembled.history[0].content;
             assert!(

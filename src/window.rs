@@ -7,12 +7,7 @@ use crate::store::ChatMessage;
 use agentcore::agent::Message;
 
 fn message_from_stored(stored: ChatMessage) -> Message {
-    Message {
-        role: stored.role,
-        content: stored.content,
-        reasoning: stored.reasoning,
-        meta: stored.meta,
-    }
+    stored.into_message()
 }
 
 /// Итог сборки: история для провайдера и число отброшенных сообщений.
@@ -26,14 +21,14 @@ pub struct WindowOutcome {
 /// пользователя, с границей, сдвинутой к сообщению пользователя
 /// (specs/context-sliding-window, «Окно начинается с сообщения
 /// пользователя»).
-pub fn assemble(stored: Vec<ChatMessage>, window_size: u32, new_message: Message) -> WindowOutcome {
+pub fn assemble(stored: Vec<ChatMessage>, window_size: u32, new_messages: Vec<Message>) -> WindowOutcome {
     let boundary = crate::summary::tail_boundary(&stored, window_size);
     let dropped_messages = boundary as u32;
     let tail = &stored[boundary..];
     let sent_messages = tail.len() as u32;
 
     let mut history: Vec<Message> = tail.iter().cloned().map(message_from_stored).collect();
-    history.push(new_message);
+    history.extend(new_messages);
 
     WindowOutcome {
         history,
@@ -59,6 +54,9 @@ mod tests {
             reasoning: None,
             meta: None,
             created_at: 0,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
         }
     }
 
@@ -67,7 +65,7 @@ mod tests {
     #[test]
     fn history_shorter_than_window_is_sent_whole() {
         let stored = vec![message(Role::User, 1, "привет"), message(Role::Assistant, 2, "привет!")];
-        let outcome = assemble(stored, 6, Message::user("как дела?"));
+        let outcome = assemble(stored, 6, vec![Message::user("как дела?")]);
         assert_eq!(outcome.sent_messages, 2);
         assert_eq!(outcome.dropped_messages, 0);
         assert_eq!(outcome.history.len(), 3);
@@ -84,7 +82,7 @@ mod tests {
                 }
             })
             .collect();
-        let outcome = assemble(stored, 6, Message::user("новое сообщение"));
+        let outcome = assemble(stored, 6, vec![Message::user("новое сообщение")]);
         assert_eq!(outcome.sent_messages, 6);
         assert_eq!(outcome.dropped_messages, 14);
         assert_eq!(outcome.history.len(), 7);
@@ -103,7 +101,7 @@ mod tests {
                 }
             })
             .collect();
-        let outcome = assemble(stored, 6, Message::user("новое сообщение"));
+        let outcome = assemble(stored, 6, vec![Message::user("новое сообщение")]);
         // Отброшено на одно больше расчётного окна — граница сдвинута.
         assert_eq!(outcome.dropped_messages, 15);
         assert_eq!(outcome.sent_messages, 5);
@@ -113,7 +111,7 @@ mod tests {
     #[test]
     fn window_exactly_matches_history_length() {
         let stored = vec![message(Role::User, 1, "привет"), message(Role::Assistant, 2, "привет!")];
-        let outcome = assemble(stored, 2, Message::user("ещё"));
+        let outcome = assemble(stored, 2, vec![Message::user("ещё")]);
         assert_eq!(outcome.dropped_messages, 0);
         assert_eq!(outcome.sent_messages, 2);
     }

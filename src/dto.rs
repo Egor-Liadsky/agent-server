@@ -1,7 +1,7 @@
 //! Типы запроса и ответа контракта `/v1`.
 
 use crate::store;
-use agentcore::agent::{AgentReply, Message, MessageMeta, Role};
+use agentcore::agent::{AgentReply, Message, MessageMeta, Role, ToolCall, ToolSpec};
 use agentcore::config::{
     ChatSettings, ContextStrategy, Provider, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode,
 };
@@ -21,16 +21,46 @@ pub struct ChatRequest {
     /// (см. `POST /v1/chat` в specs/chat-api).
     #[serde(default)]
     pub chat_id: Option<String>,
+    /// Инструменты, доступные модели на этом вызове. Не сохраняются в чате:
+    /// их набор — свойство запуска клиента, а не чата. Пустой список
+    /// равносилен отсутствию поля.
+    #[serde(default)]
+    pub tools: Option<Vec<ToolSpec>>,
+    /// Результаты вызовов инструментов — продолжение хода в чате вместо
+    /// `prompt`. Выполняет инструменты клиент: сервис процессов не
+    /// запускает и файловой системы пользователя не видит.
+    #[serde(default)]
+    pub tool_results: Option<Vec<ToolResultDto>>,
     /// Произвольные данные клиента: принимаются и на вызов модели не влияют.
     #[serde(default)]
     #[allow(dead_code)]
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Результат вызова инструмента, выполненного клиентом.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResultDto {
+    pub tool_call_id: String,
+    /// Имя инструмента. Не задано — берётся из вызова, на который отвечает
+    /// результат.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageDto {
     pub role: RoleDto,
+    /// У ответа модели из одних вызовов инструментов текст пуст.
+    #[serde(default)]
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -38,6 +68,8 @@ pub struct MessageDto {
 pub enum RoleDto {
     User,
     Assistant,
+    /// Результат вызова инструмента.
+    Tool,
 }
 
 impl From<RoleDto> for Role {
@@ -45,16 +77,23 @@ impl From<RoleDto> for Role {
         match role {
             RoleDto::User => Role::User,
             RoleDto::Assistant => Role::Assistant,
+            RoleDto::Tool => Role::Tool,
         }
     }
 }
 
 impl MessageDto {
     pub fn into_message(self) -> Message {
-        match self.role {
+        let mut message = match self.role {
             RoleDto::User => Message::user(self.content),
-            RoleDto::Assistant => Message::assistant(self.content),
+            RoleDto::Assistant => Message::assistant_with_tool_calls(self.content, self.tool_calls),
+            RoleDto::Tool => Message::plain(Role::Tool, self.content),
+        };
+        if matches!(message.role, Role::Tool) {
+            message.tool_call_id = self.tool_call_id;
+            message.tool_name = self.tool_name;
         }
+        message
     }
 }
 
@@ -164,6 +203,18 @@ pub struct ChatSettingsDto {
     /// поля, что и у `summary_enabled`.
     #[serde(default, deserialize_with = "double_option")]
     pub task_state_auto_enabled: Option<Option<bool>>,
+    /// Настройки git-инструментов клиента. Сервис их не использует, но
+    /// хранит: иначе настройка, сохранённая через `PATCH`, не пережила бы
+    /// перезагрузку списка чатов. Та же семантика присутствия поля, что и у
+    /// `summary_enabled`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub git_tools_enabled: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub git_repository: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub git_allowed_tools: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub tool_max_iterations: Option<Option<u32>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -263,6 +314,18 @@ impl ChatSettingsDto {
         defaults.task_state_enabled = self.task_state_enabled.unwrap_or(defaults.task_state_enabled);
         defaults.task_state_auto_enabled =
             self.task_state_auto_enabled.unwrap_or(defaults.task_state_auto_enabled);
+        if let Some(Some(iterations)) = self.tool_max_iterations
+            && (iterations == 0 || iterations > agentcore::config::MAX_TOOL_ITERATIONS)
+        {
+            return Err(format!(
+                "tool_max_iterations должен быть от 1 до {}",
+                agentcore::config::MAX_TOOL_ITERATIONS
+            ));
+        }
+        defaults.git_tools_enabled = self.git_tools_enabled.unwrap_or(defaults.git_tools_enabled);
+        defaults.git_repository = self.git_repository.unwrap_or(defaults.git_repository);
+        defaults.git_allowed_tools = self.git_allowed_tools.unwrap_or(defaults.git_allowed_tools);
+        defaults.tool_max_iterations = self.tool_max_iterations.unwrap_or(defaults.tool_max_iterations);
         Ok(defaults)
     }
 }
@@ -293,6 +356,10 @@ pub struct ChatResponse {
     /// «Наблюдаемость компактизации»).
     #[serde(default)]
     pub context: Option<ContextDto>,
+    /// Вызовы инструментов, которые запросила модель. Присутствует всегда;
+    /// пустой массив — ответ окончательный.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// Что действующая стратегия сделала со сборкой истории этого запроса.
@@ -592,6 +659,7 @@ impl ChatResponse {
             chat_id: None,
             seq: None,
             context: None,
+            tool_calls: reply.tool_calls.clone(),
         }
     }
 
@@ -678,6 +746,12 @@ pub struct MessageView {
     pub usage: Option<UsageDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingDto>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 impl From<store::ChatMessage> for MessageView {
@@ -689,6 +763,7 @@ impl From<store::ChatMessage> for MessageView {
             // решение 4): ветка — только защита от несуществующего на
             // практике случая, `RoleDto` варианта `System` не имеет.
             Role::System => RoleDto::User,
+            Role::Tool => RoleDto::Tool,
         };
         let (reasoning, model, usage, timing) = if matches!(message.role, Role::Assistant) {
             let usage = message.meta.as_ref().map(UsageDto::from);
@@ -707,6 +782,9 @@ impl From<store::ChatMessage> for MessageView {
             model,
             usage,
             timing,
+            tool_calls: message.tool_calls,
+            tool_call_id: message.tool_call_id,
+            tool_name: message.tool_name,
         }
     }
 }
@@ -742,6 +820,14 @@ pub struct NewMessageDto {
     pub usage: Option<UsageDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingDto>,
+    /// Вызовы инструментов у ответа модели (ход локальной модели с
+    /// инструментами дозаписывается клиентом целиком).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 impl NewMessageDto {
@@ -755,6 +841,21 @@ impl NewMessageDto {
                 content: self.content,
                 reasoning: None,
                 meta: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+            };
+        }
+        // Результат инструмента — не ответ модели: телеметрии у него нет.
+        if matches!(role, Role::Tool) {
+            return store::NewMessage {
+                role,
+                content: self.content,
+                reasoning: None,
+                meta: None,
+                tool_calls: Vec::new(),
+                tool_call_id: self.tool_call_id,
+                tool_name: self.tool_name,
             };
         }
 
@@ -785,6 +886,9 @@ impl NewMessageDto {
             content: self.content,
             reasoning: self.reasoning,
             meta: has_telemetry.then_some(meta),
+            tool_calls: self.tool_calls,
+            tool_call_id: None,
+            tool_name: None,
         }
     }
 }

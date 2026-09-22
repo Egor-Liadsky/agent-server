@@ -16,7 +16,7 @@ use crate::state::AppState;
 use crate::store;
 use crate::summary;
 use crate::telemetry::{log_exchange, ExchangeRecord};
-use agentcore::agent::{Agent, Message};
+use agentcore::agent::{Agent, Message, Role, ToolCall, ToolSpec};
 use agentcore::config::{ChatSettings, Provider, ReasoningMode, ThinkingMode};
 use agentcore::pipeline::{Pipeline, PipelineOutcome, RequestContext};
 use axum::extract::{Extension, Path, Query, State};
@@ -45,6 +45,12 @@ pub(crate) const MAX_CHAT_TITLE_LEN: usize = 200;
 /// Предел одной дозаписи: обмен с локальной моделью — это две реплики, а
 /// запас нужен только на повтор после неудачи, не на выгрузку истории.
 const MAX_APPEND_MESSAGES: usize = 100;
+/// Предел числа инструментов в одном запросе: описания уходят провайдеру в
+/// каждом запросе хода, и длинный список лишь съедает контекст.
+const MAX_TOOLS: usize = 128;
+/// Предел длины имени инструмента — тот же, что у провайдеров
+/// OpenAI-совместимого формата.
+const MAX_TOOL_NAME_LEN: usize = 64;
 
 /// Живость процесса. Никаких обращений к провайдеру: эндпоинт отвечает,
 /// пока жив сам процесс.
@@ -105,7 +111,16 @@ fn contains_invariants_field(value: &serde_json::Value) -> bool {
 fn estimate_tokens(history: &[Message]) -> u32 {
     let chars: usize = history
         .iter()
-        .map(|message| role_str(&message.role).len() + message.content.chars().count())
+        .map(|message| {
+            let calls = if message.tool_calls.is_empty() {
+                0
+            } else {
+                serde_json::to_string(&message.tool_calls)
+                    .map(|json| json.chars().count())
+                    .unwrap_or(0)
+            };
+            role_str(&message.role).len() + message.content.chars().count() + calls
+        })
         .sum();
     (chars as u64).div_ceil(4) as u32
 }
@@ -115,7 +130,76 @@ fn role_str(role: &agentcore::agent::Role) -> &'static str {
         agentcore::agent::Role::User => "user",
         agentcore::agent::Role::Assistant => "assistant",
         agentcore::agent::Role::System => "system",
+        agentcore::agent::Role::Tool => "tool",
     }
+}
+
+/// Проверка описаний инструментов из запроса. Пустой список равносилен
+/// отсутствию поля.
+fn validate_tools(tools: Option<Vec<ToolSpec>>) -> Result<Vec<ToolSpec>, ApiError> {
+    let tools = tools.unwrap_or_default();
+    if tools.len() > MAX_TOOLS {
+        return Err(ApiError::tools_invalid(format!(
+            "инструментов не может быть больше {MAX_TOOLS}"
+        )));
+    }
+    let mut names = std::collections::HashSet::new();
+    for tool in &tools {
+        let valid_name = !tool.name.is_empty()
+            && tool.name.len() <= MAX_TOOL_NAME_LEN
+            && tool
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !valid_name {
+            return Err(ApiError::tools_invalid(format!(
+                "недопустимое имя инструмента «{}»: разрешены латинские буквы, цифры, _ и -, до {MAX_TOOL_NAME_LEN} символов",
+                tool.name
+            )));
+        }
+        if !names.insert(tool.name.as_str()) {
+            return Err(ApiError::tools_invalid(format!(
+                "инструмент {} описан дважды",
+                tool.name
+            )));
+        }
+        if !tool.parameters.is_object() {
+            return Err(ApiError::tools_invalid(format!(
+                "parameters инструмента {} должен быть JSON-объектом",
+                tool.name
+            )));
+        }
+    }
+    Ok(tools)
+}
+
+/// Проверка связей «вызов → результат» в истории, присланной целиком: каждый
+/// результат роли `tool` отвечает на вызов ответа модели, после которого
+/// стоит (в сплошной группе результатов), по `tool_call_id`, а без него — по
+/// имени инструмента.
+fn validate_tool_messages(history: &[Message]) -> Result<(), ApiError> {
+    let mut calls: Option<&[ToolCall]> = None;
+    for message in history {
+        match message.role {
+            Role::Tool => {
+                let matched = calls.is_some_and(|calls| {
+                    calls.iter().any(|call| match &message.tool_call_id {
+                        Some(id) => &call.id == id,
+                        None => message.tool_name.as_deref() == Some(call.name.as_str()),
+                    })
+                });
+                if !matched {
+                    return Err(ApiError::tool_results_mismatch(
+                        "результат инструмента не ссылается на вызов предыдущего ответа модели",
+                    ));
+                }
+            }
+            _ => {
+                calls = (!message.tool_calls.is_empty()).then_some(message.tool_calls.as_slice());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Эффективный лимит контекстного окна на этот запрос: минимум из заданных
@@ -189,9 +273,9 @@ pub(crate) struct CompactionOutcome {
     pub(crate) summary_section: Option<String>,
 }
 
-fn history_without_compaction(stored: Vec<store::ChatMessage>, new_message: Message) -> CompactionOutcome {
+fn history_without_compaction(stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> CompactionOutcome {
     let mut history: Vec<Message> = stored.into_iter().map(message_from_stored).collect();
-    history.push(new_message);
+    history.extend(new_messages);
     CompactionOutcome {
         history,
         replaced_messages: 0,
@@ -209,15 +293,15 @@ pub(crate) async fn compact_history(
     chat_id: &str,
     settings: &ChatSettings,
     stored: Vec<store::ChatMessage>,
-    new_message: Message,
+    new_messages: Vec<Message>,
 ) -> CompactionOutcome {
     let effective = effective_summary_settings(state, settings);
     if !effective.enabled {
-        return history_without_compaction(stored, new_message);
+        return history_without_compaction(stored, new_messages);
     }
     let boundary = summary::tail_boundary(&stored, effective.keep_messages);
     if boundary == 0 {
-        return history_without_compaction(stored, new_message);
+        return history_without_compaction(stored, new_messages);
     }
 
     let existing = match store::load_summary(&state.db, chat_id).await {
@@ -240,7 +324,7 @@ pub(crate) async fn compact_history(
             // Прежний пересказ есть — подставляем его без обращения к модели.
             Some(text) => {
                 let tail = &stored[boundary..];
-                let history = summary::assemble_history(tail, new_message);
+                let history = summary::assemble_history(tail, new_messages);
                 CompactionOutcome {
                     history,
                     replaced_messages: boundary as u32,
@@ -250,7 +334,7 @@ pub(crate) async fn compact_history(
             }
             // Пересказа ещё нет, а порог не достигнут: компактизация ещё не
             // начала действовать — история уходит целиком.
-            None => history_without_compaction(stored, new_message),
+            None => history_without_compaction(stored, new_messages),
         };
     }
 
@@ -296,7 +380,7 @@ pub(crate) async fn compact_history(
     match final_summary {
         Some(text) => {
             let tail = &stored[boundary..];
-            let history = summary::assemble_history(tail, new_message);
+            let history = summary::assemble_history(tail, new_messages);
             CompactionOutcome {
                 history,
                 replaced_messages: boundary as u32,
@@ -304,7 +388,7 @@ pub(crate) async fn compact_history(
                 summary_section: Some(summary::summary_section(&text)),
             }
         }
-        None => history_without_compaction(stored, new_message),
+        None => history_without_compaction(stored, new_messages),
     }
 }
 
@@ -327,11 +411,15 @@ fn history_from(request: &ChatRequest) -> Result<Vec<Message>, ApiError> {
             "задайте одно из полей prompt или messages",
         )),
         (Some(prompt), None) => Ok(vec![Message::user(prompt)]),
-        (None, Some(messages)) => Ok(messages
-            .iter()
-            .cloned()
-            .map(|message| message.into_message())
-            .collect()),
+        (None, Some(messages)) => {
+            let history: Vec<Message> = messages
+                .iter()
+                .cloned()
+                .map(|message| message.into_message())
+                .collect();
+            validate_tool_messages(&history)?;
+            Ok(history)
+        }
     }
 }
 
@@ -538,12 +626,7 @@ fn validate_title(title: Option<String>) -> Result<Option<String>, ApiError> {
 }
 
 fn message_from_stored(message: store::ChatMessage) -> Message {
-    Message {
-        role: message.role,
-        content: message.content,
-        reasoning: message.reasoning,
-        meta: message.meta,
-    }
+    message.into_message()
 }
 
 /// Текст запроса для журнала: он записывается только при включённом
@@ -551,6 +634,15 @@ fn message_from_stored(message: store::ChatMessage) -> Message {
 fn prompt_preview(body: &serde_json::Value) -> String {
     if let Some(prompt) = body.get("prompt").and_then(|value| value.as_str()) {
         return prompt.to_string();
+    }
+    // Результаты инструментов — содержимое запроса наравне с `prompt`:
+    // попадают в журнал только при включённой записи содержимого.
+    if let Some(results) = body.get("tool_results").and_then(|value| value.as_array()) {
+        return results
+            .iter()
+            .filter_map(|result| result.get("content").and_then(|content| content.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
     }
     body.get("messages")
         .and_then(|value| value.as_array())
@@ -644,6 +736,12 @@ async fn handle_chat_without_storage(
     owner: String,
     request: ChatRequest,
 ) -> Result<ChatResponse, ApiError> {
+    if request.tool_results.as_ref().is_some_and(|results| !results.is_empty()) {
+        return Err(ApiError::invalid_request(
+            "tool_results принимаются только вместе с chat_id: без чата результаты передаются сообщениями роли tool в messages",
+        ));
+    }
+    let tools = validate_tools(request.tools.clone())?;
     let history = history_from(&request)?;
     let settings =
         merge_settings(&state, &owner, server_defaults(&state), request.settings, SettingsPurpose::Call).await?;
@@ -658,22 +756,20 @@ async fn handle_chat_without_storage(
     let pipeline = Pipeline::new(state.agent.clone())
         .with_output_policies(agentcore::invariants::default_output_policies(state.agent.clone()));
     let context = RequestContext::new(request_id.clone(), history, settings)
-        .with_invariants((*state.invariants).clone());
+        .with_invariants((*state.invariants).clone())
+        .with_tools(tools);
     let (reply, policy) = run_pipeline(&pipeline, context, &request_id).await?;
     Ok(ChatResponse::new(request_id, model, &reply, policy))
 }
 
-/// `POST /v1/chat` с `chat_id`: история берётся из хранилища, клиент
-/// присылает только новое сообщение, обмен пишется одной транзакцией после
-/// успешного ответа модели (specs/chat-api, «Диалог в существующем чате»;
-/// design.md, решение 9).
-async fn handle_chat_in_existing(
-    state: AppState,
-    request_id: String,
-    owner: String,
-    chat_id: String,
-    request: ChatRequest,
-) -> Result<ChatResponse, ApiError> {
+/// Что клиент прислал в существующий чат: новую реплику или результаты
+/// инструментов, продолжающие незавершённый ход.
+enum TurnInput {
+    Prompt(String),
+    ToolResults(Vec<crate::dto::ToolResultDto>),
+}
+
+fn turn_input(request: &ChatRequest) -> Result<TurnInput, ApiError> {
     if request.messages.is_some() {
         return Err(ApiError::invalid_request(
             "поле messages вместе с chat_id не принимается: история берётся из чата",
@@ -683,9 +779,75 @@ async fn handle_chat_in_existing(
         .prompt
         .as_deref()
         .map(str::trim)
-        .filter(|prompt| !prompt.is_empty())
-        .ok_or_else(|| ApiError::invalid_request("для chat_id обязательно поле prompt"))?
-        .to_string();
+        .filter(|prompt| !prompt.is_empty());
+    let results = request
+        .tool_results
+        .as_ref()
+        .filter(|results| !results.is_empty());
+    match (prompt, results) {
+        (Some(_), Some(_)) => Err(ApiError::invalid_request(
+            "задайте ровно одно из полей prompt и tool_results",
+        )),
+        (None, None) => Err(ApiError::invalid_request(
+            "для chat_id обязательно поле prompt или tool_results",
+        )),
+        (Some(prompt), None) => Ok(TurnInput::Prompt(prompt.to_string())),
+        (None, Some(results)) => Ok(TurnInput::ToolResults(results.clone())),
+    }
+}
+
+/// Результаты инструментов как сообщения истории. Принимаются, только если
+/// последнее сообщение активной ветки — ответ модели с вызовами, а
+/// множество присланных `tool_call_id` совпадает с множеством `id` этих
+/// вызовов: иначе модель получила бы ответ не на свой вопрос.
+fn tool_results_for(
+    stored: &[store::ChatMessage],
+    results: Vec<crate::dto::ToolResultDto>,
+) -> Result<Vec<Message>, ApiError> {
+    let calls = match stored.last() {
+        Some(last) if matches!(last.role, Role::Assistant) && !last.tool_calls.is_empty() => &last.tool_calls,
+        _ => {
+            return Err(ApiError::tool_results_mismatch(
+                "последнее сообщение чата — не ответ модели с вызовами инструментов",
+            ));
+        }
+    };
+    let expected: std::collections::HashSet<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+    let received: std::collections::HashSet<&str> =
+        results.iter().map(|result| result.tool_call_id.as_str()).collect();
+    if received.len() != results.len() || expected != received {
+        return Err(ApiError::tool_results_mismatch(
+            "tool_call_id результатов должны совпадать с идентификаторами вызовов последнего ответа модели",
+        ));
+    }
+    Ok(results
+        .into_iter()
+        .map(|result| {
+            let name = result.name.unwrap_or_else(|| {
+                calls
+                    .iter()
+                    .find(|call| call.id == result.tool_call_id)
+                    .map(|call| call.name.clone())
+                    .unwrap_or_default()
+            });
+            Message::tool_result(result.tool_call_id, name, result.content)
+        })
+        .collect())
+}
+
+/// `POST /v1/chat` с `chat_id`: история берётся из хранилища, клиент
+/// присылает только новое сообщение (или результаты инструментов), обмен
+/// пишется одной транзакцией после успешного ответа модели (specs/chat-api,
+/// «Диалог в существующем чате»; design.md, решение 9).
+async fn handle_chat_in_existing(
+    state: AppState,
+    request_id: String,
+    owner: String,
+    chat_id: String,
+    request: ChatRequest,
+) -> Result<ChatResponse, ApiError> {
+    let input = turn_input(&request)?;
+    let tools = validate_tools(request.tools.clone())?;
 
     let defaults = server_defaults(&state);
     let chat = store::load_chat(&state.db, &owner, &chat_id, &defaults)
@@ -709,12 +871,36 @@ async fn handle_chat_in_existing(
     )
     .await
     .map_err(ApiError::from_store_error)?;
-    let user_message = Message::user(prompt.clone());
+
+    // Новые сообщения хода и реплика пользователя, с которой ход начался:
+    // фоновым задачам нужна именно она, а не результаты инструментов.
+    let (new_messages, prompt, turn_user_seq) = match input {
+        TurnInput::Prompt(prompt) => (vec![Message::user(prompt.clone())], prompt, None),
+        TurnInput::ToolResults(results) => {
+            let messages = tool_results_for(&stored.messages, results)?;
+            let turn_user = stored
+                .messages
+                .iter()
+                .rev()
+                .find(|message| matches!(message.role, Role::User));
+            let prompt = turn_user.map(|m| m.content.clone()).unwrap_or_default();
+            (messages, prompt, Some(turn_user.map(|m| m.seq).unwrap_or(0)))
+        }
+    };
+
     // Сборка истории — до проверки лимита контекста, чтобы стратегия успела
     // спасти чат от context_limit_exceeded, а не сработать после отказа
     // (design.md, решение 6, распространено на все стратегии решением 7).
-    let mut assembled =
-        context::assemble(&state, &chat, &settings, &owner, strategy, stored.messages, user_message.clone()).await;
+    let mut assembled = context::assemble(
+        &state,
+        &chat,
+        &settings,
+        &owner,
+        strategy,
+        stored.messages,
+        new_messages.clone(),
+    )
+    .await;
     let history = std::mem::take(&mut assembled.history);
     // Системное сообщение уходит первым при любой стратегии (design.md,
     // решение 3): его текст переиспользуется как контекст для генерации
@@ -728,34 +914,48 @@ async fn handle_chat_in_existing(
     let pipeline = Pipeline::new(state.agent.clone())
         .with_output_policies(agentcore::invariants::default_output_policies(state.agent.clone()));
     let pipeline_context = RequestContext::new(request_id.clone(), history, settings.clone())
-        .with_invariants((*state.invariants).clone());
+        .with_invariants((*state.invariants).clone())
+        .with_tools(tools);
     let (reply, policy) = run_pipeline(&pipeline, pipeline_context, &request_id).await?;
 
     let mut assistant_meta = reply.meta.clone();
     if assistant_meta.model.is_none() {
         assistant_meta.model = reply.model.clone().or_else(|| Some(model.clone()));
     }
-    let (user_row, assistant_row) = store::append_exchange(
-        &state.db,
-        &owner,
-        &chat_id,
-        store::NewMessage::from_message(user_message),
-        store::NewMessage {
-            role: agentcore::agent::Role::Assistant,
-            content: reply.content.clone(),
-            reasoning: reply.reasoning.clone(),
-            meta: Some(assistant_meta),
-        },
-    )
-    .await
-    .map_err(ApiError::from_store_error)?;
+    // Ход с инструментами пишется частями, сразу после каждого ответа
+    // модели, а не в конце хода: пишущий инструмент мог уже изменить
+    // репозиторий, и история чата обязана это отражать, даже если клиент
+    // потом упадёт.
+    let mut rows: Vec<store::NewMessage> = new_messages.into_iter().map(store::NewMessage::from_message).collect();
+    rows.push(store::NewMessage {
+        role: Role::Assistant,
+        content: reply.content.clone(),
+        reasoning: reply.reasoning.clone(),
+        meta: Some(assistant_meta),
+        tool_calls: reply.tool_calls.clone(),
+        tool_call_id: None,
+        tool_name: None,
+    });
+    let mut written = store::append_messages(&state.db, &owner, &chat_id, rows)
+        .await
+        .map_err(ApiError::from_store_error)?;
+    let assistant_row = written.pop().expect("ответ модели записан последним");
+    let user_seq = turn_user_seq.unwrap_or_else(|| written.first().map(|row| row.seq).unwrap_or(0));
+
+    let response = ChatResponse::new(request_id, model, &reply, policy).with_chat(chat_id.clone(), assistant_row.seq);
+    // Пока модель собирает данные инструментами, ход не завершён: факты,
+    // память, трекер задачи и название считаются по окончательному ответу,
+    // иначе каждая итерация цикла стоила бы им лишнего вызова модели.
+    if !reply.tool_calls.is_empty() {
+        return Ok(response.with_context(assembled.context));
+    }
 
     // Факты обновляются ПОСЛЕ записи обмена — задерживать ответ пользователю
     // вторым вызовом модели незачем, а сообщение уже целиком доступно в
     // хвосте истории (design.md, решение 5).
     if strategy == agentcore::config::ContextStrategy::Facts {
         let facts_updated =
-            crate::facts::update_after_exchange(&state, &chat_id, &settings, &prompt, user_row.seq).await;
+            crate::facts::update_after_exchange(&state, &chat_id, &settings, &prompt, user_seq).await;
         assembled.context.facts_updated = Some(facts_updated);
     }
 
@@ -818,7 +1018,7 @@ async fn handle_chat_in_existing(
 
     // Название генерируется фоном, вне ответа пользователю (design.md,
     // решение 5): ответ уже сформирован, ждать вызов модели незачем.
-    if crate::title::should_generate(&state, &chat.title, user_row.seq) {
+    if crate::title::should_generate(&state, &chat.title, user_seq) {
         let state = state.clone();
         let title_chat_id = chat_id.clone();
         let owner = owner.clone();
@@ -833,9 +1033,7 @@ async fn handle_chat_in_existing(
         ));
     }
 
-    Ok(ChatResponse::new(request_id, model, &reply, policy)
-        .with_chat(chat_id, assistant_row.seq)
-        .with_context(assembled.context))
+    Ok(response.with_context(assembled.context))
 }
 
 async fn run_pipeline(
@@ -1064,7 +1262,10 @@ async fn handle_append_messages(
         )));
     }
     for message in &request.messages {
-        if message.content.trim().is_empty() {
+        // Ответ модели из одних вызовов и результат инструмента (у
+        // `git_add` вывод пуст) законно приходят без текста.
+        let may_be_empty = !message.tool_calls.is_empty() || matches!(message.role, crate::dto::RoleDto::Tool);
+        if message.content.trim().is_empty() && !may_be_empty {
             return Err(ApiError::invalid_request(
                 "текст сообщения не должен быть пустым",
             ));

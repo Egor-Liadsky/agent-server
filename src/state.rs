@@ -1,7 +1,7 @@
 //! Общее состояние сервиса: конфигурация и единственный клиент провайдера.
 
 use crate::config::AgentdConfig;
-use agentcore::agent::{Agent, AgentReply, Message, OllamaAgent};
+use agentcore::agent::{Agent, AgentReply, Message, OllamaAgent, ToolSpec};
 use agentcore::config::{ChatSettings, Config, Provider};
 use agentcore::invariants::InvariantSet;
 use agentcore::logging::ExchangeLog;
@@ -99,6 +99,18 @@ impl Agent for ServiceAgent {
         match settings.provider {
             Provider::Cloud => self.cloud.ask(history, settings).await,
             Provider::Ollama => self.local.ask(history, settings).await,
+        }
+    }
+
+    async fn ask_with_tools(
+        &self,
+        history: &[Message],
+        settings: &ChatSettings,
+        tools: &[ToolSpec],
+    ) -> Result<AgentReply> {
+        match settings.provider {
+            Provider::Cloud => self.cloud.ask_with_tools(history, settings, tools).await,
+            Provider::Ollama => self.local.ask_with_tools(history, settings, tools).await,
         }
     }
 }

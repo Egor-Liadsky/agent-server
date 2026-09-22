@@ -29,12 +29,7 @@ pub struct FactsOutcome {
 }
 
 fn message_from_stored(stored: ChatMessage) -> Message {
-    Message {
-        role: stored.role,
-        content: stored.content,
-        reasoning: stored.reasoning,
-        meta: stored.meta,
-    }
+    stored.into_message()
 }
 
 /// Текст раздела фактов для системного сообщения — пустой набор не создаёт
@@ -56,7 +51,7 @@ pub async fn assemble(
     chat_id: &str,
     window_size: u32,
     stored: Vec<ChatMessage>,
-    new_message: Message,
+    new_messages: Vec<Message>,
 ) -> FactsOutcome {
     let facts = match store::load_facts(&state.db, chat_id).await {
         Ok(facts) => facts,
@@ -75,7 +70,7 @@ pub async fn assemble(
 
     let mut history = Vec::with_capacity(tail.len() + 1);
     history.extend(tail.iter().cloned().map(message_from_stored));
-    history.push(new_message);
+    history.extend(new_messages);
 
     FactsOutcome {
         history,
@@ -236,6 +231,9 @@ mod tests {
             reasoning: None,
             meta: None,
             created_at: 0,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
         }
     }
 
@@ -287,7 +285,7 @@ mod tests {
             .expect("факт сохранён");
 
         let stored = vec![message(Role::User, 1, "первое сообщение")];
-        let outcome = assemble(&state, &chat.id, 6, stored, Message::user("новое")).await;
+        let outcome = assemble(&state, &chat.id, 6, stored, vec![Message::user("новое")]).await;
 
         assert_eq!(outcome.facts_applied, 1);
         assert_eq!(outcome.history.len(), 2);

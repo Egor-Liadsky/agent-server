@@ -181,6 +181,7 @@ fn successful_response_has_contract_shape() {
         chat_id: None,
         seq: None,
         context: None,
+        tool_calls: Vec::new(),
     };
     let value = serde_json::to_value(&response).expect("сериализация");
     assert_eq!(value["request_id"], "req-1");
@@ -5357,4 +5358,380 @@ async fn client_supplied_invariants_field_is_rejected_before_calling_provider() 
     assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
     assert_eq!(sent.body["error"]["code"], "invalid_request");
     assert_eq!(server.received_requests().await.expect("запросы").len(), 0);
+}
+
+// --- Вызов инструментов (tool calling) ---
+
+/// Ответ провайдера из одних вызовов инструментов: `content` — `null`.
+fn provider_tool_calls(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "choices": [{ "message": {
+            "content": null,
+            "tool_calls": [{
+                "id": "call_0",
+                "type": "function",
+                "function": { "name": name, "arguments": "{}" }
+            }]
+        } }],
+        "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
+    })
+}
+
+fn git_status_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "git_status",
+        "description": "Shows the working tree status",
+        "parameters": { "type": "object", "properties": {}, "required": [] }
+    })
+}
+
+/// Число запросов к провайдеру, тело которых содержит `needle`.
+async fn provider_requests_containing(server: &MockServer, needle: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| String::from_utf8_lossy(&request.body).contains(needle))
+        .count()
+}
+
+#[tokio::test]
+async fn request_without_chat_passes_tools_and_returns_tool_calls() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains("\"tools\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_tool_calls("git_status")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({ "prompt": "что в рабочей копии?", "tools": [git_status_tool()] })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["content"], "");
+    assert_eq!(sent.body["tool_calls"][0]["id"], "call_0");
+    assert_eq!(sent.body["tool_calls"][0]["name"], "git_status");
+    assert_eq!(sent.body["tool_calls"][0]["arguments"], serde_json::json!({}));
+
+    let sent_to_provider: serde_json::Value =
+        serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(sent_to_provider["tools"][0]["function"]["name"], "git_status");
+}
+
+#[tokio::test]
+async fn final_response_always_has_empty_tool_calls() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let sent = send(state, post_chat(serde_json::json!({ "prompt": "привет" }))).await;
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["tool_calls"], serde_json::json!([]));
+    // Без инструментов поле `tools` провайдеру не уходит вовсе.
+    let body = String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body).to_string();
+    assert!(!body.contains("\"tools\""), "тело: {body}");
+}
+
+#[tokio::test]
+async fn tool_turn_in_chat_is_stored_in_parts_and_background_runs_once() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyContains(crate::title::TITLE_UPDATE_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("Статус репозитория")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(crate::title::TITLE_UPDATE_MARKER))
+        .and(BodyLacks("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_tool_calls("git_status")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(crate::title::TITLE_UPDATE_MARKER))
+        .and(BodyContains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("рабочая копия чистая")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let first = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "покажи статус", "tools": [git_status_tool()] })),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "тело: {}", first.body);
+    assert_eq!(first.body["seq"], 2);
+    assert_eq!(first.body["tool_calls"][0]["id"], "call_0");
+
+    // Промежуточный ответ фоновых задач не запускает: названия ещё нет.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(provider_requests_containing(&server, crate::title::TITLE_UPDATE_MARKER).await, 0);
+
+    let second = send(
+        state.clone(),
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "tool_results": [{ "tool_call_id": "call_0", "name": "git_status", "content": "nothing to commit" }],
+            "tools": [git_status_tool()]
+        })),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::OK, "тело: {}", second.body);
+    assert_eq!(second.body["content"], "рабочая копия чистая");
+    assert_eq!(second.body["tool_calls"], serde_json::json!([]));
+    assert_eq!(second.body["seq"], 4);
+
+    // Модель получила вызов и результат в правильной связке.
+    let continuation = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .find(|body| body.to_string().contains("\"role\":\"tool\""))
+        .expect("запрос продолжения");
+    let messages = continuation["messages"].as_array().unwrap();
+    let tool = messages.iter().find(|m| m["role"] == "tool").unwrap();
+    assert_eq!(tool["tool_call_id"], "call_0");
+    assert_eq!(tool["content"], "nothing to commit");
+    let call = messages.iter().find(|m| m.get("tool_calls").is_some()).unwrap();
+    assert_eq!(call["tool_calls"][0]["id"], "call_0");
+
+    let mut title_requests = 0;
+    for _ in 0..40 {
+        title_requests = provider_requests_containing(&server, crate::title::TITLE_UPDATE_MARKER).await;
+        if title_requests > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(title_requests, 1, "фоновые задачи запускаются один раз, после окончательного ответа");
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let messages = loaded.body["messages"].as_array().unwrap();
+    let roles: Vec<&str> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, vec!["user", "assistant", "tool", "assistant"]);
+    assert_eq!(messages[1]["tool_calls"][0]["name"], "git_status");
+    assert_eq!(messages[2]["tool_call_id"], "call_0");
+    assert_eq!(messages[2]["tool_name"], "git_status");
+    assert!(messages[3].get("tool_calls").is_none());
+}
+
+#[tokio::test]
+async fn foreign_tool_call_id_is_rejected_in_error_envelope() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_tool_calls("git_status")))
+        .mount(&server)
+        .await;
+    let state = state_with_provider(&server, &[]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let first = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "статус", "tools": [git_status_tool()] })),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "тело: {}", first.body);
+    let calls_before = server.received_requests().await.unwrap().len();
+
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "tool_results": [{ "tool_call_id": "call_999", "content": "чужой" }]
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "tool_results_mismatch");
+    assert!(!sent.request_id_header.is_empty());
+    assert_eq!(sent.body["error"]["request_id"], sent.request_id_header);
+    assert_eq!(server.received_requests().await.unwrap().len(), calls_before, "модель не вызывалась");
+}
+
+#[tokio::test]
+async fn tool_results_without_pending_calls_are_rejected() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "tool_results": [{ "tool_call_id": "call_0", "content": "x" }]
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "tool_results_mismatch");
+}
+
+#[tokio::test]
+async fn prompt_together_with_tool_results_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "prompt": "вопрос",
+            "tool_results": [{ "tool_call_id": "call_0", "content": "x" }]
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn invalid_tool_name_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    for tools in [
+        serde_json::json!([{ "name": "git status", "parameters": { "type": "object" } }]),
+        serde_json::json!([git_status_tool(), git_status_tool()]),
+        serde_json::json!([{ "name": "git_status", "parameters": "не объект" }]),
+    ] {
+        let sent = send(
+            state.clone(),
+            post_chat(serde_json::json!({ "prompt": "статус", "tools": tools })),
+        )
+        .await;
+        assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+        assert_eq!(sent.body["error"]["code"], "tools_invalid", "инструменты: {tools}");
+        assert_eq!(sent.body["error"]["request_id"], sent.request_id_header);
+    }
+}
+
+#[tokio::test]
+async fn orphan_tool_message_without_chat_is_rejected() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "messages": [
+                { "role": "user", "content": "статус" },
+                { "role": "tool", "content": "clean", "tool_call_id": "call_0", "tool_name": "git_status" }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
+    assert_eq!(sent.body["error"]["code"], "tool_results_mismatch");
+}
+
+#[tokio::test]
+async fn patch_git_tool_settings_persist_and_read_back() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": {
+                "git_tools_enabled": true,
+                "git_repository": "/tmp/git-mcp-demo",
+                "git_allowed_tools": ["git_add", "git_commit"],
+                "tool_max_iterations": 4
+            } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+
+    let loaded = send(state.clone(), request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let settings = &loaded.body["chat"]["settings"];
+    let settings = if settings.is_null() { &loaded.body["settings"] } else { settings };
+    assert_eq!(settings["git_tools_enabled"], true);
+    assert_eq!(settings["git_repository"], "/tmp/git-mcp-demo");
+    assert_eq!(settings["git_allowed_tools"], serde_json::json!(["git_add", "git_commit"]));
+    assert_eq!(settings["tool_max_iterations"], 4);
+
+    // Поля нет — значение остаётся; `null` — снимается.
+    let patched = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "git_repository": null } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+    assert!(patched.body["settings"]["git_repository"].is_null());
+    assert_eq!(patched.body["settings"]["git_tools_enabled"], true);
+
+    let rejected = send(
+        state,
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "tool_max_iterations": 0 } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "тело: {}", rejected.body);
+}
+
+#[tokio::test]
+async fn appended_tool_turn_round_trips_through_chat_history() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({ "settings": { "provider": "ollama" } })).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let appended = send(
+        state.clone(),
+        append(
+            &id,
+            serde_json::json!({ "messages": [
+                { "role": "user", "content": "статус?" },
+                { "role": "assistant", "content": "", "tool_calls": [
+                    { "id": "call_0", "name": "git_status", "arguments": {} }
+                ] },
+                { "role": "tool", "content": "clean", "tool_call_id": "call_0", "tool_name": "git_status" },
+                { "role": "assistant", "content": "всё чисто" }
+            ] }),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(appended.status, StatusCode::CREATED, "тело: {}", appended.body);
+
+    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let messages = loaded.body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[1]["tool_calls"][0]["name"], "git_status");
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_0");
 }

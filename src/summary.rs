@@ -25,8 +25,30 @@ pub fn tail_boundary(messages: &[ChatMessage], keep_messages: u32) -> usize {
     while start < len && !matches!(messages[start].role, Role::User) {
         start += 1;
     }
-    start
+    start.min(open_turn_start(messages))
 }
+
+/// Начало незавершённого хода с инструментами: индекс последнего сообщения
+/// пользователя, если история заканчивается вызовами или их результатами.
+/// Такой ход продолжается прямо сейчас (`tool_results`), и граница окна не
+/// должна отрезать ни вопрос пользователя, ни вызовы, на которые отвечают
+/// присланные результаты. Иначе — длина истории, то есть ограничения нет.
+fn open_turn_start(messages: &[ChatMessage]) -> usize {
+    let open = messages
+        .last()
+        .is_some_and(|last| !last.tool_calls.is_empty() || matches!(last.role, Role::Tool));
+    if !open {
+        return messages.len();
+    }
+    messages
+        .iter()
+        .rposition(|message| matches!(message.role, Role::User))
+        .unwrap_or(0)
+}
+
+/// Предел текста результата инструмента в запросе на пересказ: вывод
+/// `git_diff` иначе вытеснил бы из пересказа всё остальное.
+const TOOL_RESULT_SUMMARY_CHARS: usize = 2_000;
 
 /// Сообщения перед границей хвоста, ещё не вошедшие в сохранённый пересказ
 /// (`seq` больше `through_seq`).
@@ -44,6 +66,7 @@ fn role_label(role: Role) -> &'static str {
         // Системное сообщение в вытесняемой части не хранится и в пересказ
         // не попадает; ветка нужна только для исчерпывающего match.
         Role::System => "Система",
+        Role::Tool => "Инструмент",
     }
 }
 
@@ -61,7 +84,16 @@ pub fn summary_prompt(previous: Option<&str>, pending: &[&ChatMessage], max_char
     for message in pending {
         text.push_str(role_label(message.role));
         text.push_str(": ");
-        text.push_str(&message.content);
+        if matches!(message.role, Role::Tool) {
+            let mut chars = message.content.chars();
+            let head: String = chars.by_ref().take(TOOL_RESULT_SUMMARY_CHARS).collect();
+            text.push_str(&head);
+            if chars.next().is_some() {
+                text.push_str(" […]");
+            }
+        } else {
+            text.push_str(&message.content);
+        }
         text.push('\n');
     }
     text.push_str(&format!(
@@ -84,12 +116,7 @@ pub fn truncate_summary(text: &str, max_chars: u32) -> String {
 }
 
 fn message_from_stored(message: &ChatMessage) -> Message {
-    Message {
-        role: message.role,
-        content: message.content.clone(),
-        reasoning: message.reasoning.clone(),
-        meta: message.meta.clone(),
-    }
+    message.to_message()
 }
 
 /// Раздел пересказа для системного сообщения запроса.
@@ -100,10 +127,10 @@ pub fn summary_section(summary: &str) -> String {
 /// Итоговая история запроса: дословный хвост, затем новое сообщение
 /// пользователя — пересказ уходит отдельно, разделом системного сообщения
 /// (specs/context-summary, «Пересказ передаётся системным сообщением»).
-pub fn assemble_history(tail: &[ChatMessage], new_message: Message) -> Vec<Message> {
+pub fn assemble_history(tail: &[ChatMessage], new_messages: Vec<Message>) -> Vec<Message> {
     let mut history = Vec::with_capacity(tail.len() + 1);
     history.extend(tail.iter().map(message_from_stored));
-    history.push(new_message);
+    history.extend(new_messages);
     history
 }
 
@@ -120,6 +147,9 @@ mod tests {
             reasoning: None,
             meta: None,
             created_at: 0,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
         }
     }
 
@@ -178,7 +208,7 @@ mod tests {
     #[test]
     fn assembled_history_has_only_tail_and_new_message() {
         let tail = exchange(&[(5, "в3", "о3")]);
-        let history = assemble_history(&tail, Message::user("новый вопрос"));
+        let history = assemble_history(&tail, vec![Message::user("новый вопрос")]);
         assert_eq!(history.len(), 3);
         assert_eq!(history[0].content, "в3");
         assert_eq!(history[1].content, "о3");
@@ -233,5 +263,39 @@ mod tests {
         msg.meta = Some(MessageMeta::default());
         let converted = message_from_stored(&msg);
         assert!(converted.meta.is_some());
+    }
+
+    // --- Незавершённый ход с инструментами ---
+
+    fn with_calls(mut message: ChatMessage) -> ChatMessage {
+        message.tool_calls = vec![agentcore::agent::ToolCall {
+            id: "call_0".into(),
+            name: "git_status".into(),
+            arguments: serde_json::json!({}),
+        }];
+        message
+    }
+
+    #[test]
+    fn open_tool_turn_is_never_cut_by_boundary() {
+        let mut messages = exchange(&[(1, "в1", "о1"), (3, "в2", "о2")]);
+        messages.push(message(5, Role::User, "статус?"));
+        messages.push(with_calls(message(6, Role::Assistant, "")));
+        messages.push(message(7, Role::Tool, "clean"));
+        messages.push(with_calls(message(8, Role::Assistant, "")));
+        // keep = 2 отрезал бы вопрос пользователя и первый вызов хода.
+        let boundary = tail_boundary(&messages, 2);
+        assert_eq!(boundary, 4);
+        assert!(matches!(messages[boundary].role, Role::User));
+    }
+
+    #[test]
+    fn long_tool_result_is_truncated_in_summary_prompt() {
+        let long = "x".repeat(TOOL_RESULT_SUMMARY_CHARS + 500);
+        let tool = message(3, Role::Tool, &long);
+        let prompt = summary_prompt(None, &[&tool], 1000);
+        assert!(prompt.contains("Инструмент: "));
+        assert!(!prompt.contains(&long));
+        assert!(prompt.contains(" […]"));
     }
 }
