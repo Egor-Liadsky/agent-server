@@ -12,6 +12,7 @@ debug
 .DS_Store
 
 .env
+invariants.toml
 
 agentd.db
 agentd.db-wal
