@@ -9,7 +9,7 @@ use std::time::Duration;
 pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
-pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_CONCURRENCY: usize = 16;
 pub const DEFAULT_DB_PATH: &str = "agentd.db";
