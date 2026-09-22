@@ -114,6 +114,7 @@ enum RejectReason {
     MissingValue,
     ValueTooLong,
     UnknownEntryType,
+    LooksLikeSecret,
 }
 
 impl RejectReason {
@@ -125,8 +126,26 @@ impl RejectReason {
             RejectReason::MissingValue => "missing_value",
             RejectReason::ValueTooLong => "value_too_long",
             RejectReason::UnknownEntryType => "unknown_entry_type",
+            RejectReason::LooksLikeSecret => "looks_like_secret",
         }
     }
+}
+
+/// Ключевые слова, по которым `set`-операция отбрасывается как попытка
+/// сохранить секрет в память вместо ответа пользователю: память хранится в
+/// открытом виде и подмешивается в системный промпт каждого следующего
+/// чата владельца, поэтому пароль или токен в ней — постоянная утечка, а не
+/// разовая (в отличие от секрета, случайно попавшего в текст ответа, — тот
+/// хотя бы не переживает чат).
+const SECRET_LIKE_MARKERS: &[&str] = &[
+    "пароль", "password", "passwd", "токен", "token", "секрет", "secret", "api_key", "apikey",
+    "api key", "приватный ключ", "private key", "ключ доступа", "access key", "credential",
+];
+
+fn looks_like_secret(key: &str, value: &str) -> bool {
+    let key_lower = key.to_lowercase();
+    let value_lower = value.to_lowercase();
+    SECRET_LIKE_MARKERS.iter().any(|marker| key_lower.contains(marker) || value_lower.contains(marker))
 }
 
 struct Limits {
@@ -185,6 +204,9 @@ fn validate(op: RawMemoryOp, limits: &Limits) -> Result<ValidatedOp, RejectReaso
             if value.chars().count() > value_max {
                 return Err(RejectReason::ValueTooLong);
             }
+            if looks_like_secret(&key, &value) {
+                return Err(RejectReason::LooksLikeSecret);
+            }
             if layer == Layer::LongTerm {
                 let entry_type_str = entry_type.as_deref().unwrap_or("knowledge");
                 if !matches!(entry_type_str, "profile" | "decision" | "knowledge") {
@@ -219,6 +241,9 @@ fn router_prompt(long_term: &[store::LongTermMemoryEntry], working: &[store::Wor
          после её завершения (промежуточные решения, статусы, параметры именно этой задачи); \
          long_term — факт верен независимо от задачи (профиль пользователя, постоянные решения, \
          знания на будущее). При сомнении выбирай working.\n\n\
+         Пароли, токены, API-ключи и другие секреты никогда не сохраняй ни в одном из слоёв \
+         памяти: память хранится в открытом виде и попадает в системный промпт каждого следующего \
+         чата — такую операцию не предлагай, даже если пользователь прямо просит запомнить секрет.\n\n\
          {MEMORY_ROUTER_MARKER} — только то, что нужно изменить. Каждый элемент — \
          {{\"layer\":\"working\"|\"long_term\",\"op\":\"set\",\"key\":\"...\",\"value\":\"...\",\
          \"entry_type\":\"profile\"|\"decision\"|\"knowledge\" (только для long_term),\
@@ -610,6 +635,38 @@ mod tests {
             reason: None,
         };
         assert_eq!(validate(op, &limits()), Err(RejectReason::ValueTooLong));
+    }
+
+    #[test]
+    fn secret_like_key_is_rejected() {
+        let op = RawMemoryOp::Set {
+            layer: "long_term".to_string(),
+            key: Some("пароль".to_string()),
+            value: Some("0000".to_string()),
+            entry_type: Some("profile".to_string()),
+            carry_forward: false,
+            reason: None,
+        };
+        assert_eq!(validate(op, &limits()), Err(RejectReason::LooksLikeSecret));
+    }
+
+    #[test]
+    fn secret_like_value_is_rejected() {
+        let op = RawMemoryOp::Set {
+            layer: "working".to_string(),
+            key: Some("доступ".to_string()),
+            value: Some("api_key=abc123".to_string()),
+            entry_type: None,
+            carry_forward: false,
+            reason: None,
+        };
+        assert_eq!(validate(op, &limits()), Err(RejectReason::LooksLikeSecret));
+    }
+
+    #[test]
+    fn router_prompt_forbids_storing_secrets() {
+        let prompt = router_prompt(&[], &[], "тест");
+        assert!(prompt.contains("Пароли, токены, API-ключи"), "промпт должен явно запрещать сохранять секреты: {prompt}");
     }
 
     #[test]
