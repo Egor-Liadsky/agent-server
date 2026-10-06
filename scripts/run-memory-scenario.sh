@@ -3,8 +3,7 @@
 # (memory_layers | sliding_window) против запущенного agentd: сначала все
 # сообщения сценария в чате A (внутричатный контрольный вопрос — последнее
 # сообщение сценария), затем создаёт новый чат B того же владельца и задаёт
-# межчатный контрольный вопрос — данные для
-# openspec/changes/add-memory-layers/comparison.md.
+# межчатный контрольный вопрос.
 #
 # Использование: AGENTD_URL=http://127.0.0.1:8090 ./run-memory-scenario.sh <strategy>
 set -euo pipefail

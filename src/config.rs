@@ -1091,7 +1091,7 @@ mod tests {
         assert!(format!("{err}").contains("AGENTD_TASK_STEP_MAX_CHARS"));
     }
 
-    // --- AGENTD_INVARIANTS_PATH (openspec/changes/add-invariant-guardrails) ---
+    // --- AGENTD_INVARIANTS_PATH ---
 
     #[test]
     fn invariants_path_defaults_to_none_and_is_not_fatal() {

@@ -304,8 +304,8 @@ async fn chat_returns_reply_from_provider() {
     assert_eq!(sent.body["usage"]["reasoning_tokens"], 3);
     assert!(sent.body["timing"]["duration_ms"].is_number());
     assert_eq!(sent.body["policy"]["input"], serde_json::json!([]));
-    // `invariant-guard` — регистрируется по умолчанию (openspec/changes/
-    // add-invariant-guardrails) и всегда проходит без служебного вызова к
+    // `invariant-guard` — регистрируется по умолчанию и всегда проходит без
+    // служебного вызова к
     // модели, пока `AGENTD_INVARIANTS_PATH` не задан этому состоянию теста.
     assert_eq!(
         sent.body["policy"]["output"],
@@ -5257,7 +5257,7 @@ async fn resumed_task_system_message_carries_prior_stage_step_and_resume_brief()
 
 // --- Инварианты: `AGENTD_INVARIANTS_PATH`, отказ `invariant_violation`,
 // отклонение клиентского поля `invariants`
-// (openspec/changes/add-invariant-guardrails) ---
+// ---
 
 /// Маркер в теле служебного запроса `InvariantGuard` (см. приглашение в
 /// `agentcore::invariants::InvariantGuard::prompt`): отличает его от
