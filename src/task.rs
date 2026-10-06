@@ -439,6 +439,9 @@ fn parse_proposal(content: &str) -> Option<RawTrackerProposal> {
 /// пользователя, и оно живёт только в его сообщении, поэтому по одному
 /// ответу модели этот переход непроверяем.
 fn tracker_prompt(task: &store::TaskState, user_message: &str, assistant_reply: &str) -> String {
+    let user_message = user_message
+        .split_once("[[RAG_CONTEXT_BEGIN]]")
+        .map_or(user_message, |(message, _)| message);
     format!(
         "Текущее состояние задачи: этап {}, шаг «{}», ожидаемое действие «{}».\n\n\
          Последнее сообщение пользователя:\n{}\n\n\
@@ -775,6 +778,28 @@ mod tests {
         let section = system_message_section(&task);
         assert!(section.contains("паузе"));
         assert!(section.contains("бриф возобновления"));
+    }
+
+    #[test]
+    fn tracker_prompt_ignores_retrieved_document_text() {
+        let task = store::TaskState {
+            id: "t1".to_string(),
+            chat_id: "c1".to_string(),
+            stage: "planning".to_string(),
+            step: "собирает требования".to_string(),
+            expected_action: "ждёт уточнений".to_string(),
+            paused: false,
+            resume_brief: String::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let prompt = tracker_prompt(
+            &task,
+            "Срок — месяц. [[RAG_CONTEXT_BEGIN]] документ: срок — год",
+            "Понял",
+        );
+        assert!(prompt.contains("Срок — месяц."));
+        assert!(!prompt.contains("документ: срок — год"));
     }
 
     // --- Трекер: разбор ---
