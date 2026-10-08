@@ -5,6 +5,7 @@ version = 4
 [[package]]
 name = "agentcore"
 version = "0.1.0"
+source = "git+https://github.com/Egor-Liadsky/agent-cli?branch=main#7f7f8caaafa5d59bad1ee882906dea8d80aeff4b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -45,6 +46,7 @@ dependencies = [
 [[package]]
 name = "agentupstream"
 version = "0.1.0"
+source = "git+https://github.com/Egor-Liadsky/agent-cli?branch=main#7f7f8caaafa5d59bad1ee882906dea8d80aeff4b"
 dependencies = [
  "agentcore",
  "anyhow",
