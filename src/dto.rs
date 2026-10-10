@@ -3,7 +3,8 @@
 use crate::store;
 use agentcore::agent::{AgentReply, Message, MessageMeta, Role, ToolCall, ToolSpec};
 use agentcore::config::{
-    ChatSettings, ContextStrategy, Provider, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode,
+    ChatSettings, ContextStrategy, Provider, ReasoningMode, ResponseFormat, SamplingParams,
+    ThinkingMode,
 };
 use agentcore::pipeline::PolicyLog;
 use serde::{Deserialize, Serialize};
@@ -142,6 +143,9 @@ pub struct ChatSettingsDto {
     pub frequency_penalty: Option<Option<f32>>,
     #[serde(default, deserialize_with = "double_option")]
     pub presence_penalty: Option<Option<f32>>,
+    /// Размер контекстного окна локальной модели Ollama; null снимает настройку.
+    #[serde(default, deserialize_with = "double_option")]
+    pub ollama_num_ctx: Option<Option<u32>>,
     /// Лимит контекстного окна чата. Незаданное поле оставляет сохранённый
     /// лимит чата прежним, явный `null` снимает его, число — задаёт
     /// (сохраняется при `PATCH`, наравне с параметрами сэмплирования).
@@ -295,9 +299,13 @@ impl ChatSettingsDto {
                 .unwrap_or(defaults.sampling.presence_penalty),
         };
         defaults.sampling = sampling;
+        if self.ollama_num_ctx == Some(Some(0)) {
+            return Err("ollama_num_ctx должен быть больше нуля".to_string());
+        }
         defaults.max_context_tokens = self
             .max_context_tokens
             .unwrap_or(defaults.max_context_tokens);
+        defaults.ollama_num_ctx = self.ollama_num_ctx.unwrap_or(defaults.ollama_num_ctx);
         defaults.summary_enabled = self.summary_enabled.unwrap_or(defaults.summary_enabled);
         defaults.summary_keep_messages = self
             .summary_keep_messages
@@ -305,15 +313,24 @@ impl ChatSettingsDto {
         defaults.summary_step_messages = self
             .summary_step_messages
             .unwrap_or(defaults.summary_step_messages);
-        defaults.memory_layers_enabled = self.memory_layers_enabled.unwrap_or(defaults.memory_layers_enabled);
-        defaults.memory_router_enabled = self.memory_router_enabled.unwrap_or(defaults.memory_router_enabled);
-        defaults.memory_working_max_entries =
-            self.memory_working_max_entries.unwrap_or(defaults.memory_working_max_entries);
-        defaults.memory_long_term_max_entries =
-            self.memory_long_term_max_entries.unwrap_or(defaults.memory_long_term_max_entries);
-        defaults.task_state_enabled = self.task_state_enabled.unwrap_or(defaults.task_state_enabled);
-        defaults.task_state_auto_enabled =
-            self.task_state_auto_enabled.unwrap_or(defaults.task_state_auto_enabled);
+        defaults.memory_layers_enabled = self
+            .memory_layers_enabled
+            .unwrap_or(defaults.memory_layers_enabled);
+        defaults.memory_router_enabled = self
+            .memory_router_enabled
+            .unwrap_or(defaults.memory_router_enabled);
+        defaults.memory_working_max_entries = self
+            .memory_working_max_entries
+            .unwrap_or(defaults.memory_working_max_entries);
+        defaults.memory_long_term_max_entries = self
+            .memory_long_term_max_entries
+            .unwrap_or(defaults.memory_long_term_max_entries);
+        defaults.task_state_enabled = self
+            .task_state_enabled
+            .unwrap_or(defaults.task_state_enabled);
+        defaults.task_state_auto_enabled = self
+            .task_state_auto_enabled
+            .unwrap_or(defaults.task_state_auto_enabled);
         if let Some(Some(iterations)) = self.tool_max_iterations
             && (iterations == 0 || iterations > agentcore::config::MAX_TOOL_ITERATIONS)
         {
@@ -325,7 +342,9 @@ impl ChatSettingsDto {
         defaults.git_tools_enabled = self.git_tools_enabled.unwrap_or(defaults.git_tools_enabled);
         defaults.git_repository = self.git_repository.unwrap_or(defaults.git_repository);
         defaults.git_allowed_tools = self.git_allowed_tools.unwrap_or(defaults.git_allowed_tools);
-        defaults.tool_max_iterations = self.tool_max_iterations.unwrap_or(defaults.tool_max_iterations);
+        defaults.tool_max_iterations = self
+            .tool_max_iterations
+            .unwrap_or(defaults.tool_max_iterations);
         Ok(defaults)
     }
 }
@@ -1026,7 +1045,12 @@ pub struct WorkingMemoryEntryDto {
 
 impl From<store::WorkingMemoryEntry> for WorkingMemoryEntryDto {
     fn from(entry: store::WorkingMemoryEntry) -> Self {
-        Self { key: entry.key, value: entry.value, source: entry.source, updated_at: entry.updated_at }
+        Self {
+            key: entry.key,
+            value: entry.value,
+            source: entry.source,
+            updated_at: entry.updated_at,
+        }
     }
 }
 
@@ -1110,7 +1134,13 @@ pub struct TaskTransitionDto {
 
 impl From<store::TaskTransition> for TaskTransitionDto {
     fn from(t: store::TaskTransition) -> Self {
-        Self { from_stage: t.from_stage, to_stage: t.to_stage, source: t.source, reason: t.reason, created_at: t.created_at }
+        Self {
+            from_stage: t.from_stage,
+            to_stage: t.to_stage,
+            source: t.source,
+            reason: t.reason,
+            created_at: t.created_at,
+        }
     }
 }
 

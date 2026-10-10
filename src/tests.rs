@@ -282,6 +282,36 @@ fn partial_settings_override_only_given_fields() {
     assert_eq!(merged.provider, Provider::Cloud);
 }
 
+#[test]
+fn ollama_context_setting_is_stored_and_can_be_cleared() {
+    use crate::dto::ChatSettingsDto;
+    use agentcore::config::ChatSettings;
+
+    let defaults = ChatSettings {
+        ollama_num_ctx: Some(4096),
+        ..ChatSettings::default()
+    };
+    let set: ChatSettingsDto =
+        serde_json::from_value(serde_json::json!({"ollama_num_ctx": 8192})).expect("DTO");
+    assert_eq!(
+        set.apply_to(defaults.clone())
+            .expect("установка")
+            .ollama_num_ctx,
+        Some(8192)
+    );
+
+    let clear: ChatSettingsDto =
+        serde_json::from_value(serde_json::json!({"ollama_num_ctx": null})).expect("DTO");
+    assert_eq!(
+        clear.apply_to(defaults).expect("сброс").ollama_num_ctx,
+        None
+    );
+
+    let zero: ChatSettingsDto =
+        serde_json::from_value(serde_json::json!({"ollama_num_ctx": 0})).expect("DTO");
+    assert!(zero.apply_to(ChatSettings::default()).is_err());
+}
+
 // --- 5.4 Успешный вызов через конвейер ---
 
 #[tokio::test]
@@ -5700,14 +5730,62 @@ async fn patch_git_tool_settings_persist_and_read_back() {
         ),
     )
     .await;
-    assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "тело: {}", rejected.body);
+    assert_eq!(
+        rejected.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        rejected.body
+    );
+}
+
+#[tokio::test]
+async fn ollama_num_ctx_survives_chat_patch_and_reload() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "provider": "ollama" } }),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+
+    let patched = send(
+        state.clone(),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({ "settings": { "ollama_num_ctx": 8192 } })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
+
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
+    let settings = &loaded.body["chat"]["settings"];
+    let settings = if settings.is_null() {
+        &loaded.body["settings"]
+    } else {
+        settings
+    };
+    assert_eq!(settings["ollama_num_ctx"], 8192, "ответ: {}", loaded.body);
 }
 
 #[tokio::test]
 async fn appended_tool_turn_round_trips_through_chat_history() {
     let _guard = test_lock();
     let state = AppState::for_tests().await;
-    let created = create_chat(state.clone(), None, serde_json::json!({ "settings": { "provider": "ollama" } })).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "provider": "ollama" } }),
+    )
+    .await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
     let appended = send(
