@@ -76,6 +76,7 @@ pub async fn generate_and_save(
     chat_id: String,
     owner: String,
     settings: ChatSettings,
+    context_generation: i64,
     system_text: String,
     user_message: String,
 ) {
@@ -88,7 +89,11 @@ pub async fn generate_and_save(
     title_settings.thinking = ThinkingMode::Disabled;
     title_settings.custom_response_mode = false;
 
-    let reply = match state.agent.ask(&[Message::user(prompt)], &title_settings).await {
+    let reply = match state
+        .agent
+        .ask(&[Message::user(prompt)], &title_settings)
+        .await
+    {
         Ok(reply) => reply,
         Err(err) => {
             tracing::warn!(chat_id = %chat_id, error = %err, "не удалось сгенерировать название чата: вызов модели не удался");
@@ -101,8 +106,15 @@ pub async fn generate_and_save(
         return;
     };
 
-    match crate::store::set_title_if_default(&state.db, &owner, &chat_id, &title, crate::app::DEFAULT_CHAT_TITLE)
-        .await
+    match crate::store::set_title_if_default(
+        &state.db,
+        &owner,
+        &chat_id,
+        &title,
+        crate::app::DEFAULT_CHAT_TITLE,
+        context_generation,
+    )
+    .await
     {
         Ok(true) => {}
         Ok(false) => {
@@ -122,9 +134,18 @@ mod tests {
 
     #[test]
     fn strips_wrapping_quotes_and_trailing_dot() {
-        assert_eq!(normalize_title("\"Название чата\".").as_deref(), Some("Название чата"));
-        assert_eq!(normalize_title("«Название чата».").as_deref(), Some("Название чата"));
-        assert_eq!(normalize_title("'Название чата'").as_deref(), Some("Название чата"));
+        assert_eq!(
+            normalize_title("\"Название чата\".").as_deref(),
+            Some("Название чата")
+        );
+        assert_eq!(
+            normalize_title("«Название чата».").as_deref(),
+            Some("Название чата")
+        );
+        assert_eq!(
+            normalize_title("'Название чата'").as_deref(),
+            Some("Название чата")
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub enum StoreError {
     /// Курсор постраничной выдачи не разобран: ошибка запроса клиента, а не
     /// хранилища.
     InvalidCursor,
+    ContextReset,
     /// Отказ хранилища. Полный текст — только для журнала.
     Backend(anyhow::Error),
 }
@@ -42,6 +43,7 @@ impl std::fmt::Display for StoreError {
         match self {
             StoreError::NotFound => write!(f, "чат не найден"),
             StoreError::InvalidCursor => write!(f, "неизвестный курсор"),
+            StoreError::ContextReset => write!(f, "контекст чата был сброшен во время запроса"),
             StoreError::Backend(err) => write!(f, "{err:#}"),
         }
     }
@@ -71,6 +73,7 @@ pub struct Chat {
     /// Задача, к которой привязана рабочая память чата (design.md, решение 2).
     /// По умолчанию — идентификатор самого чата.
     pub active_task_id: String,
+    pub context_generation: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +89,7 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
+    pub context_generation: i64,
 }
 
 /// Новое сообщение перед записью: без `id` и `seq` — их назначает
@@ -185,8 +189,9 @@ pub async fn open_pool(
 ) -> anyhow::Result<SqlitePool> {
     if let Some(parent) = Path::new(db_path).parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| anyhow::anyhow!("не удалось создать каталог базы {db_path}: {err}"))?;
+            std::fs::create_dir_all(parent).map_err(|err| {
+                anyhow::anyhow!("не удалось создать каталог базы {db_path}: {err}")
+            })?;
         }
     }
 
@@ -236,7 +241,10 @@ fn parse_settings(raw: &str, chat_id: &str, defaults: &ChatSettings) -> ChatSett
     }
 }
 
-fn chat_from_row(row: &sqlx::sqlite::SqliteRow, defaults: &ChatSettings) -> Result<Chat, StoreError> {
+fn chat_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    defaults: &ChatSettings,
+) -> Result<Chat, StoreError> {
     let id: String = row.try_get("id")?;
     let settings_raw: String = row.try_get("settings")?;
     let settings = parse_settings(&settings_raw, &id, defaults);
@@ -247,6 +255,7 @@ fn chat_from_row(row: &sqlx::sqlite::SqliteRow, defaults: &ChatSettings) -> Resu
         message_count: row.try_get::<i64, _>("message_count").unwrap_or(0),
         active_branch: row.try_get("active_branch")?,
         active_task_id: row.try_get("active_task_id")?,
+        context_generation: row.try_get("context_generation")?,
         id,
         settings,
     })
@@ -260,8 +269,9 @@ pub async fn create_chat(
 ) -> Result<Chat, StoreError> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_secs();
-    let settings_json = serde_json::to_string(settings)
-        .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать настройки: {err}")))?;
+    let settings_json = serde_json::to_string(settings).map_err(|err| {
+        StoreError::Backend(anyhow::anyhow!("не удалось сериализовать настройки: {err}"))
+    })?;
 
     let mut tx = pool.begin().await?;
 
@@ -301,6 +311,7 @@ pub async fn create_chat(
         message_count: 0,
         active_branch: root_branch,
         active_task_id: id,
+        context_generation: 0,
     })
 }
 
@@ -324,9 +335,14 @@ async fn insert_root_branch(
 
 /// Чат по владельцу и идентификатору. Владелец входит в условие выборки:
 /// чужой чат и несуществующий неотличимы (design.md, решение 7).
-pub async fn load_chat(pool: &SqlitePool, owner: &str, id: &str, defaults: &ChatSettings) -> Result<Chat, StoreError> {
+pub async fn load_chat(
+    pool: &SqlitePool,
+    owner: &str,
+    id: &str,
+    defaults: &ChatSettings,
+) -> Result<Chat, StoreError> {
     let row = sqlx::query(
-        "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, c.active_task_id, \
+        "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, c.active_task_id, c.context_generation, \
                 (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
          FROM chats c WHERE c.id = ? AND c.owner = ?",
     )
@@ -359,19 +375,22 @@ pub async fn update_chat(
     let existing_raw: String = existing.try_get("settings")?;
     let existing_settings = parse_settings(&existing_raw, id, defaults);
     let new_settings = settings.cloned().unwrap_or(existing_settings);
-    let settings_json = serde_json::to_string(&new_settings)
-        .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать настройки: {err}")))?;
+    let settings_json = serde_json::to_string(&new_settings).map_err(|err| {
+        StoreError::Backend(anyhow::anyhow!("не удалось сериализовать настройки: {err}"))
+    })?;
     let now = now_secs();
 
     if let Some(title) = title {
-        sqlx::query("UPDATE chats SET title = ?, settings = ?, updated_at = ? WHERE id = ? AND owner = ?")
-            .bind(title)
-            .bind(&settings_json)
-            .bind(now)
-            .bind(id)
-            .bind(owner)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE chats SET title = ?, settings = ?, updated_at = ? WHERE id = ? AND owner = ?",
+        )
+        .bind(title)
+        .bind(&settings_json)
+        .bind(now)
+        .bind(id)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?;
     } else {
         sqlx::query("UPDATE chats SET settings = ?, updated_at = ? WHERE id = ? AND owner = ?")
             .bind(&settings_json)
@@ -386,10 +405,8 @@ pub async fn update_chat(
     load_chat(pool, owner, id, defaults).await
 }
 
-/// Обновляет название чата, только если оно всё ещё равно `expected` —
-/// закрывает гонку с ручным `PATCH /v1/chats/{id}` одним запросом: если
-/// клиент успел переименовать чат, условие не выполнится и сгенерированное
-/// название будет отброшено (specs/chat-title, design.md, решение 6).
+/// Обновляет название, только если оно ещё ожидаемое и поколение не менялось:
+/// ручное переименование и очистка чата отбрасывают запоздалый ответ модели.
 /// Возвращает `true`, если строка действительно обновилась.
 pub async fn set_title_if_default(
     pool: &SqlitePool,
@@ -397,16 +414,18 @@ pub async fn set_title_if_default(
     id: &str,
     title: &str,
     expected: &str,
+    context_generation: i64,
 ) -> Result<bool, StoreError> {
     let now = now_secs();
     let result = sqlx::query(
-        "UPDATE chats SET title = ?, updated_at = ? WHERE id = ? AND owner = ? AND title = ?",
+        "UPDATE chats SET title = ?, updated_at = ? WHERE id = ? AND owner = ? AND title = ? AND context_generation = ?",
     )
     .bind(title)
     .bind(now)
     .bind(id)
     .bind(owner)
     .bind(expected)
+    .bind(context_generation)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
@@ -464,7 +483,7 @@ pub async fn list_chats(
     let rows = match &after {
         Some((updated_at, id)) => {
             sqlx::query(
-                "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, c.active_task_id, \
+        "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, c.active_task_id, c.context_generation, \
                         (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
                  FROM chats c WHERE c.owner = ? \
                    AND (c.updated_at < ? OR (c.updated_at = ? AND c.id < ?)) \
@@ -480,7 +499,7 @@ pub async fn list_chats(
         }
         None => {
             sqlx::query(
-                "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, c.active_task_id, \
+                "SELECT c.id, c.owner, c.title, c.settings, c.created_at, c.updated_at, c.active_branch, c.active_task_id, c.context_generation, \
                         (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count \
                  FROM chats c WHERE c.owner = ? \
                  ORDER BY c.updated_at DESC, c.id DESC LIMIT ?",
@@ -541,12 +560,14 @@ async fn load_branch_link(
     chat_id: &str,
     branch_id: &str,
 ) -> Result<BranchLink, StoreError> {
-    let row = sqlx::query("SELECT id, parent_id, fork_seq FROM chat_branches WHERE id = ? AND chat_id = ?")
-        .bind(branch_id)
-        .bind(chat_id)
-        .fetch_optional(pool)
-        .await?
-        .ok_or(StoreError::NotFound)?;
+    let row = sqlx::query(
+        "SELECT id, parent_id, fork_seq FROM chat_branches WHERE id = ? AND chat_id = ?",
+    )
+    .bind(branch_id)
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(StoreError::NotFound)?;
     Ok(BranchLink {
         id: row.try_get("id")?,
         parent_id: row.try_get("parent_id")?,
@@ -588,7 +609,7 @@ async fn branch_messages_upto(
     let rows = match upto_seq {
         Some(upto) => {
             sqlx::query(
-                "SELECT seq, role, content, reasoning, meta, created_at, tool_calls, tool_call_id, tool_name FROM messages \
+                "SELECT seq, role, content, reasoning, meta, created_at, tool_calls, tool_call_id, tool_name, context_generation FROM messages \
                  WHERE branch_id = ? AND seq <= ? ORDER BY seq ASC",
             )
             .bind(branch_id)
@@ -598,7 +619,7 @@ async fn branch_messages_upto(
         }
         None => {
             sqlx::query(
-                "SELECT seq, role, content, reasoning, meta, created_at, tool_calls, tool_call_id, tool_name FROM messages \
+                "SELECT seq, role, content, reasoning, meta, created_at, tool_calls, tool_call_id, tool_name, context_generation FROM messages \
                  WHERE branch_id = ? ORDER BY seq ASC",
             )
             .bind(branch_id)
@@ -617,12 +638,20 @@ fn rows_to_messages(rows: &[sqlx::sqlite::SqliteRow]) -> Result<Vec<ChatMessage>
         let meta = meta
             .map(|raw| serde_json::from_str(&raw))
             .transpose()
-            .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось разобрать телеметрию сообщения: {err}")))?;
+            .map_err(|err| {
+                StoreError::Backend(anyhow::anyhow!(
+                    "не удалось разобрать телеметрию сообщения: {err}"
+                ))
+            })?;
         let tool_calls: Option<String> = row.try_get("tool_calls")?;
         let tool_calls = tool_calls
             .map(|raw| serde_json::from_str(&raw))
             .transpose()
-            .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось разобрать вызовы инструментов: {err}")))?
+            .map_err(|err| {
+                StoreError::Backend(anyhow::anyhow!(
+                    "не удалось разобрать вызовы инструментов: {err}"
+                ))
+            })?
             .unwrap_or_default();
         messages.push(ChatMessage {
             seq: row.try_get("seq")?,
@@ -634,6 +663,7 @@ fn rows_to_messages(rows: &[sqlx::sqlite::SqliteRow]) -> Result<Vec<ChatMessage>
             tool_calls,
             tool_call_id: row.try_get("tool_call_id")?,
             tool_name: row.try_get("tool_name")?,
+            context_generation: row.try_get("context_generation")?,
         });
     }
     Ok(messages)
@@ -688,7 +718,7 @@ pub async fn load_messages(
         // появления веток.
         let fetch_limit = i64::from(limit) + 1;
         let rows = sqlx::query(
-            "SELECT seq, role, content, reasoning, meta, created_at, tool_calls, tool_call_id, tool_name FROM messages \
+            "SELECT seq, role, content, reasoning, meta, created_at, tool_calls, tool_call_id, tool_name, context_generation FROM messages \
              WHERE branch_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
         )
         .bind(&target_branch)
@@ -730,7 +760,11 @@ async fn active_branch_of(pool: &SqlitePool, chat_id: &str) -> Result<String, St
 
 /// Ветки чата с числом собственных сообщений и признаком активной
 /// (specs/chat-branching, «Ветки перечисляются и переключаются»).
-pub async fn list_branches(pool: &SqlitePool, owner: &str, chat_id: &str) -> Result<Vec<Branch>, StoreError> {
+pub async fn list_branches(
+    pool: &SqlitePool,
+    owner: &str,
+    chat_id: &str,
+) -> Result<Vec<Branch>, StoreError> {
     let active_branch: Option<String> =
         sqlx::query_scalar("SELECT active_branch FROM chats WHERE id = ? AND owner = ?")
             .bind(chat_id)
@@ -788,14 +822,12 @@ pub async fn create_branch(
             return Err(StoreError::NotFound);
         }
     };
-
-    let fork_point_exists: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM messages WHERE branch_id = ? AND seq = ?",
-    )
-    .bind(&active_branch)
-    .bind(from_seq)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let fork_point_exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM messages WHERE branch_id = ? AND seq = ?")
+            .bind(&active_branch)
+            .bind(from_seq)
+            .fetch_optional(&mut *tx)
+            .await?;
     if fork_point_exists.is_none() {
         tx.rollback().await?;
         return Err(StoreError::NotFound);
@@ -836,11 +868,12 @@ pub async fn activate_branch(
     chat_id: &str,
     branch_id: &str,
 ) -> Result<(), StoreError> {
-    let owns_chat: Option<i64> = sqlx::query_scalar("SELECT 1 FROM chats WHERE id = ? AND owner = ?")
-        .bind(chat_id)
-        .bind(owner)
-        .fetch_optional(pool)
-        .await?;
+    let owns_chat: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM chats WHERE id = ? AND owner = ?")
+            .bind(chat_id)
+            .bind(owner)
+            .fetch_optional(pool)
+            .await?;
     if owns_chat.is_none() {
         return Err(StoreError::NotFound);
     }
@@ -903,7 +936,42 @@ pub async fn set_fact(
     value: &str,
     through_seq: i64,
 ) -> Result<Fact, StoreError> {
+    set_fact_inner(pool, chat_id, key, value, through_seq, None).await
+}
+
+pub async fn set_fact_for_generation(
+    pool: &SqlitePool,
+    chat_id: &str,
+    key: &str,
+    value: &str,
+    through_seq: i64,
+    generation: i64,
+) -> Result<(), StoreError> {
+    set_fact_inner(pool, chat_id, key, value, through_seq, Some(generation)).await?;
+    Ok(())
+}
+
+async fn set_fact_inner(
+    pool: &SqlitePool,
+    chat_id: &str,
+    key: &str,
+    value: &str,
+    through_seq: i64,
+    generation: Option<i64>,
+) -> Result<Fact, StoreError> {
     let now = now_secs();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    if let Some(generation) = generation {
+        let current: Option<i64> =
+            sqlx::query_scalar("SELECT context_generation FROM chats WHERE id = ?")
+                .bind(chat_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if current != Some(generation) {
+            tx.rollback().await?;
+            return Err(StoreError::ContextReset);
+        }
+    }
     sqlx::query(
         "INSERT INTO chat_facts (chat_id, key, value, through_seq, updated_at) \
          VALUES (?, ?, ?, ?, ?) \
@@ -915,8 +983,9 @@ pub async fn set_fact(
     .bind(value)
     .bind(through_seq)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(Fact {
         key: key.to_string(),
         value: value.to_string(),
@@ -1016,12 +1085,14 @@ pub async fn delete_working_memory(
     task_id: &str,
     key: &str,
 ) -> Result<(), StoreError> {
-    let result = sqlx::query("DELETE FROM chat_working_memory WHERE chat_id = ? AND task_id = ? AND key = ?")
-        .bind(chat_id)
-        .bind(task_id)
-        .bind(key)
-        .execute(pool)
-        .await?;
+    let result = sqlx::query(
+        "DELETE FROM chat_working_memory WHERE chat_id = ? AND task_id = ? AND key = ?",
+    )
+    .bind(chat_id)
+    .bind(task_id)
+    .bind(key)
+    .execute(pool)
+    .await?;
     if result.rows_affected() == 0 {
         return Err(StoreError::NotFound);
     }
@@ -1148,7 +1219,11 @@ pub async fn set_long_term_memory(
     }
 }
 
-pub async fn delete_long_term_memory(pool: &SqlitePool, owner: &str, id: &str) -> Result<(), StoreError> {
+pub async fn delete_long_term_memory(
+    pool: &SqlitePool,
+    owner: &str,
+    id: &str,
+) -> Result<(), StoreError> {
     let result = sqlx::query("DELETE FROM owner_long_term_memory WHERE owner = ? AND id = ?")
         .bind(owner)
         .bind(id)
@@ -1163,7 +1238,11 @@ pub async fn delete_long_term_memory(pool: &SqlitePool, owner: &str, id: &str) -
 /// Удаляет запись долговременной памяти по ключу — путь маршрутизатора,
 /// операция `delete` которого не знает `entry_type`/`id` записи, только
 /// `key` (specs/memory-layers).
-pub async fn delete_long_term_memory_by_key(pool: &SqlitePool, owner: &str, key: &str) -> Result<(), StoreError> {
+pub async fn delete_long_term_memory_by_key(
+    pool: &SqlitePool,
+    owner: &str,
+    key: &str,
+) -> Result<(), StoreError> {
     let result = sqlx::query("DELETE FROM owner_long_term_memory WHERE owner = ? AND key = ?")
         .bind(owner)
         .bind(key)
@@ -1203,12 +1282,13 @@ pub async fn finish_task(
     reason: &str,
 ) -> Result<FinishTaskResult, StoreError> {
     let mut tx = pool.begin().await?;
-    let task_id: String = sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = ? AND owner = ?")
-        .bind(chat_id)
-        .bind(owner)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(StoreError::NotFound)?;
+    let task_id: String =
+        sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = ? AND owner = ?")
+            .bind(chat_id)
+            .bind(owner)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
 
     let now = now_secs();
 
@@ -1305,7 +1385,10 @@ pub async fn finish_task(
         .await?;
 
     tx.commit().await?;
-    Ok(FinishTaskResult { transferred, new_task_id })
+    Ok(FinishTaskResult {
+        transferred,
+        new_task_id,
+    })
 }
 
 // --- Состояние задачи: этап, шаг, ожидаемое действие, пауза, журнал
@@ -1351,19 +1434,28 @@ pub struct TaskTransition {
 /// строки в `chat_tasks` (созданный до появления этой возможности или ни
 /// разу её не касавшийся) получает `planning` с пустыми текстами
 /// (specs/task-state, «Чат, созданный до появления состояния задачи»).
-pub async fn load_task_state(pool: &SqlitePool, owner: &str, chat_id: &str) -> Result<TaskState, StoreError> {
-    let task_id: String = sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = ? AND owner = ?")
-        .bind(chat_id)
-        .bind(owner)
-        .fetch_optional(pool)
-        .await?
-        .ok_or(StoreError::NotFound)?;
+pub async fn load_task_state(
+    pool: &SqlitePool,
+    owner: &str,
+    chat_id: &str,
+) -> Result<TaskState, StoreError> {
+    let task_id: String =
+        sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = ? AND owner = ?")
+            .bind(chat_id)
+            .bind(owner)
+            .fetch_optional(pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
     ensure_task_row(pool, chat_id, &task_id).await
 }
 
 /// Заводит строку задачи, если её ещё нет (design.md, решение 2), и
 /// возвращает актуальное состояние.
-async fn ensure_task_row(pool: &SqlitePool, chat_id: &str, task_id: &str) -> Result<TaskState, StoreError> {
+async fn ensure_task_row(
+    pool: &SqlitePool,
+    chat_id: &str,
+    task_id: &str,
+) -> Result<TaskState, StoreError> {
     let now = now_secs();
     sqlx::query(
         "INSERT OR IGNORE INTO chat_tasks \
@@ -1391,12 +1483,13 @@ pub async fn load_task_transitions(
     owner: &str,
     chat_id: &str,
 ) -> Result<Vec<TaskTransition>, StoreError> {
-    let task_id: String = sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = ? AND owner = ?")
-        .bind(chat_id)
-        .bind(owner)
-        .fetch_optional(pool)
-        .await?
-        .ok_or(StoreError::NotFound)?;
+    let task_id: String =
+        sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = ? AND owner = ?")
+            .bind(chat_id)
+            .bind(owner)
+            .fetch_optional(pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
     let rows = sqlx::query(
         "SELECT from_stage, to_stage, source, reason, created_at FROM chat_task_transitions \
          WHERE task_id = ? ORDER BY created_at ASC, id ASC",
@@ -1490,7 +1583,9 @@ pub async fn write_task_transition(
     Ok(TaskState {
         stage: to_stage.to_string(),
         step: step.unwrap_or(&current.step).to_string(),
-        expected_action: expected_action.unwrap_or(&current.expected_action).to_string(),
+        expected_action: expected_action
+            .unwrap_or(&current.expected_action)
+            .to_string(),
         updated_at: now,
         ..current
     })
@@ -1509,13 +1604,15 @@ pub async fn set_task_paused(
     let now = now_secs();
     match resume_brief {
         Some(brief) => {
-            sqlx::query("UPDATE chat_tasks SET paused = ?, resume_brief = ?, updated_at = ? WHERE id = ?")
-                .bind(paused)
-                .bind(brief)
-                .bind(now)
-                .bind(task_id)
-                .execute(pool)
-                .await?;
+            sqlx::query(
+                "UPDATE chat_tasks SET paused = ?, resume_brief = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(paused)
+            .bind(brief)
+            .bind(now)
+            .bind(task_id)
+            .execute(pool)
+            .await?;
         }
         None => {
             sqlx::query("UPDATE chat_tasks SET paused = ?, updated_at = ? WHERE id = ?")
@@ -1542,6 +1639,7 @@ pub async fn set_task_paused(
 /// через `append_messages`, потому что ход с инструментами состоит из
 /// произвольного числа сообщений; обёртка осталась для тестов хранилища.
 #[cfg(test)]
+#[cfg(test)]
 pub async fn append_exchange(
     pool: &SqlitePool,
     owner: &str,
@@ -1549,7 +1647,8 @@ pub async fn append_exchange(
     user_message: NewMessage,
     assistant_message: NewMessage,
 ) -> Result<(ChatMessage, ChatMessage), StoreError> {
-    let mut rows = append_messages(pool, owner, chat_id, vec![user_message, assistant_message]).await?;
+    let mut rows =
+        append_messages(pool, owner, chat_id, vec![user_message, assistant_message]).await?;
     let assistant_row = rows.pop().expect("две записанные реплики обмена");
     let user_row = rows.pop().expect("две записанные реплики обмена");
     Ok((user_row, assistant_row))
@@ -1560,11 +1659,32 @@ pub async fn append_exchange(
 /// одно. Номера `seq` назначает хранилище, порядок сохраняется тот же, в
 /// котором сообщения переданы. Провайдер здесь не участвует: содержимое
 /// пришло готовым (specs/chat-message-api).
+#[cfg(test)]
 pub async fn append_messages(
     pool: &SqlitePool,
     owner: &str,
     chat_id: &str,
     messages: Vec<NewMessage>,
+) -> Result<Vec<ChatMessage>, StoreError> {
+    append_messages_inner(pool, owner, chat_id, messages, None).await
+}
+
+pub async fn append_messages_for_generation(
+    pool: &SqlitePool,
+    owner: &str,
+    chat_id: &str,
+    messages: Vec<NewMessage>,
+    generation: i64,
+) -> Result<Vec<ChatMessage>, StoreError> {
+    append_messages_inner(pool, owner, chat_id, messages, Some(generation)).await
+}
+
+async fn append_messages_inner(
+    pool: &SqlitePool,
+    owner: &str,
+    chat_id: &str,
+    messages: Vec<NewMessage>,
+    expected_generation: Option<i64>,
 ) -> Result<Vec<ChatMessage>, StoreError> {
     if messages.is_empty() {
         return Err(StoreError::Backend(anyhow::anyhow!(
@@ -1574,33 +1694,52 @@ pub async fn append_messages(
 
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
-    let active_branch: Option<String> = sqlx::query_scalar(
-        "SELECT active_branch FROM chats WHERE id = ? AND owner = ?",
+    let chat: Option<sqlx::sqlite::SqliteRow> = sqlx::query(
+        "SELECT active_branch, context_generation FROM chats WHERE id = ? AND owner = ?",
     )
     .bind(chat_id)
     .bind(owner)
     .fetch_optional(&mut *tx)
     .await?;
-    let active_branch = match active_branch {
-        Some(branch) => branch,
+    let (active_branch, generation) = match chat {
+        Some(row) => (
+            row.try_get::<String, _>("active_branch")?,
+            row.try_get::<i64, _>("context_generation")?,
+        ),
         None => {
             tx.rollback().await?;
             return Err(StoreError::NotFound);
         }
     };
+    if expected_generation.is_some_and(|expected| expected != generation) {
+        tx.rollback().await?;
+        return Err(StoreError::ContextReset);
+    }
 
     // seq растёт внутри ветки, а не всего чата: у новой ветки собственная
     // нумерация с единицы (design.md, решение 3).
-    let max_seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM messages WHERE branch_id = ?")
-        .bind(&active_branch)
-        .fetch_one(&mut *tx)
-        .await?;
+    let max_seq: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM messages WHERE branch_id = ?")
+            .bind(&active_branch)
+            .fetch_one(&mut *tx)
+            .await?;
 
     let now = now_secs();
     let mut rows = Vec::with_capacity(messages.len());
     for (offset, message) in messages.iter().enumerate() {
         let seq = max_seq + 1 + offset as i64;
-        rows.push(insert_message(&mut *tx, chat_id, &active_branch, seq, message, now).await?);
+        rows.push(
+            insert_message(
+                &mut *tx,
+                chat_id,
+                &active_branch,
+                seq,
+                generation,
+                message,
+                now,
+            )
+            .await?,
+        );
     }
 
     sqlx::query("UPDATE chats SET updated_at = ? WHERE id = ?")
@@ -1622,7 +1761,10 @@ pub struct ChatSummary {
 }
 
 /// Пересказ чата, если он уже построен.
-pub async fn load_summary(pool: &SqlitePool, chat_id: &str) -> Result<Option<ChatSummary>, StoreError> {
+pub async fn load_summary(
+    pool: &SqlitePool,
+    chat_id: &str,
+) -> Result<Option<ChatSummary>, StoreError> {
     let row = sqlx::query("SELECT summary, through_seq FROM chat_summaries WHERE chat_id = ?")
         .bind(chat_id)
         .fetch_optional(pool)
@@ -1640,13 +1782,46 @@ pub async fn load_summary(pool: &SqlitePool, chat_id: &str) -> Result<Option<Cha
 /// Сохраняет пересказ чата, заменяя прежний. `through_seq` монотонно не
 /// убывает: конкурентная запись худшим исходом даёт лишний вызов модели, а
 /// не откат границы назад (design.md, риск «Параллельные запросы»).
+#[cfg(test)]
 pub async fn save_summary(
     pool: &SqlitePool,
     chat_id: &str,
     summary: &str,
     through_seq: i64,
 ) -> Result<(), StoreError> {
+    save_summary_inner(pool, chat_id, summary, through_seq, None).await
+}
+
+pub async fn save_summary_for_generation(
+    pool: &SqlitePool,
+    chat_id: &str,
+    summary: &str,
+    through_seq: i64,
+    generation: i64,
+) -> Result<(), StoreError> {
+    save_summary_inner(pool, chat_id, summary, through_seq, Some(generation)).await
+}
+
+async fn save_summary_inner(
+    pool: &SqlitePool,
+    chat_id: &str,
+    summary: &str,
+    through_seq: i64,
+    generation: Option<i64>,
+) -> Result<(), StoreError> {
     let now = now_secs();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    if let Some(generation) = generation {
+        let current: Option<i64> =
+            sqlx::query_scalar("SELECT context_generation FROM chats WHERE id = ?")
+                .bind(chat_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if current != Some(generation) {
+            tx.rollback().await?;
+            return Ok(());
+        }
+    }
     sqlx::query(
         "INSERT INTO chat_summaries (chat_id, summary, through_seq, updated_at) \
          VALUES (?, ?, ?, ?) \
@@ -1660,9 +1835,96 @@ pub async fn save_summary(
     .bind(summary)
     .bind(through_seq)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
+}
+
+/// Фиксирует постоянную границу контекста и удаляет только производные
+/// данные диалога в одной транзакции; сами сообщения остаются архивом.
+pub async fn reset_context(
+    pool: &SqlitePool,
+    owner: &str,
+    chat_id: &str,
+) -> Result<i64, StoreError> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let result = sqlx::query("UPDATE chats SET context_generation = context_generation + 1, updated_at = ? WHERE id = ? AND owner = ?")
+        .bind(now_secs()).bind(chat_id).bind(owner).execute(&mut *tx).await?;
+    if result.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Err(StoreError::NotFound);
+    }
+    let generation: i64 = sqlx::query_scalar("SELECT context_generation FROM chats WHERE id = ?")
+        .bind(chat_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM chat_summaries WHERE chat_id = ?")
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM chat_facts WHERE chat_id = ?")
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(generation)
+}
+
+/// Полностью очищает данные диалога, оставляя настройки и сам чат.
+pub async fn clear_chat(pool: &SqlitePool, owner: &str, chat_id: &str) -> Result<i64, StoreError> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let branch_id = uuid::Uuid::new_v4().to_string();
+    let now = now_secs();
+    let result = sqlx::query(
+        "UPDATE chats SET title = 'Новый чат', context_generation = context_generation + 1, \
+         active_task_id = ?, updated_at = ? WHERE id = ? AND owner = ?",
+    )
+    .bind(&task_id)
+    .bind(now)
+    .bind(chat_id)
+    .bind(owner)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Err(StoreError::NotFound);
+    }
+
+    let generation: i64 = sqlx::query_scalar("SELECT context_generation FROM chats WHERE id = ?")
+        .bind(chat_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM chat_branches WHERE chat_id = ?")
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO chat_branches (id, chat_id, parent_id, fork_seq, name, created_at) VALUES (?, ?, NULL, NULL, 'root', ?)")
+        .bind(&branch_id).bind(chat_id).bind(now).execute(&mut *tx).await?;
+    sqlx::query("UPDATE chats SET active_branch = ? WHERE id = ?")
+        .bind(branch_id)
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM chat_summaries WHERE chat_id = ?")
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM chat_facts WHERE chat_id = ?")
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM chat_tasks WHERE chat_id = ?")
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM chat_working_memory WHERE chat_id = ?")
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(generation)
 }
 
 async fn insert_message(
@@ -1670,6 +1932,7 @@ async fn insert_message(
     chat_id: &str,
     branch_id: &str,
     seq: i64,
+    generation: i64,
     message: &NewMessage,
     now: i64,
 ) -> Result<ChatMessage, StoreError> {
@@ -1679,19 +1942,27 @@ async fn insert_message(
         .as_ref()
         .map(serde_json::to_string)
         .transpose()
-        .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать телеметрию: {err}")))?;
+        .map_err(|err| {
+            StoreError::Backend(anyhow::anyhow!(
+                "не удалось сериализовать телеметрию: {err}"
+            ))
+        })?;
 
     // Пустой список вызовов пишется как NULL: так же выглядят строки,
     // записанные до миграции, и чтение у них одно.
     let tool_calls_json = (!message.tool_calls.is_empty())
         .then(|| serde_json::to_string(&message.tool_calls))
         .transpose()
-        .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать вызовы инструментов: {err}")))?;
+        .map_err(|err| {
+            StoreError::Backend(anyhow::anyhow!(
+                "не удалось сериализовать вызовы инструментов: {err}"
+            ))
+        })?;
 
     sqlx::query(
         "INSERT INTO messages (id, chat_id, branch_id, seq, role, content, reasoning, meta, created_at, \
-         tool_calls, tool_call_id, tool_name) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         tool_calls, tool_call_id, tool_name, context_generation) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(chat_id)
@@ -1705,6 +1976,7 @@ async fn insert_message(
     .bind(&tool_calls_json)
     .bind(&message.tool_call_id)
     .bind(&message.tool_name)
+    .bind(generation)
     .execute(&mut *tx)
     .await?;
 
@@ -1718,6 +1990,7 @@ async fn insert_message(
         tool_calls: message.tool_calls.clone(),
         tool_call_id: message.tool_call_id.clone(),
         tool_name: message.tool_name.clone(),
+        context_generation: generation,
     })
 }
 
@@ -1755,7 +2028,10 @@ fn row_to_owner_profile(row: sqlx::sqlite::SqliteRow) -> Result<OwnerProfile, St
 }
 
 /// Собственные профили владельца, свежие первыми.
-pub async fn list_owner_profiles(pool: &SqlitePool, owner: &str) -> Result<Vec<OwnerProfile>, StoreError> {
+pub async fn list_owner_profiles(
+    pool: &SqlitePool,
+    owner: &str,
+) -> Result<Vec<OwnerProfile>, StoreError> {
     let rows = sqlx::query(
         "SELECT id, name, persona, style, format, constraints, created_at \
          FROM owner_profiles WHERE owner = ? ORDER BY created_at DESC",
@@ -1778,7 +2054,11 @@ pub async fn count_owner_profiles(pool: &SqlitePool, owner: &str) -> Result<u32,
 
 /// Один собственный профиль владельца. Чужой профиль неотличим от
 /// несуществующего (specs/user-profiles, «Чужой профиль не читается»).
-pub async fn load_owner_profile(pool: &SqlitePool, owner: &str, id: &str) -> Result<OwnerProfile, StoreError> {
+pub async fn load_owner_profile(
+    pool: &SqlitePool,
+    owner: &str,
+    id: &str,
+) -> Result<OwnerProfile, StoreError> {
     let row = sqlx::query(
         "SELECT id, name, persona, style, format, constraints, created_at \
          FROM owner_profiles WHERE owner = ? AND id = ?",
@@ -1805,8 +2085,11 @@ pub async fn create_owner_profile(
 ) -> Result<OwnerProfile, StoreError> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_secs();
-    let constraints_json = serde_json::to_string(constraints)
-        .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать ограничения: {err}")))?;
+    let constraints_json = serde_json::to_string(constraints).map_err(|err| {
+        StoreError::Backend(anyhow::anyhow!(
+            "не удалось сериализовать ограничения: {err}"
+        ))
+    })?;
     sqlx::query(
         "INSERT INTO owner_profiles \
              (id, owner, name, persona, style, format, constraints, created_at, updated_at) \
@@ -1854,8 +2137,11 @@ pub async fn update_owner_profile(
     let format = format.unwrap_or(&existing.format);
     let constraints = constraints.unwrap_or(&existing.constraints);
     let now = now_secs();
-    let constraints_json = serde_json::to_string(constraints)
-        .map_err(|err| StoreError::Backend(anyhow::anyhow!("не удалось сериализовать ограничения: {err}")))?;
+    let constraints_json = serde_json::to_string(constraints).map_err(|err| {
+        StoreError::Backend(anyhow::anyhow!(
+            "не удалось сериализовать ограничения: {err}"
+        ))
+    })?;
     sqlx::query(
         "UPDATE owner_profiles SET name = ?, persona = ?, style = ?, format = ?, constraints = ?, updated_at = ? \
          WHERE owner = ? AND id = ?",
@@ -1881,7 +2167,11 @@ pub async fn update_owner_profile(
     })
 }
 
-pub async fn delete_owner_profile(pool: &SqlitePool, owner: &str, id: &str) -> Result<(), StoreError> {
+pub async fn delete_owner_profile(
+    pool: &SqlitePool,
+    owner: &str,
+    id: &str,
+) -> Result<(), StoreError> {
     let result = sqlx::query("DELETE FROM owner_profiles WHERE owner = ? AND id = ?")
         .bind(owner)
         .bind(id)
@@ -1923,20 +2213,39 @@ mod tests {
     #[tokio::test]
     async fn working_memory_set_load_delete_round_trip() {
         let (_dir, pool) = temp_pool().await;
-        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
-
-        let applied = set_working_memory(&pool, &chat.id, &chat.active_task_id, "budget", "200000", "manual", 10)
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default())
             .await
-            .expect("запись");
+            .expect("чат");
+
+        let applied = set_working_memory(
+            &pool,
+            &chat.id,
+            &chat.active_task_id,
+            "budget",
+            "200000",
+            "manual",
+            10,
+        )
+        .await
+        .expect("запись");
         assert!(applied);
 
-        let entries = load_working_memory(&pool, &chat.id, &chat.active_task_id).await.expect("чтение");
+        let entries = load_working_memory(&pool, &chat.id, &chat.active_task_id)
+            .await
+            .expect("чтение");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].value, "200000");
         assert_eq!(entries[0].source, "manual");
 
-        delete_working_memory(&pool, &chat.id, &chat.active_task_id, "budget").await.expect("удаление");
-        assert!(load_working_memory(&pool, &chat.id, &chat.active_task_id).await.expect("чтение").is_empty());
+        delete_working_memory(&pool, &chat.id, &chat.active_task_id, "budget")
+            .await
+            .expect("удаление");
+        assert!(
+            load_working_memory(&pool, &chat.id, &chat.active_task_id)
+                .await
+                .expect("чтение")
+                .is_empty()
+        );
 
         let err = delete_working_memory(&pool, &chat.id, &chat.active_task_id, "budget")
             .await
@@ -1947,45 +2256,100 @@ mod tests {
     #[tokio::test]
     async fn working_memory_is_isolated_per_chat() {
         let (_dir, pool) = temp_pool().await;
-        let chat_a = create_chat(&pool, "owner-1", "Чат A", &ChatSettings::default()).await.expect("чат A");
-        let chat_b = create_chat(&pool, "owner-1", "Чат B", &ChatSettings::default()).await.expect("чат B");
-
-        set_working_memory(&pool, &chat_a.id, &chat_a.active_task_id, "budget", "100", "manual", 1)
+        let chat_a = create_chat(&pool, "owner-1", "Чат A", &ChatSettings::default())
             .await
-            .expect("запись в чате A");
+            .expect("чат A");
+        let chat_b = create_chat(&pool, "owner-1", "Чат B", &ChatSettings::default())
+            .await
+            .expect("чат B");
 
-        let entries_b = load_working_memory(&pool, &chat_b.id, &chat_b.active_task_id).await.expect("чтение B");
-        assert!(entries_b.is_empty(), "рабочая память не видна другому чату того же владельца");
+        set_working_memory(
+            &pool,
+            &chat_a.id,
+            &chat_a.active_task_id,
+            "budget",
+            "100",
+            "manual",
+            1,
+        )
+        .await
+        .expect("запись в чате A");
+
+        let entries_b = load_working_memory(&pool, &chat_b.id, &chat_b.active_task_id)
+            .await
+            .expect("чтение B");
+        assert!(
+            entries_b.is_empty(),
+            "рабочая память не видна другому чату того же владельца"
+        );
     }
 
     #[tokio::test]
     async fn later_update_wins_regardless_of_source() {
         let (_dir, pool) = temp_pool().await;
-        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
-
-        set_working_memory(&pool, &chat.id, &chat.active_task_id, "k", "от роутера", "router", 5)
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default())
             .await
-            .expect("ранняя автоматическая запись");
-        let applied =
-            set_working_memory(&pool, &chat.id, &chat.active_task_id, "k", "от клиента", "manual", 10)
-                .await
-                .expect("поздняя ручная запись");
+            .expect("чат");
+
+        set_working_memory(
+            &pool,
+            &chat.id,
+            &chat.active_task_id,
+            "k",
+            "от роутера",
+            "router",
+            5,
+        )
+        .await
+        .expect("ранняя автоматическая запись");
+        let applied = set_working_memory(
+            &pool,
+            &chat.id,
+            &chat.active_task_id,
+            "k",
+            "от клиента",
+            "manual",
+            10,
+        )
+        .await
+        .expect("поздняя ручная запись");
         assert!(applied);
-        let entries = load_working_memory(&pool, &chat.id, &chat.active_task_id).await.expect("чтение");
+        let entries = load_working_memory(&pool, &chat.id, &chat.active_task_id)
+            .await
+            .expect("чтение");
         assert_eq!(entries[0].value, "от клиента");
 
         // Обратный порядок по времени: ручная запись раньше, автоматическая позже.
-        let applied =
-            set_working_memory(&pool, &chat.id, &chat.active_task_id, "k2", "от клиента", "manual", 10)
-                .await
-                .expect("ранняя ручная запись");
+        let applied = set_working_memory(
+            &pool,
+            &chat.id,
+            &chat.active_task_id,
+            "k2",
+            "от клиента",
+            "manual",
+            10,
+        )
+        .await
+        .expect("ранняя ручная запись");
         assert!(applied);
-        let applied =
-            set_working_memory(&pool, &chat.id, &chat.active_task_id, "k2", "от роутера", "router", 5)
-                .await
-                .expect("вызов не должен упасть");
-        assert!(!applied, "более ранняя операция не должна применяться поверх более поздней");
-        let entries = load_working_memory(&pool, &chat.id, &chat.active_task_id).await.expect("чтение");
+        let applied = set_working_memory(
+            &pool,
+            &chat.id,
+            &chat.active_task_id,
+            "k2",
+            "от роутера",
+            "router",
+            5,
+        )
+        .await
+        .expect("вызов не должен упасть");
+        assert!(
+            !applied,
+            "более ранняя операция не должна применяться поверх более поздней"
+        );
+        let entries = load_working_memory(&pool, &chat.id, &chat.active_task_id)
+            .await
+            .expect("чтение");
         let k2 = entries.iter().find(|e| e.key == "k2").expect("запись k2");
         assert_eq!(k2.value, "от клиента");
     }
@@ -1993,36 +2357,83 @@ mod tests {
     #[tokio::test]
     async fn finish_task_transfers_carried_entries_before_clearing_and_rotates_task() {
         let (_dir, pool) = temp_pool().await;
-        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default())
+            .await
+            .expect("чат");
         let old_task_id = chat.active_task_id.clone();
 
-        set_working_memory(&pool, &chat.id, &old_task_id, "carried", "значение", "manual", 1)
-            .await
-            .expect("запись для переноса");
-        set_working_memory(&pool, &chat.id, &old_task_id, "dropped", "потеряется", "manual", 1)
-            .await
-            .expect("запись без переноса");
+        set_working_memory(
+            &pool,
+            &chat.id,
+            &old_task_id,
+            "carried",
+            "значение",
+            "manual",
+            1,
+        )
+        .await
+        .expect("запись для переноса");
+        set_working_memory(
+            &pool,
+            &chat.id,
+            &old_task_id,
+            "dropped",
+            "потеряется",
+            "manual",
+            1,
+        )
+        .await
+        .expect("запись без переноса");
 
-        let result = finish_task(&pool, "owner-1", &chat.id, &["carried".to_string()], "manual", "тест")
-            .await
-            .expect("завершение задачи");
+        let result = finish_task(
+            &pool,
+            "owner-1",
+            &chat.id,
+            &["carried".to_string()],
+            "manual",
+            "тест",
+        )
+        .await
+        .expect("завершение задачи");
         let transferred = result.transferred;
         assert_eq!(transferred.len(), 1);
         assert_eq!(transferred[0].value, "значение");
 
-        let long_term = load_long_term_memory(&pool, "owner-1", 50).await.expect("долговременная память");
-        assert!(long_term.iter().any(|e| e.key.as_deref() == Some("carried") && e.value == "значение"));
+        let long_term = load_long_term_memory(&pool, "owner-1", 50)
+            .await
+            .expect("долговременная память");
+        assert!(
+            long_term
+                .iter()
+                .any(|e| e.key.as_deref() == Some("carried") && e.value == "значение")
+        );
 
-        let reloaded = load_chat(&pool, "owner-1", &chat.id, &ChatSettings::default()).await.expect("чат");
-        assert_ne!(reloaded.active_task_id, old_task_id, "у чата новая активная задача");
-        assert_eq!(reloaded.active_task_id, result.new_task_id, "ответ несёт идентификатор новой задачи");
+        let reloaded = load_chat(&pool, "owner-1", &chat.id, &ChatSettings::default())
+            .await
+            .expect("чат");
+        assert_ne!(
+            reloaded.active_task_id, old_task_id,
+            "у чата новая активная задача"
+        );
+        assert_eq!(
+            reloaded.active_task_id, result.new_task_id,
+            "ответ несёт идентификатор новой задачи"
+        );
 
-        let old_task_entries = load_working_memory(&pool, &chat.id, &old_task_id).await.expect("чтение прежней задачи");
-        assert!(old_task_entries.is_empty(), "рабочая память прежней задачи очищена");
+        let old_task_entries = load_working_memory(&pool, &chat.id, &old_task_id)
+            .await
+            .expect("чтение прежней задачи");
+        assert!(
+            old_task_entries.is_empty(),
+            "рабочая память прежней задачи очищена"
+        );
         let new_task_entries = load_working_memory(&pool, &chat.id, &reloaded.active_task_id)
             .await
             .expect("чтение новой задачи");
-        assert!(new_task_entries.is_empty(), "новая задача начинает с пустого набора");
+        assert!(
+            new_task_entries.is_empty(),
+            "новая задача начинает с пустого набора"
+        );
     }
 
     // --- Состояние задачи: ленивое создание, переходы, пауза ---
@@ -2030,9 +2441,13 @@ mod tests {
     #[tokio::test]
     async fn task_state_of_new_chat_is_planning_with_empty_texts() {
         let (_dir, pool) = temp_pool().await;
-        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default())
+            .await
+            .expect("чат");
 
-        let task = load_task_state(&pool, "owner-1", &chat.id).await.expect("состояние задачи");
+        let task = load_task_state(&pool, "owner-1", &chat.id)
+            .await
+            .expect("состояние задачи");
         assert_eq!(task.stage, "planning");
         assert_eq!(task.step, "");
         assert_eq!(task.expected_action, "");
@@ -2045,22 +2460,30 @@ mod tests {
         // Симулирует чат, созданный до появления этой возможности: строка в
         // chat_tasks для его active_task_id никогда не создавалась.
         let (_dir, pool) = temp_pool().await;
-        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default())
+            .await
+            .expect("чат");
         sqlx::query("DELETE FROM chat_tasks WHERE id = ?")
             .bind(&chat.active_task_id)
             .execute(&pool)
             .await
             .expect("удаление строки задачи");
 
-        let task = load_task_state(&pool, "owner-1", &chat.id).await.expect("состояние задачи без ошибки");
+        let task = load_task_state(&pool, "owner-1", &chat.id)
+            .await
+            .expect("состояние задачи без ошибки");
         assert_eq!(task.stage, "planning");
     }
 
     #[tokio::test]
     async fn write_task_transition_updates_stage_and_writes_journal_entry() {
         let (_dir, pool) = temp_pool().await;
-        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
-        let task = load_task_state(&pool, "owner-1", &chat.id).await.expect("состояние задачи");
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default())
+            .await
+            .expect("чат");
+        let task = load_task_state(&pool, "owner-1", &chat.id)
+            .await
+            .expect("состояние задачи");
 
         let updated = write_task_transition(
             &pool,
@@ -2077,7 +2500,9 @@ mod tests {
         assert_eq!(updated.stage, "execution");
         assert_eq!(updated.step, "правит парсер");
 
-        let transitions = load_task_transitions(&pool, "owner-1", &chat.id).await.expect("журнал");
+        let transitions = load_task_transitions(&pool, "owner-1", &chat.id)
+            .await
+            .expect("журнал");
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].from_stage, "planning");
         assert_eq!(transitions[0].to_stage, "execution");
@@ -2087,7 +2512,9 @@ mod tests {
     #[tokio::test]
     async fn update_task_fields_without_stage_does_not_write_journal_entry() {
         let (_dir, pool) = temp_pool().await;
-        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default())
+            .await
+            .expect("чат");
 
         let updated = update_task_fields(&pool, "owner-1", &chat.id, Some("новый шаг"), None)
             .await
@@ -2095,25 +2522,43 @@ mod tests {
         assert_eq!(updated.step, "новый шаг");
         assert_eq!(updated.stage, "planning");
 
-        let transitions = load_task_transitions(&pool, "owner-1", &chat.id).await.expect("журнал");
-        assert!(transitions.is_empty(), "обновление без смены этапа не переход");
+        let transitions = load_task_transitions(&pool, "owner-1", &chat.id)
+            .await
+            .expect("журнал");
+        assert!(
+            transitions.is_empty(),
+            "обновление без смены этапа не переход"
+        );
     }
 
     #[tokio::test]
     async fn set_task_paused_is_idempotent_and_preserves_state() {
         let (_dir, pool) = temp_pool().await;
-        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
-        let task = load_task_state(&pool, "owner-1", &chat.id).await.expect("состояние задачи");
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default())
+            .await
+            .expect("чат");
+        let task = load_task_state(&pool, "owner-1", &chat.id)
+            .await
+            .expect("состояние задачи");
 
-        let paused = set_task_paused(&pool, &task.id, true, Some("бриф возобновления")).await.expect("пауза");
+        let paused = set_task_paused(&pool, &task.id, true, Some("бриф возобновления"))
+            .await
+            .expect("пауза");
         assert!(paused.paused);
         assert_eq!(paused.resume_brief, "бриф возобновления");
 
-        let paused_again = set_task_paused(&pool, &task.id, true, None).await.expect("повторная пауза");
+        let paused_again = set_task_paused(&pool, &task.id, true, None)
+            .await
+            .expect("повторная пауза");
         assert!(paused_again.paused);
-        assert_eq!(paused_again.resume_brief, "бриф возобновления", "бриф не трогается без нового значения");
+        assert_eq!(
+            paused_again.resume_brief, "бриф возобновления",
+            "бриф не трогается без нового значения"
+        );
 
-        let resumed = set_task_paused(&pool, &task.id, false, None).await.expect("снятие с паузы");
+        let resumed = set_task_paused(&pool, &task.id, false, None)
+            .await
+            .expect("снятие с паузы");
         assert!(!resumed.paused);
         assert_eq!(resumed.stage, "planning");
     }
@@ -2121,12 +2566,25 @@ mod tests {
     #[tokio::test]
     async fn finish_task_transitions_old_task_to_done_and_journals_it() {
         let (_dir, pool) = temp_pool().await;
-        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
-        let old_task_id = chat.active_task_id.clone();
-        load_task_state(&pool, "owner-1", &chat.id).await.expect("ленивое создание строки задачи");
-        write_task_transition(&pool, &old_task_id, "planning", "execution", None, None, "manual", "")
+        let chat = create_chat(&pool, "owner-1", "Чат", &ChatSettings::default())
             .await
-            .expect("переход в execution");
+            .expect("чат");
+        let old_task_id = chat.active_task_id.clone();
+        load_task_state(&pool, "owner-1", &chat.id)
+            .await
+            .expect("ленивое создание строки задачи");
+        write_task_transition(
+            &pool,
+            &old_task_id,
+            "planning",
+            "execution",
+            None,
+            None,
+            "manual",
+            "",
+        )
+        .await
+        .expect("переход в execution");
 
         let result = finish_task(&pool, "owner-1", &chat.id, &[], "manual", "готово")
             .await
@@ -2139,14 +2597,22 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("журнал прежней задачи");
-        assert_eq!(old_transitions.len(), 2, "переход в execution и переход в done");
+        assert_eq!(
+            old_transitions.len(),
+            2,
+            "переход в execution и переход в done"
+        );
         let last: String = old_transitions[1].try_get("to_stage").expect("этап");
         assert_eq!(last, "done");
 
-        let new_task = load_task_state(&pool, "owner-1", &chat.id).await.expect("новая задача");
+        let new_task = load_task_state(&pool, "owner-1", &chat.id)
+            .await
+            .expect("новая задача");
         assert_eq!(new_task.id, result.new_task_id);
         assert_eq!(new_task.stage, "planning");
-        let new_transitions = load_task_transitions(&pool, "owner-1", &chat.id).await.expect("журнал новой задачи");
+        let new_transitions = load_task_transitions(&pool, "owner-1", &chat.id)
+            .await
+            .expect("журнал новой задачи");
         assert!(new_transitions.is_empty(), "журнал новой задачи пуст");
     }
 
@@ -2155,45 +2621,98 @@ mod tests {
     #[tokio::test]
     async fn long_term_memory_set_load_delete_round_trip() {
         let (_dir, pool) = temp_pool().await;
-        let (id, applied) =
-            set_long_term_memory(&pool, "owner-1", "decision", Some("auth_provider"), "Clerk", "manual", None, 1)
-                .await
-                .expect("запись");
+        let (id, applied) = set_long_term_memory(
+            &pool,
+            "owner-1",
+            "decision",
+            Some("auth_provider"),
+            "Clerk",
+            "manual",
+            None,
+            1,
+        )
+        .await
+        .expect("запись");
         assert!(applied);
 
-        let entries = load_long_term_memory(&pool, "owner-1", 50).await.expect("чтение");
+        let entries = load_long_term_memory(&pool, "owner-1", 50)
+            .await
+            .expect("чтение");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].value, "Clerk");
 
-        delete_long_term_memory(&pool, "owner-1", &id).await.expect("удаление");
-        assert!(load_long_term_memory(&pool, "owner-1", 50).await.expect("чтение").is_empty());
+        delete_long_term_memory(&pool, "owner-1", &id)
+            .await
+            .expect("удаление");
+        assert!(
+            load_long_term_memory(&pool, "owner-1", 50)
+                .await
+                .expect("чтение")
+                .is_empty()
+        );
 
-        let err = delete_long_term_memory(&pool, "owner-1", &id).await.expect_err("записи уже нет");
+        let err = delete_long_term_memory(&pool, "owner-1", &id)
+            .await
+            .expect_err("записи уже нет");
         assert!(matches!(err, StoreError::NotFound));
     }
 
     #[tokio::test]
     async fn long_term_memory_is_isolated_per_owner() {
         let (_dir, pool) = temp_pool().await;
-        set_long_term_memory(&pool, "owner-x", "profile", Some("name"), "секрет X", "manual", None, 1)
-            .await
-            .expect("запись владельца X");
+        set_long_term_memory(
+            &pool,
+            "owner-x",
+            "profile",
+            Some("name"),
+            "секрет X",
+            "manual",
+            None,
+            1,
+        )
+        .await
+        .expect("запись владельца X");
 
-        let entries_y = load_long_term_memory(&pool, "owner-y", 50).await.expect("чтение владельца Y");
-        assert!(entries_y.is_empty(), "долговременная память не видна другому владельцу");
+        let entries_y = load_long_term_memory(&pool, "owner-y", 50)
+            .await
+            .expect("чтение владельца Y");
+        assert!(
+            entries_y.is_empty(),
+            "долговременная память не видна другому владельцу"
+        );
     }
 
     #[tokio::test]
     async fn long_term_memory_without_key_never_upserts() {
         let (_dir, pool) = temp_pool().await;
-        set_long_term_memory(&pool, "owner-1", "knowledge", None, "заметка один", "manual", None, 1)
-            .await
-            .expect("заметка 1");
-        set_long_term_memory(&pool, "owner-1", "knowledge", None, "заметка два", "manual", None, 2)
-            .await
-            .expect("заметка 2");
+        set_long_term_memory(
+            &pool,
+            "owner-1",
+            "knowledge",
+            None,
+            "заметка один",
+            "manual",
+            None,
+            1,
+        )
+        .await
+        .expect("заметка 1");
+        set_long_term_memory(
+            &pool,
+            "owner-1",
+            "knowledge",
+            None,
+            "заметка два",
+            "manual",
+            None,
+            2,
+        )
+        .await
+        .expect("заметка 2");
 
-        let entries = load_long_term_memory(&pool, "owner-1", 50).await.expect("чтение");
+        let entries = load_long_term_memory(&pool, "owner-1", 50)
+            .await
+            .expect("чтение");
         assert_eq!(entries.len(), 2, "записи без ключа не схлопываются в одну");
     }
 
@@ -2214,20 +2733,35 @@ mod tests {
         .await
         .expect("создание");
 
-        let loaded = load_owner_profile(&pool, "owner-1", &created.id).await.expect("чтение");
+        let loaded = load_owner_profile(&pool, "owner-1", &created.id)
+            .await
+            .expect("чтение");
         assert_eq!(loaded.name, "Мой профиль");
         assert_eq!(loaded.format, "");
         assert_eq!(loaded.constraints, vec!["ограничение 1".to_string()]);
 
-        let updated = update_owner_profile(&pool, "owner-1", &created.id, None, None, None, Some("маркдаун"), None)
-            .await
-            .expect("частичное изменение");
+        let updated = update_owner_profile(
+            &pool,
+            "owner-1",
+            &created.id,
+            None,
+            None,
+            None,
+            Some("маркдаун"),
+            None,
+        )
+        .await
+        .expect("частичное изменение");
         assert_eq!(updated.format, "маркдаун");
         assert_eq!(updated.name, "Мой профиль", "остальные поля не затёрты");
         assert_eq!(updated.persona, "персона");
 
-        delete_owner_profile(&pool, "owner-1", &created.id).await.expect("удаление");
-        let err = load_owner_profile(&pool, "owner-1", &created.id).await.expect_err("профиль удалён");
+        delete_owner_profile(&pool, "owner-1", &created.id)
+            .await
+            .expect("удаление");
+        let err = load_owner_profile(&pool, "owner-1", &created.id)
+            .await
+            .expect_err("профиль удалён");
         assert!(matches!(err, StoreError::NotFound));
     }
 
@@ -2238,10 +2772,14 @@ mod tests {
             .await
             .expect("создание владельцем X");
 
-        let list_y = list_owner_profiles(&pool, "owner-y").await.expect("список владельца Y");
+        let list_y = list_owner_profiles(&pool, "owner-y")
+            .await
+            .expect("список владельца Y");
         assert!(list_y.is_empty(), "профиль не виден другому владельцу");
 
-        let err = load_owner_profile(&pool, "owner-y", &created.id).await.expect_err("чужой профиль");
+        let err = load_owner_profile(&pool, "owner-y", &created.id)
+            .await
+            .expect_err("чужой профиль");
         assert!(matches!(err, StoreError::NotFound));
     }
 
@@ -2253,9 +2791,16 @@ mod tests {
         let chat = create_chat(&pool, "owner-1", "Новый чат", &ChatSettings::default())
             .await
             .expect("чат");
-        let updated = set_title_if_default(&pool, "owner-1", &chat.id, "Название от модели", "Новый чат")
-            .await
-            .expect("обновление названия");
+        let updated = set_title_if_default(
+            &pool,
+            "owner-1",
+            &chat.id,
+            "Название от модели",
+            "Новый чат",
+            0,
+        )
+        .await
+        .expect("обновление названия");
         assert!(updated);
         let loaded = load_chat(&pool, "owner-1", &chat.id, &ChatSettings::default())
             .await
@@ -2269,18 +2814,60 @@ mod tests {
         let chat = create_chat(&pool, "owner-1", "Новый чат", &ChatSettings::default())
             .await
             .expect("чат");
-        update_chat(&pool, "owner-1", &chat.id, Some("Название клиента"), None, &ChatSettings::default())
-            .await
-            .expect("переименование");
+        update_chat(
+            &pool,
+            "owner-1",
+            &chat.id,
+            Some("Название клиента"),
+            None,
+            &ChatSettings::default(),
+        )
+        .await
+        .expect("переименование");
 
-        let updated = set_title_if_default(&pool, "owner-1", &chat.id, "Название от модели", "Новый чат")
-            .await
-            .expect("обновление названия");
+        let updated = set_title_if_default(
+            &pool,
+            "owner-1",
+            &chat.id,
+            "Название от модели",
+            "Новый чат",
+            0,
+        )
+        .await
+        .expect("обновление названия");
         assert!(!updated);
         let loaded = load_chat(&pool, "owner-1", &chat.id, &ChatSettings::default())
             .await
             .expect("чат");
         assert_eq!(loaded.title, "Название клиента");
+    }
+
+    #[tokio::test]
+    async fn clear_chat_discards_title_generated_for_previous_generation() {
+        let (_dir, pool) = temp_pool().await;
+        let chat = create_chat(&pool, "owner-1", "Новый чат", &ChatSettings::default())
+            .await
+            .expect("чат");
+        clear_chat(&pool, "owner-1", &chat.id)
+            .await
+            .expect("очистка");
+
+        assert!(
+            !set_title_if_default(
+                &pool,
+                "owner-1",
+                &chat.id,
+                "Название старого сообщения",
+                "Новый чат",
+                chat.context_generation,
+            )
+            .await
+            .expect("позднее название")
+        );
+        let loaded = load_chat(&pool, "owner-1", &chat.id, &ChatSettings::default())
+            .await
+            .expect("чат");
+        assert_eq!(loaded.title, "Новый чат");
     }
 
     // --- Роль "system" в хранилище (design.md, решение 4) ---
@@ -2293,7 +2880,10 @@ mod tests {
     #[test]
     fn role_to_str_round_trips_system() {
         assert_eq!(role_to_str(Role::System), "system");
-        assert!(matches!(role_from_str(role_to_str(Role::System)), Ok(Role::System)));
+        assert!(matches!(
+            role_from_str(role_to_str(Role::System)),
+            Ok(Role::System)
+        ));
     }
 
     // --- 2.2 Открытие пула ---
@@ -2318,15 +2908,22 @@ mod tests {
         // нельзя, поэтому open_pool должен провалиться с путём в сообщении.
         let readonly_dir = dir.path().join("readonly");
         std::fs::create_dir(&readonly_dir).expect("подкаталог");
-        let mut perms = std::fs::metadata(&readonly_dir).expect("права").permissions();
+        let mut perms = std::fs::metadata(&readonly_dir)
+            .expect("права")
+            .permissions();
         perms.set_readonly(true);
         std::fs::set_permissions(&readonly_dir, perms.clone()).expect("выставление прав");
 
         let db_path = readonly_dir.join("nested").join("agentd.db");
         let db_path = db_path.to_str().expect("путь").to_string();
 
-        let err = open_pool(&db_path, 5, 5000).await.expect_err("ожидалась ошибка");
-        assert!(format!("{err:#}").contains(&db_path), "путь не найден в ошибке: {err:#}");
+        let err = open_pool(&db_path, 5, 5000)
+            .await
+            .expect_err("ожидалась ошибка");
+        assert!(
+            format!("{err:#}").contains(&db_path),
+            "путь не найден в ошибке: {err:#}"
+        );
 
         perms.set_readonly(false);
         std::fs::set_permissions(&readonly_dir, perms).expect("восстановление прав");
@@ -2342,7 +2939,9 @@ mod tests {
 
         let pool = open_pool(path, 5, 5000).await.expect("первый пул");
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
         pool.close().await;
 
         let pool = open_pool(path, 5, 5000).await.expect("повторное открытие");
@@ -2358,7 +2957,9 @@ mod tests {
     async fn cascade_delete_removes_messages() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
         append_exchange(
             &pool,
             "owner-1",
@@ -2369,14 +2970,19 @@ mod tests {
         .await
         .expect("обмен записан");
 
-        delete_chat(&pool, "owner-1", &chat.id).await.expect("удаление");
+        delete_chat(&pool, "owner-1", &chat.id)
+            .await
+            .expect("удаление");
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE chat_id = ?")
             .bind(&chat.id)
             .fetch_one(&pool)
             .await
             .expect("подсчёт сообщений");
-        assert_eq!(count, 0, "foreign_keys=ON должен каскадно удалить сообщения");
+        assert_eq!(
+            count, 0,
+            "foreign_keys=ON должен каскадно удалить сообщения"
+        );
     }
 
     // --- 3.2 CRUD чата ---
@@ -2385,22 +2991,35 @@ mod tests {
     async fn chat_create_load_update_delete() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Новый чат", &defaults).await.expect("создание");
+        let chat = create_chat(&pool, "owner-1", "Новый чат", &defaults)
+            .await
+            .expect("создание");
         assert_eq!(chat.message_count, 0);
 
-        let loaded = load_chat(&pool, "owner-1", &chat.id, &defaults).await.expect("чтение");
+        let loaded = load_chat(&pool, "owner-1", &chat.id, &defaults)
+            .await
+            .expect("чтение");
         assert_eq!(loaded.title, "Новый чат");
 
         let mut settings = defaults.clone();
         settings.sampling.temperature = Some(0.2);
-        let updated = update_chat(&pool, "owner-1", &chat.id, Some("Переименован"), Some(&settings), &defaults)
-            .await
-            .expect("изменение");
+        let updated = update_chat(
+            &pool,
+            "owner-1",
+            &chat.id,
+            Some("Переименован"),
+            Some(&settings),
+            &defaults,
+        )
+        .await
+        .expect("изменение");
         assert_eq!(updated.title, "Переименован");
         assert_eq!(updated.settings.sampling.temperature, Some(0.2));
         assert!(updated.updated_at >= chat.updated_at);
 
-        delete_chat(&pool, "owner-1", &chat.id).await.expect("удаление");
+        delete_chat(&pool, "owner-1", &chat.id)
+            .await
+            .expect("удаление");
         let missing = load_chat(&pool, "owner-1", &chat.id, &defaults).await;
         assert!(matches!(missing, Err(StoreError::NotFound)));
     }
@@ -2452,7 +3071,9 @@ mod tests {
     async fn load_messages_paginates_by_seq() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
         for i in 0..5 {
             append_exchange(
                 &pool,
@@ -2465,9 +3086,14 @@ mod tests {
             .expect("обмен");
         }
 
-        let first = load_messages(&pool, &chat.id, 0, 4, None, 8).await.expect("первая часть");
+        let first = load_messages(&pool, &chat.id, 0, 4, None, 8)
+            .await
+            .expect("первая часть");
         assert_eq!(first.messages.len(), 4);
-        assert_eq!(first.messages.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            first.messages.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
         assert_eq!(first.next_after, Some(4));
 
         let second = load_messages(&pool, &chat.id, 4, 20, None, 8)
@@ -2483,7 +3109,9 @@ mod tests {
     async fn append_exchange_assigns_sequential_numbers_and_round_trips_telemetry() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
 
         let meta = MessageMeta {
             prompt_tokens: Some(11),
@@ -2514,11 +3142,16 @@ mod tests {
         assert_eq!(user.seq, 1);
         assert_eq!(assistant.seq, 2);
 
-        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
+        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8)
+            .await
+            .expect("чтение");
         assert_eq!(loaded.messages.len(), 2);
         let stored_assistant = &loaded.messages[1];
         assert_eq!(stored_assistant.reasoning.as_deref(), Some("рассуждение"));
-        assert_eq!(stored_assistant.meta.as_ref().unwrap().total_tokens, Some(18));
+        assert_eq!(
+            stored_assistant.meta.as_ref().unwrap().total_tokens,
+            Some(18)
+        );
     }
 
     // --- 1.1 Дозапись готовых сообщений ---
@@ -2527,7 +3160,9 @@ mod tests {
     async fn append_messages_keeps_request_order_and_lifts_chat() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
         // Заведомо старое время изменения: иначе рост updated_at не отличить
         // от исходного значения — обе метки в секундах и совпадут.
         sqlx::query("UPDATE chats SET updated_at = 1000 WHERE id = ?")
@@ -2561,14 +3196,24 @@ mod tests {
         .await
         .expect("дозапись");
 
-        assert_eq!(rows.iter().map(|row| row.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
 
-        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
+        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8)
+            .await
+            .expect("чтение");
         assert_eq!(loaded.messages[0].content, "вопрос");
         assert_eq!(loaded.messages[1].content, "ответ");
-        assert_eq!(loaded.messages[1].meta.as_ref().unwrap().duration_ms, Some(42));
+        assert_eq!(
+            loaded.messages[1].meta.as_ref().unwrap().duration_ms,
+            Some(42)
+        );
 
-        let reloaded = load_chat(&pool, "owner-1", &chat.id, &defaults).await.expect("чат");
+        let reloaded = load_chat(&pool, "owner-1", &chat.id, &defaults)
+            .await
+            .expect("чат");
         assert_eq!(reloaded.message_count, 2);
         assert!(reloaded.updated_at > 1000);
     }
@@ -2577,10 +3222,17 @@ mod tests {
     async fn append_messages_after_existing_history_continues_numbering() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
-        append_messages(&pool, "owner-1", &chat.id, vec![new_message(Role::User, "первое")])
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
             .await
-            .expect("первая дозапись");
+            .expect("чат");
+        append_messages(
+            &pool,
+            "owner-1",
+            &chat.id,
+            vec![new_message(Role::User, "первое")],
+        )
+        .await
+        .expect("первая дозапись");
 
         let rows = append_messages(
             &pool,
@@ -2594,14 +3246,19 @@ mod tests {
         .await
         .expect("вторая дозапись");
 
-        assert_eq!(rows.iter().map(|row| row.seq).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(
+            rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     #[tokio::test]
     async fn append_messages_rolls_back_when_second_insert_fails() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
         // Отказ хранилища ровно на втором сообщении списка: триггер живёт
         // только в тестовой базе и ломает вставку, когда в чате уже есть
         // одно сообщение этой же транзакции.
@@ -2627,7 +3284,9 @@ mod tests {
 
         assert!(matches!(result, Err(StoreError::Backend(_))));
 
-        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
+        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8)
+            .await
+            .expect("чтение");
         assert!(
             loaded.messages.is_empty(),
             "после отказа на втором сообщении в чате не должно остаться ни одного"
@@ -2638,7 +3297,9 @@ mod tests {
     async fn append_messages_to_foreign_chat_is_not_found() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
 
         let result = append_messages(
             &pool,
@@ -2649,7 +3310,9 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(StoreError::NotFound)));
-        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
+        let loaded = load_messages(&pool, &chat.id, 0, 10, None, 8)
+            .await
+            .expect("чтение");
         assert!(loaded.messages.is_empty());
     }
 
@@ -2659,7 +3322,9 @@ mod tests {
     async fn concurrent_append_exchange_gives_sequential_numbers() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
 
         let pool_a = pool.clone();
         let pool_b = pool.clone();
@@ -2690,7 +3355,9 @@ mod tests {
         a.await.expect("задача A").expect("обмен A");
         b.await.expect("задача B").expect("обмен B");
 
-        let page = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
+        let page = load_messages(&pool, &chat.id, 0, 10, None, 8)
+            .await
+            .expect("чтение");
         let mut seqs: Vec<i64> = page.messages.iter().map(|m| m.seq).collect();
         seqs.sort_unstable();
         assert_eq!(seqs, vec![1, 2, 3, 4]);
@@ -2711,7 +3378,9 @@ mod tests {
         std::fs::create_dir_all(&legacy_dir).expect("каталог старых миграций");
         for name in ["0001_init.sql", "0002_chat_summaries.sql"] {
             std::fs::copy(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations").join(name),
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("migrations")
+                    .join(name),
                 legacy_dir.join(name),
             )
             .expect("копия старой миграции");
@@ -2756,15 +3425,19 @@ mod tests {
         legacy_pool.close().await;
 
         // `open_pool` применяет все миграции крейта, включая 0003.
-        let pool = open_pool(&path_str, 5, 5000).await.expect("применение 0003");
+        let pool = open_pool(&path_str, 5, 5000)
+            .await
+            .expect("применение 0003");
 
-        let branch_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM chat_branches WHERE chat_id = 'chat-1'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("число веток чата");
-        assert_eq!(branch_count, 1, "чат должен получить ровно одну корневую ветку");
+        let branch_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chat_branches WHERE chat_id = 'chat-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("число веток чата");
+        assert_eq!(
+            branch_count, 1,
+            "чат должен получить ровно одну корневую ветку"
+        );
 
         let active_branch: Option<String> =
             sqlx::query_scalar("SELECT active_branch FROM chats WHERE id = 'chat-1'")
@@ -2779,7 +3452,11 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("ветки сообщений");
-        assert_eq!(message_branches.len(), 3, "все сообщения читаются без потерь");
+        assert_eq!(
+            message_branches.len(),
+            3,
+            "все сообщения читаются без потерь"
+        );
         assert!(
             message_branches.iter().all(|b| *b == active_branch),
             "все сообщения перенесены в активную (корневую) ветку чата"
@@ -2798,9 +3475,15 @@ mod tests {
         // ожидающей — как на боевой базе перед обновлением сервиса.
         let legacy_dir = dir.path().join("legacy-migrations");
         std::fs::create_dir_all(&legacy_dir).expect("каталог старых миграций");
-        for name in ["0001_init.sql", "0002_chat_summaries.sql", "0003_context_strategies.sql"] {
+        for name in [
+            "0001_init.sql",
+            "0002_chat_summaries.sql",
+            "0003_context_strategies.sql",
+        ] {
             std::fs::copy(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations").join(name),
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("migrations")
+                    .join(name),
                 legacy_dir.join(name),
             )
             .expect("копия старой миграции");
@@ -2844,14 +3527,20 @@ mod tests {
         legacy_pool.close().await;
 
         // `open_pool` применяет все миграции крейта, включая 0004.
-        let pool = open_pool(&path_str, 5, 5000).await.expect("применение 0004");
+        let pool = open_pool(&path_str, 5, 5000)
+            .await
+            .expect("применение 0004");
 
         let active_task_id: Option<String> =
             sqlx::query_scalar("SELECT active_task_id FROM chats WHERE id = 'chat-1'")
                 .fetch_one(&pool)
                 .await
                 .expect("активная задача чата");
-        assert_eq!(active_task_id.as_deref(), Some("chat-1"), "бэкофилл задаёт задачу равной id чата");
+        assert_eq!(
+            active_task_id.as_deref(),
+            Some("chat-1"),
+            "бэкофилл задаёт задачу равной id чата"
+        );
 
         let chat = load_chat(&pool, "owner-1", "chat-1", &ChatSettings::default())
             .await
@@ -2859,7 +3548,9 @@ mod tests {
         assert_eq!(chat.active_task_id, "chat-1");
         assert_eq!(chat.title, "Старый чат");
 
-        let working = load_working_memory(&pool, "chat-1", "chat-1").await.expect("рабочая память");
+        let working = load_working_memory(&pool, "chat-1", "chat-1")
+            .await
+            .expect("рабочая память");
         assert!(working.is_empty(), "у старого чата рабочей памяти ещё нет");
     }
 
@@ -2881,7 +3572,9 @@ mod tests {
     async fn load_summary_of_chat_without_summary_is_none() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
         let summary = load_summary(&pool, &chat.id).await.expect("чтение");
         assert!(summary.is_none());
     }
@@ -2890,7 +3583,9 @@ mod tests {
     async fn save_summary_persists_and_overwrites() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
 
         save_summary(&pool, &chat.id, "первый пересказ", 5)
             .await
@@ -2917,7 +3612,9 @@ mod tests {
     async fn save_summary_does_not_move_through_seq_backward() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
 
         save_summary(&pool, &chat.id, "новый пересказ", 20)
             .await
@@ -2942,16 +3639,23 @@ mod tests {
     async fn deleting_chat_cascades_summary() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
-        save_summary(&pool, &chat.id, "пересказ", 5).await.expect("сохранение");
-
-        delete_chat(&pool, "owner-1", &chat.id).await.expect("удаление");
-
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_summaries WHERE chat_id = ?")
-            .bind(&chat.id)
-            .fetch_one(&pool)
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
             .await
-            .expect("подсчёт пересказов");
+            .expect("чат");
+        save_summary(&pool, &chat.id, "пересказ", 5)
+            .await
+            .expect("сохранение");
+
+        delete_chat(&pool, "owner-1", &chat.id)
+            .await
+            .expect("удаление");
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chat_summaries WHERE chat_id = ?")
+                .bind(&chat.id)
+                .fetch_one(&pool)
+                .await
+                .expect("подсчёт пересказов");
         assert_eq!(count, 0, "foreign_keys=ON должен каскадно удалить пересказ");
     }
 
@@ -2961,7 +3665,9 @@ mod tests {
     async fn facts_of_chat_without_facts_is_empty() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
         let facts = load_facts(&pool, &chat.id).await.expect("чтение");
         assert!(facts.is_empty());
     }
@@ -2970,14 +3676,20 @@ mod tests {
     async fn set_fact_persists_and_overwrites_existing_key() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
 
-        set_fact(&pool, &chat.id, "budget", "100000", 3).await.expect("установка");
+        set_fact(&pool, &chat.id, "budget", "100000", 3)
+            .await
+            .expect("установка");
         let facts = load_facts(&pool, &chat.id).await.expect("чтение");
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].value, "100000");
 
-        set_fact(&pool, &chat.id, "budget", "200000", 7).await.expect("перезапись");
+        set_fact(&pool, &chat.id, "budget", "200000", 7)
+            .await
+            .expect("перезапись");
         let facts = load_facts(&pool, &chat.id).await.expect("чтение");
         assert_eq!(facts.len(), 1, "перезапись ключа не создаёт вторую запись");
         assert_eq!(facts[0].value, "200000");
@@ -2988,13 +3700,26 @@ mod tests {
     async fn delete_fact_removes_key_and_missing_key_is_not_found() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
-        set_fact(&pool, &chat.id, "budget", "100000", 1).await.expect("установка");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
+        set_fact(&pool, &chat.id, "budget", "100000", 1)
+            .await
+            .expect("установка");
 
-        delete_fact(&pool, &chat.id, "budget").await.expect("удаление");
-        assert!(load_facts(&pool, &chat.id).await.expect("чтение").is_empty());
+        delete_fact(&pool, &chat.id, "budget")
+            .await
+            .expect("удаление");
+        assert!(
+            load_facts(&pool, &chat.id)
+                .await
+                .expect("чтение")
+                .is_empty()
+        );
 
-        let err = delete_fact(&pool, &chat.id, "budget").await.expect_err("ключа уже нет");
+        let err = delete_fact(&pool, &chat.id, "budget")
+            .await
+            .expect_err("ключа уже нет");
         assert!(matches!(err, StoreError::NotFound));
     }
 
@@ -3002,10 +3727,16 @@ mod tests {
     async fn deleting_chat_cascades_facts() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
-        set_fact(&pool, &chat.id, "budget", "100000", 1).await.expect("установка");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
+        set_fact(&pool, &chat.id, "budget", "100000", 1)
+            .await
+            .expect("установка");
 
-        delete_chat(&pool, "owner-1", &chat.id).await.expect("удаление чата");
+        delete_chat(&pool, "owner-1", &chat.id)
+            .await
+            .expect("удаление чата");
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_facts WHERE chat_id = ?")
             .bind(&chat.id)
@@ -3021,9 +3752,13 @@ mod tests {
     async fn new_chat_has_one_active_root_branch() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
 
-        let branches = list_branches(&pool, "owner-1", &chat.id).await.expect("список веток");
+        let branches = list_branches(&pool, "owner-1", &chat.id)
+            .await
+            .expect("список веток");
         assert_eq!(branches.len(), 1);
         assert!(branches[0].active);
         assert!(branches[0].parent_id.is_none());
@@ -3034,7 +3769,9 @@ mod tests {
     async fn branch_created_from_message_and_activated() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
         append_exchange(
             &pool,
             "owner-1",
@@ -3049,12 +3786,17 @@ mod tests {
             .await
             .expect("создание ветки");
         assert_eq!(branch.fork_seq, Some(1));
-        assert_eq!(branch.parent_id.as_deref(), Some(chat.active_branch.as_str()));
+        assert_eq!(
+            branch.parent_id.as_deref(),
+            Some(chat.active_branch.as_str())
+        );
 
         activate_branch(&pool, "owner-1", &chat.id, &branch.id)
             .await
             .expect("активация");
-        let branches = list_branches(&pool, "owner-1", &chat.id).await.expect("список веток");
+        let branches = list_branches(&pool, "owner-1", &chat.id)
+            .await
+            .expect("список веток");
         let active: Vec<_> = branches.iter().filter(|b| b.active).collect();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, branch.id);
@@ -3064,7 +3806,9 @@ mod tests {
     async fn branch_from_nonexistent_message_is_not_found() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
 
         let err = create_branch(&pool, "owner-1", &chat.id, 99, "ветка")
             .await
@@ -3076,7 +3820,9 @@ mod tests {
     async fn two_branches_from_one_point_keep_shared_prefix_and_own_suffix() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
         append_exchange(
             &pool,
             "owner-1",
@@ -3088,8 +3834,12 @@ mod tests {
         .expect("общий обмен");
         let root = chat.active_branch.clone();
 
-        let branch_a = create_branch(&pool, "owner-1", &chat.id, 2, "A").await.expect("ветка A");
-        activate_branch(&pool, "owner-1", &chat.id, &branch_a.id).await.expect("активация A");
+        let branch_a = create_branch(&pool, "owner-1", &chat.id, 2, "A")
+            .await
+            .expect("ветка A");
+        activate_branch(&pool, "owner-1", &chat.id, &branch_a.id)
+            .await
+            .expect("активация A");
         append_messages(
             &pool,
             "owner-1",
@@ -3099,9 +3849,15 @@ mod tests {
         .await
         .expect("сообщение в A");
 
-        activate_branch(&pool, "owner-1", &chat.id, &root).await.expect("возврат к root");
-        let branch_b = create_branch(&pool, "owner-1", &chat.id, 2, "B").await.expect("ветка B");
-        activate_branch(&pool, "owner-1", &chat.id, &branch_b.id).await.expect("активация B");
+        activate_branch(&pool, "owner-1", &chat.id, &root)
+            .await
+            .expect("возврат к root");
+        let branch_b = create_branch(&pool, "owner-1", &chat.id, 2, "B")
+            .await
+            .expect("ветка B");
+        activate_branch(&pool, "owner-1", &chat.id, &branch_b.id)
+            .await
+            .expect("активация B");
         append_messages(
             &pool,
             "owner-1",
@@ -3111,8 +3867,12 @@ mod tests {
         .await
         .expect("сообщение в B");
 
-        let history_a = load_branch_history(&pool, &chat.id, &branch_a.id, 8).await.expect("история A");
-        let history_b = load_branch_history(&pool, &chat.id, &branch_b.id, 8).await.expect("история B");
+        let history_a = load_branch_history(&pool, &chat.id, &branch_a.id, 8)
+            .await
+            .expect("история A");
+        let history_b = load_branch_history(&pool, &chat.id, &branch_b.id, 8)
+            .await
+            .expect("история B");
 
         assert!(history_a.iter().any(|m| m.content == "общий вопрос"));
         assert!(history_a.iter().any(|m| m.content == "только в A"));
@@ -3127,7 +3887,9 @@ mod tests {
     async fn nested_branch_sees_root_and_intermediate_chain() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
         append_exchange(
             &pool,
             "owner-1",
@@ -3138,8 +3900,12 @@ mod tests {
         .await
         .expect("корневой обмен");
 
-        let middle = create_branch(&pool, "owner-1", &chat.id, 2, "middle").await.expect("промежуточная ветка");
-        activate_branch(&pool, "owner-1", &chat.id, &middle.id).await.expect("активация middle");
+        let middle = create_branch(&pool, "owner-1", &chat.id, 2, "middle")
+            .await
+            .expect("промежуточная ветка");
+        activate_branch(&pool, "owner-1", &chat.id, &middle.id)
+            .await
+            .expect("активация middle");
         append_exchange(
             &pool,
             "owner-1",
@@ -3150,17 +3916,34 @@ mod tests {
         .await
         .expect("промежуточный обмен");
 
-        let leaf = create_branch(&pool, "owner-1", &chat.id, 2, "leaf").await.expect("вложенная ветка");
-        activate_branch(&pool, "owner-1", &chat.id, &leaf.id).await.expect("активация leaf");
-        append_messages(&pool, "owner-1", &chat.id, vec![new_message(Role::User, "листовое сообщение")])
+        let leaf = create_branch(&pool, "owner-1", &chat.id, 2, "leaf")
             .await
-            .expect("сообщение в leaf");
+            .expect("вложенная ветка");
+        activate_branch(&pool, "owner-1", &chat.id, &leaf.id)
+            .await
+            .expect("активация leaf");
+        append_messages(
+            &pool,
+            "owner-1",
+            &chat.id,
+            vec![new_message(Role::User, "листовое сообщение")],
+        )
+        .await
+        .expect("сообщение в leaf");
 
-        let history = load_branch_history(&pool, &chat.id, &leaf.id, 8).await.expect("история leaf");
+        let history = load_branch_history(&pool, &chat.id, &leaf.id, 8)
+            .await
+            .expect("история leaf");
         let contents: Vec<&str> = history.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(
             contents,
-            vec!["корневой вопрос", "корневой ответ", "промежуточный вопрос", "промежуточный ответ", "листовое сообщение"],
+            vec![
+                "корневой вопрос",
+                "корневой ответ",
+                "промежуточный вопрос",
+                "промежуточный ответ",
+                "листовое сообщение"
+            ],
         );
     }
 
@@ -3168,7 +3951,9 @@ mod tests {
     async fn load_messages_ignores_summary_and_returns_full_history() {
         let (_dir, pool) = temp_pool().await;
         let defaults = ChatSettings::default();
-        let chat = create_chat(&pool, "owner-1", "Чат", &defaults).await.expect("чат");
+        let chat = create_chat(&pool, "owner-1", "Чат", &defaults)
+            .await
+            .expect("чат");
         append_exchange(
             &pool,
             "owner-1",
@@ -3178,10 +3963,18 @@ mod tests {
         )
         .await
         .expect("обмен");
-        save_summary(&pool, &chat.id, "пересказ", 1).await.expect("сохранение");
+        save_summary(&pool, &chat.id, "пересказ", 1)
+            .await
+            .expect("сохранение");
 
-        let page = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
-        assert_eq!(page.messages.len(), 2, "пересказ не должен скрывать сообщения");
+        let page = load_messages(&pool, &chat.id, 0, 10, None, 8)
+            .await
+            .expect("чтение");
+        assert_eq!(
+            page.messages.len(),
+            2,
+            "пересказ не должен скрывать сообщения"
+        );
     }
 
     // --- 3.7 Отпечаток владельца ---
@@ -3215,14 +4008,19 @@ mod tests {
             &chat.id,
             vec![
                 new_message(Role::User, "статус?"),
-                NewMessage::from_message(Message::assistant_with_tool_calls("", vec![call.clone()])),
+                NewMessage::from_message(Message::assistant_with_tool_calls(
+                    "",
+                    vec![call.clone()],
+                )),
                 NewMessage::from_message(Message::tool_result("call_0", "git_status", "clean")),
             ],
         )
         .await
         .expect("дозапись");
 
-        let page = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
+        let page = load_messages(&pool, &chat.id, 0, 10, None, 8)
+            .await
+            .expect("чтение");
         assert_eq!(page.messages.len(), 3);
         assert!(page.messages[0].tool_calls.is_empty());
         assert_eq!(page.messages[1].tool_calls, vec![call]);
@@ -3258,7 +4056,9 @@ mod tests {
             "0006_task_state.sql",
         ] {
             std::fs::copy(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations").join(name),
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("migrations")
+                    .join(name),
                 legacy_dir.join(name),
             )
             .expect("копия старой миграции");
@@ -3280,9 +4080,14 @@ mod tests {
 
         // Таблица chats до 0007 не менялась, поэтому чат создаётся обычным
         // кодом, а сообщения — по старому набору колонок.
-        let chat = create_chat(&legacy_pool, "owner-1", "Старый чат", &ChatSettings::default())
-            .await
-            .expect("чат по старой схеме");
+        let chat = create_chat(
+            &legacy_pool,
+            "owner-1",
+            "Старый чат",
+            &ChatSettings::default(),
+        )
+        .await
+        .expect("чат по старой схеме");
         for (seq, role) in [(1i64, "user"), (2, "assistant")] {
             sqlx::query(
                 "INSERT INTO messages (id, chat_id, branch_id, seq, role, content, created_at) \
@@ -3300,10 +4105,130 @@ mod tests {
         }
         legacy_pool.close().await;
 
-        let pool = open_pool(&path_str, 5, 5000).await.expect("применение 0007");
-        let page = load_messages(&pool, &chat.id, 0, 10, None, 8).await.expect("чтение");
+        let pool = open_pool(&path_str, 5, 5000)
+            .await
+            .expect("применение 0007");
+        let page = load_messages(&pool, &chat.id, 0, 10, None, 8)
+            .await
+            .expect("чтение");
         assert_eq!(page.messages.len(), 2);
         assert!(page.messages.iter().all(|m| m.tool_calls.is_empty()));
-        assert!(page.messages.iter().all(|m| m.tool_call_id.is_none() && m.tool_name.is_none()));
+        assert!(
+            page.messages
+                .iter()
+                .all(|m| m.tool_call_id.is_none() && m.tool_name.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn context_reset_keeps_archive_and_rejects_stale_writes_after_reopen() {
+        let dir = tempfile::tempdir().expect("каталог базы");
+        let path = dir.path().join("clear-context.db");
+        let path = path.to_str().expect("путь UTF-8");
+        let pool = open_pool(path, 5, 5000).await.expect("база");
+        let old = create_chat(&pool, "owner-1", "Архив", &ChatSettings::default())
+            .await
+            .expect("чат");
+        let other = create_chat(&pool, "owner-1", "Другой", &ChatSettings::default())
+            .await
+            .expect("другой чат");
+        append_messages_for_generation(
+            &pool,
+            "owner-1",
+            &old.id,
+            vec![NewMessage::from_message(Message::user("старый текст"))],
+            0,
+        )
+        .await
+        .expect("архивная реплика");
+        save_summary(&pool, &old.id, "старый пересказ", 1)
+            .await
+            .expect("пересказ");
+        set_fact(&pool, &old.id, "старый", "факт", 1)
+            .await
+            .expect("факт");
+
+        assert_eq!(
+            reset_context(&pool, "owner-1", &old.id)
+                .await
+                .expect("сброс"),
+            1
+        );
+        assert!(matches!(
+            append_messages_for_generation(
+                &pool,
+                "owner-1",
+                &old.id,
+                vec![NewMessage::from_message(Message::user("запоздалый ответ"))],
+                0
+            )
+            .await,
+            Err(StoreError::ContextReset)
+        ));
+        save_summary_for_generation(&pool, &old.id, "устаревший пересказ", 2, 0)
+            .await
+            .expect("устаревший пересказ отбрасывается");
+        assert!(matches!(
+            set_fact_for_generation(&pool, &old.id, "устаревший", "факт", 2, 0).await,
+            Err(StoreError::ContextReset)
+        ));
+        append_messages_for_generation(
+            &pool,
+            "owner-1",
+            &old.id,
+            vec![NewMessage::from_message(Message::user("новый текст"))],
+            1,
+        )
+        .await
+        .expect("новая реплика");
+        assert!(matches!(
+            reset_context(&pool, "чужой", &old.id).await,
+            Err(StoreError::NotFound)
+        ));
+        pool.close().await;
+
+        let pool = open_pool(path, 5, 5000).await.expect("повторное открытие");
+        let history = load_messages(&pool, &old.id, 0, 10, None, 8)
+            .await
+            .expect("архив");
+        assert_eq!(
+            history
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["старый текст", "новый текст"]
+        );
+        assert_eq!(
+            history
+                .messages
+                .iter()
+                .map(|m| m.context_generation)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let chat = load_chat(&pool, "owner-1", &old.id, &ChatSettings::default())
+            .await
+            .expect("чат");
+        assert_eq!(chat.context_generation, 1);
+        assert!(
+            load_summary(&pool, &old.id)
+                .await
+                .expect("пересказ сброшен")
+                .is_none()
+        );
+        assert!(
+            load_facts(&pool, &old.id)
+                .await
+                .expect("факты сброшены")
+                .is_empty()
+        );
+        assert_eq!(
+            load_chat(&pool, "owner-1", &other.id, &ChatSettings::default())
+                .await
+                .expect("другой чат")
+                .context_generation,
+            0
+        );
     }
 }

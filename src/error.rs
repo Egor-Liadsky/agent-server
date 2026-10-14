@@ -1,9 +1,9 @@
 //! Единый конверт ошибок и отображение исходов обработки в коды состояния.
 
 use agentcore::agent::AgentError;
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,13 +111,21 @@ impl ApiError {
     }
 
     pub fn branch_not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "branch_not_found", "ветка не найдена")
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "branch_not_found",
+            "ветка не найдена",
+        )
     }
 
     /// Запись рабочей или долговременной памяти, которой нет — неотличимо
     /// от чужой (specs/memory-layers).
     pub fn memory_entry_not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "memory_entry_not_found", "запись памяти не найдена")
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "memory_entry_not_found",
+            "запись памяти не найдена",
+        )
     }
 
     /// Ручная правка памяти превышает операторский потолок длины ключа или
@@ -137,7 +145,11 @@ impl ApiError {
     /// найден или принадлежит другому владельцу — неотличимо
     /// (specs/user-profiles, «Чужой профиль не читается»).
     pub fn profile_not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "profile_not_found", "профиль не найден")
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "profile_not_found",
+            "профиль не найден",
+        )
     }
 
     /// Изменение или удаление встроенного профиля, создание профиля без
@@ -251,6 +263,11 @@ impl ApiError {
         match err {
             crate::store::StoreError::NotFound => Self::chat_not_found(),
             crate::store::StoreError::InvalidCursor => Self::invalid_request("неизвестный курсор"),
+            crate::store::StoreError::ContextReset => Self::new(
+                StatusCode::CONFLICT,
+                "context_reset",
+                "контекст чата был сброшен во время запроса",
+            ),
             crate::store::StoreError::Backend(err) => Self::storage_error(format!("{err:#}")),
         }
     }

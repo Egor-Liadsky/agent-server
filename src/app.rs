@@ -1,30 +1,33 @@
 //! Сборка HTTP-приложения: маршруты, слои и обработчики.
 
-use crate::dto::{
-    AppendMessagesRequest, AppendMessagesResponse, BranchDto, BranchesResponse, ChatDto, ChatRequest,
-    ChatResponse, ChatWithMessagesResponse, CreateBranchRequest, CreateChatRequest, CreateProfileRequest,
-    DeleteLongTermMemoryQuery, DeleteWorkingMemoryQuery, FactDto, FactsResponse, FinishTaskRequest, GetChatQuery,
-    ListChatsQuery, ListChatsResponse, LongTermMemoryEntryDto, LongTermMemoryResponse, MessageView, ModelsResponse,
-    ProfileDto, ProfilesResponse, SetFactRequest, SetLongTermMemoryRequest, SetWorkingMemoryRequest,
-    TaskStateDto, TaskTransitionDto, TaskTransitionRequest, TaskTransitionResponse, UpdateChatRequest,
-    UpdateProfileRequest, WorkingMemoryEntryDto, WorkingMemoryResponse,
-};
 use crate::context;
+use crate::dto::{
+    AppendMessagesRequest, AppendMessagesResponse, BranchDto, BranchesResponse, ChatDto,
+    ChatRequest, ChatResponse, ChatWithMessagesResponse, CreateBranchRequest, CreateChatRequest,
+    CreateProfileRequest, DeleteLongTermMemoryQuery, DeleteWorkingMemoryQuery, FactDto,
+    FactsResponse, FinishTaskRequest, GetChatQuery, ListChatsQuery, ListChatsResponse,
+    LongTermMemoryEntryDto, LongTermMemoryResponse, MessageView, ModelsResponse, ProfileDto,
+    ProfilesResponse, SetFactRequest, SetLongTermMemoryRequest, SetWorkingMemoryRequest,
+    TaskStateDto, TaskTransitionDto, TaskTransitionRequest, TaskTransitionResponse,
+    UpdateChatRequest, UpdateProfileRequest, WorkingMemoryEntryDto, WorkingMemoryResponse,
+};
 use crate::error::ApiError;
-use crate::middleware::{assign_request_id, authenticate, normalize_errors, ClientId, Owner, RequestId};
+use crate::middleware::{
+    ClientId, Owner, RequestId, assign_request_id, authenticate, normalize_errors,
+};
 use crate::state::AppState;
 use crate::store;
 use crate::summary;
-use crate::telemetry::{log_exchange, ExchangeRecord};
+use crate::telemetry::{ExchangeRecord, log_exchange};
 use agentcore::agent::{Agent, Message, Role, ToolCall, ToolSpec};
 use agentcore::config::{ChatSettings, Provider, ReasoningMode, ThinkingMode};
 use agentcore::pipeline::{Pipeline, PipelineOutcome, RequestContext};
+use axum::error_handling::HandleErrorLayer;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use axum::error_handling::HandleErrorLayer;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::load_shed::LoadShedLayer;
 use tower::timeout::TimeoutLayer;
@@ -82,8 +85,7 @@ async fn models(State(state): State<AppState>) -> Json<ModelsResponse> {
 fn contains_api_key(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(map) => {
-            map.contains_key("api_key")
-                || map.values().any(contains_api_key)
+            map.contains_key("api_key") || map.values().any(contains_api_key)
         }
         serde_json::Value::Array(items) => items.iter().any(contains_api_key),
         _ => false,
@@ -96,8 +98,7 @@ fn contains_api_key(value: &serde_json::Value) -> bool {
 fn contains_invariants_field(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(map) => {
-            map.contains_key("invariants")
-                || map.values().any(contains_invariants_field)
+            map.contains_key("invariants") || map.values().any(contains_invariants_field)
         }
         serde_json::Value::Array(items) => items.iter().any(contains_invariants_field),
         _ => false,
@@ -248,9 +249,14 @@ struct EffectiveSummarySettings {
     step_messages: u32,
 }
 
-fn effective_summary_settings(state: &AppState, settings: &ChatSettings) -> EffectiveSummarySettings {
+fn effective_summary_settings(
+    state: &AppState,
+    settings: &ChatSettings,
+) -> EffectiveSummarySettings {
     EffectiveSummarySettings {
-        enabled: settings.summary_enabled.unwrap_or(state.config.summary_enabled),
+        enabled: settings
+            .summary_enabled
+            .unwrap_or(state.config.summary_enabled),
         keep_messages: settings
             .summary_keep_messages
             .unwrap_or(state.config.summary_keep_messages),
@@ -273,7 +279,10 @@ pub(crate) struct CompactionOutcome {
     pub(crate) summary_section: Option<String>,
 }
 
-fn history_without_compaction(stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> CompactionOutcome {
+fn history_without_compaction(
+    stored: Vec<store::ChatMessage>,
+    new_messages: Vec<Message>,
+) -> CompactionOutcome {
     let mut history: Vec<Message> = stored.into_iter().map(message_from_stored).collect();
     history.extend(new_messages);
     CompactionOutcome {
@@ -291,6 +300,7 @@ fn history_without_compaction(stored: Vec<store::ChatMessage>, new_messages: Vec
 pub(crate) async fn compact_history(
     state: &AppState,
     chat_id: &str,
+    context_generation: i64,
     settings: &ChatSettings,
     stored: Vec<store::ChatMessage>,
     new_messages: Vec<Message>,
@@ -338,7 +348,11 @@ pub(crate) async fn compact_history(
         };
     }
 
-    let prompt = summary::summary_prompt(previous_summary.as_deref(), &pending, state.config.summary_max_chars);
+    let prompt = summary::summary_prompt(
+        previous_summary.as_deref(),
+        &pending,
+        state.config.summary_max_chars,
+    );
     let mut summary_settings = settings.clone();
     if let Some(model) = &state.config.summary_model {
         summary_settings.model = Some(model.clone());
@@ -347,12 +361,24 @@ pub(crate) async fn compact_history(
     summary_settings.thinking = ThinkingMode::Disabled;
     summary_settings.custom_response_mode = false;
 
-    let built = state.agent.ask(&[Message::user(prompt)], &summary_settings).await;
+    let built = state
+        .agent
+        .ask(&[Message::user(prompt)], &summary_settings)
+        .await;
     let new_through_seq = stored[boundary - 1].seq;
     let (final_summary, summary_built) = match built {
         Ok(reply) => {
-            let truncated = summary::truncate_summary(&reply.content, state.config.summary_max_chars);
-            match store::save_summary(&state.db, chat_id, &truncated, new_through_seq).await {
+            let truncated =
+                summary::truncate_summary(&reply.content, state.config.summary_max_chars);
+            match store::save_summary_for_generation(
+                &state.db,
+                chat_id,
+                &truncated,
+                new_through_seq,
+                context_generation,
+            )
+            .await
+            {
                 Ok(()) => {
                     tracing::info!(
                         chat_id,
@@ -435,6 +461,11 @@ fn server_defaults(state: &AppState) -> ChatSettings {
 /// Проверка настроек перед вызовом модели: белый список моделей и наличие
 /// своего адреса Ollama — про то, что сервис собирается вызывать сам.
 fn validate_settings_for_call(state: &AppState, settings: &ChatSettings) -> Result<(), ApiError> {
+    if state.config.ollama_only && settings.provider != Provider::Ollama {
+        return Err(ApiError::invalid_request(
+            "облачный провайдер отключён конфигурацией сервиса",
+        ));
+    }
     if settings.provider == Provider::Ollama {
         // Локальную модель пользователя сервис вызвать не может: без своего
         // адреса Ollama диалог в таком чате идёт мимо сервиса.
@@ -462,7 +493,10 @@ fn validate_settings_for_call(state: &AppState, settings: &ChatSettings) -> Resu
 /// белый список моделей, ни свой адрес Ollama к нему не применяются
 /// (specs/chat-message-api, «Настройки чата с локальным провайдером
 /// принимаются на хранение»).
-fn validate_settings_for_storage(state: &AppState, settings: &ChatSettings) -> Result<(), ApiError> {
+fn validate_settings_for_storage(
+    state: &AppState,
+    settings: &ChatSettings,
+) -> Result<(), ApiError> {
     if settings.provider == Provider::Ollama {
         return Ok(());
     }
@@ -493,7 +527,12 @@ async fn merge_settings(
     // сохранении настроек чата»; design.md, решение 2).
     effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
     validate_summary_settings(state, &settings)?;
-    apply_context_strategy(state, &mut settings, context_strategy_override, context_window_override)?;
+    apply_context_strategy(
+        state,
+        &mut settings,
+        context_strategy_override,
+        context_window_override,
+    )?;
     apply_profile(state, owner, &mut settings, profile_override).await?;
     match purpose {
         SettingsPurpose::Call => validate_settings_for_call(state, &settings)?,
@@ -547,11 +586,13 @@ fn apply_context_strategy(
     if let Some(value) = strategy_override {
         settings.context_strategy = match value {
             None => None,
-            Some(name) => Some(
-                agentcore::config::ContextStrategy::parse(&name).ok_or_else(|| {
-                    ApiError::context_strategy_invalid(format!("неизвестная стратегия контекста: {name}"))
-                })?,
-            ),
+            Some(name) => Some(agentcore::config::ContextStrategy::parse(&name).ok_or_else(
+                || {
+                    ApiError::context_strategy_invalid(format!(
+                        "неизвестная стратегия контекста: {name}"
+                    ))
+                },
+            )?),
         };
     }
     if let Some(value) = window_override {
@@ -736,25 +777,37 @@ async fn handle_chat_without_storage(
     owner: String,
     request: ChatRequest,
 ) -> Result<ChatResponse, ApiError> {
-    if request.tool_results.as_ref().is_some_and(|results| !results.is_empty()) {
+    if request
+        .tool_results
+        .as_ref()
+        .is_some_and(|results| !results.is_empty())
+    {
         return Err(ApiError::invalid_request(
             "tool_results принимаются только вместе с chat_id: без чата результаты передаются сообщениями роли tool в messages",
         ));
     }
     let tools = validate_tools(request.tools.clone())?;
     let history = history_from(&request)?;
-    let settings =
-        merge_settings(&state, &owner, server_defaults(&state), request.settings, SettingsPurpose::Call).await?;
+    let settings = merge_settings(
+        &state,
+        &owner,
+        server_defaults(&state),
+        request.settings,
+        SettingsPurpose::Call,
+    )
+    .await?;
     let model = settings
         .model
         .clone()
         .unwrap_or_else(|| state.config.model.clone());
 
-    let limit = effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
+    let limit =
+        effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
     check_context_limit(&history, limit)?;
 
-    let pipeline = Pipeline::new(state.agent.clone())
-        .with_output_policies(agentcore::invariants::default_output_policies(state.agent.clone()));
+    let pipeline = Pipeline::new(state.agent.clone()).with_output_policies(
+        agentcore::invariants::default_output_policies(state.agent.clone()),
+    );
     let context = RequestContext::new(request_id.clone(), history, settings)
         .with_invariants((*state.invariants).clone())
         .with_tools(tools);
@@ -805,16 +858,21 @@ fn tool_results_for(
     results: Vec<crate::dto::ToolResultDto>,
 ) -> Result<Vec<Message>, ApiError> {
     let calls = match stored.last() {
-        Some(last) if matches!(last.role, Role::Assistant) && !last.tool_calls.is_empty() => &last.tool_calls,
+        Some(last) if matches!(last.role, Role::Assistant) && !last.tool_calls.is_empty() => {
+            &last.tool_calls
+        }
         _ => {
             return Err(ApiError::tool_results_mismatch(
                 "последнее сообщение чата — не ответ модели с вызовами инструментов",
             ));
         }
     };
-    let expected: std::collections::HashSet<&str> = calls.iter().map(|call| call.id.as_str()).collect();
-    let received: std::collections::HashSet<&str> =
-        results.iter().map(|result| result.tool_call_id.as_str()).collect();
+    let expected: std::collections::HashSet<&str> =
+        calls.iter().map(|call| call.id.as_str()).collect();
+    let received: std::collections::HashSet<&str> = results
+        .iter()
+        .map(|result| result.tool_call_id.as_str())
+        .collect();
     if received.len() != results.len() || expected != received {
         return Err(ApiError::tool_results_mismatch(
             "tool_call_id результатов должны совпадать с идентификаторами вызовов последнего ответа модели",
@@ -853,8 +911,14 @@ async fn handle_chat_in_existing(
     let chat = store::load_chat(&state.db, &owner, &chat_id, &defaults)
         .await
         .map_err(ApiError::from_store_error)?;
-    let settings =
-        merge_settings(&state, &owner, chat.settings.clone(), request.settings, SettingsPurpose::Call).await?;
+    let settings = merge_settings(
+        &state,
+        &owner,
+        chat.settings.clone(),
+        request.settings,
+        SettingsPurpose::Call,
+    )
+    .await?;
     let model = settings
         .model
         .clone()
@@ -871,6 +935,12 @@ async fn handle_chat_in_existing(
     )
     .await
     .map_err(ApiError::from_store_error)?;
+    let mut stored = stored;
+    // Архив остаётся читаемым, но ни одна стратегия, включая ветвление,
+    // компактизацию и facts, не видит сообщения предыдущего поколения.
+    stored
+        .messages
+        .retain(|message| message.context_generation == chat.context_generation);
 
     // Новые сообщения хода и реплика пользователя, с которой ход начался:
     // фоновым задачам нужна именно она, а не результаты инструментов.
@@ -884,7 +954,11 @@ async fn handle_chat_in_existing(
                 .rev()
                 .find(|message| matches!(message.role, Role::User));
             let prompt = turn_user.map(|m| m.content.clone()).unwrap_or_default();
-            (messages, prompt, Some(turn_user.map(|m| m.seq).unwrap_or(0)))
+            (
+                messages,
+                prompt,
+                Some(turn_user.map(|m| m.seq).unwrap_or(0)),
+            )
         }
     };
 
@@ -906,13 +980,18 @@ async fn handle_chat_in_existing(
     // решение 3): его текст переиспользуется как контекст для генерации
     // названия чата, не задерживая ответ пользователю вторым обращением к
     // системному сообщению.
-    let system_text = history.first().map(|m| m.content.clone()).unwrap_or_default();
+    let system_text = history
+        .first()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
 
-    let limit = effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
+    let limit =
+        effective_context_limit(state.config.max_context_tokens, settings.max_context_tokens)?;
     check_context_limit(&history, limit)?;
 
-    let pipeline = Pipeline::new(state.agent.clone())
-        .with_output_policies(agentcore::invariants::default_output_policies(state.agent.clone()));
+    let pipeline = Pipeline::new(state.agent.clone()).with_output_policies(
+        agentcore::invariants::default_output_policies(state.agent.clone()),
+    );
     let pipeline_context = RequestContext::new(request_id.clone(), history, settings.clone())
         .with_invariants((*state.invariants).clone())
         .with_tools(tools);
@@ -926,7 +1005,10 @@ async fn handle_chat_in_existing(
     // модели, а не в конце хода: пишущий инструмент мог уже изменить
     // репозиторий, и история чата обязана это отражать, даже если клиент
     // потом упадёт.
-    let mut rows: Vec<store::NewMessage> = new_messages.into_iter().map(store::NewMessage::from_message).collect();
+    let mut rows: Vec<store::NewMessage> = new_messages
+        .into_iter()
+        .map(store::NewMessage::from_message)
+        .collect();
     rows.push(store::NewMessage {
         role: Role::Assistant,
         content: reply.content.clone(),
@@ -936,13 +1018,20 @@ async fn handle_chat_in_existing(
         tool_call_id: None,
         tool_name: None,
     });
-    let mut written = store::append_messages(&state.db, &owner, &chat_id, rows)
-        .await
-        .map_err(ApiError::from_store_error)?;
+    let mut written = store::append_messages_for_generation(
+        &state.db,
+        &owner,
+        &chat_id,
+        rows,
+        chat.context_generation,
+    )
+    .await
+    .map_err(ApiError::from_store_error)?;
     let assistant_row = written.pop().expect("ответ модели записан последним");
     let user_seq = turn_user_seq.unwrap_or_else(|| written.first().map(|row| row.seq).unwrap_or(0));
 
-    let response = ChatResponse::new(request_id, model, &reply, policy).with_chat(chat_id.clone(), assistant_row.seq);
+    let response = ChatResponse::new(request_id, model, &reply, policy)
+        .with_chat(chat_id.clone(), assistant_row.seq);
     // Пока модель собирает данные инструментами, ход не завершён: факты,
     // память, трекер задачи и название считаются по окончательному ответу,
     // иначе каждая итерация цикла стоила бы им лишнего вызова модели.
@@ -954,8 +1043,15 @@ async fn handle_chat_in_existing(
     // вторым вызовом модели незачем, а сообщение уже целиком доступно в
     // хвосте истории (design.md, решение 5).
     if strategy == agentcore::config::ContextStrategy::Facts {
-        let facts_updated =
-            crate::facts::update_after_exchange(&state, &chat_id, &settings, &prompt, user_seq).await;
+        let facts_updated = crate::facts::update_after_exchange(
+            &state,
+            &chat_id,
+            &settings,
+            &prompt,
+            user_seq,
+            chat.context_generation,
+        )
+        .await;
         assembled.context.facts_updated = Some(facts_updated);
     }
 
@@ -973,9 +1069,14 @@ async fn handle_chat_in_existing(
         let route_owner = owner.clone();
         let route_prompt = prompt.clone();
         tokio::spawn(async move {
-            let outcome =
-                crate::memory::route_after_exchange(&route_state, &route_chat, &route_settings, &route_owner, &route_prompt)
-                    .await;
+            let outcome = crate::memory::route_after_exchange(
+                &route_state,
+                &route_chat,
+                &route_settings,
+                &route_owner,
+                &route_prompt,
+            )
+            .await;
             route_state
                 .memory_route_outcomes
                 .lock()
@@ -988,7 +1089,9 @@ async fn handle_chat_in_existing(
     // задерживающий ответ пользователю; результат прогона попадёт в блок
     // `context` СЛЕДУЮЩЕГО ответа этого чата (design.md, решение 5;
     // specs/task-state, «Автоматический трекер предлагает переход»).
-    if crate::task::effective_enabled(&state, &settings) && crate::task::effective_auto_enabled(&state, &settings) {
+    if crate::task::effective_enabled(&state, &settings)
+        && crate::task::effective_auto_enabled(&state, &settings)
+    {
         let track_state = state.clone();
         let track_chat = chat.clone();
         let track_settings = settings.clone();
@@ -1023,11 +1126,13 @@ async fn handle_chat_in_existing(
         let title_chat_id = chat_id.clone();
         let owner = owner.clone();
         let settings = settings.clone();
+        let context_generation = chat.context_generation;
         tokio::spawn(crate::title::generate_and_save(
             state,
             title_chat_id,
             owner,
             settings,
+            context_generation,
             system_text,
             prompt.clone(),
         ));
@@ -1044,7 +1149,10 @@ async fn run_pipeline(
     match pipeline.run(context).await {
         Ok(PipelineOutcome::Completed { reply, policy }) => Ok((*reply, policy)),
         Ok(PipelineOutcome::Rejected {
-            stage, code, reason, ..
+            stage,
+            code,
+            reason,
+            ..
         }) => {
             tracing::info!(%request_id, %stage, %code, "запрос отклонён политикой");
             Err(ApiError::policy_rejected(code, reason))
@@ -1073,8 +1181,14 @@ async fn handle_create_chat(
     body: CreateChatRequest,
 ) -> Result<ChatDto, ApiError> {
     let title = validate_title(body.title)?.unwrap_or_else(|| DEFAULT_CHAT_TITLE.to_string());
-    let settings =
-        merge_settings(&state, &owner, server_defaults(&state), body.settings, SettingsPurpose::Storage).await?;
+    let settings = merge_settings(
+        &state,
+        &owner,
+        server_defaults(&state),
+        body.settings,
+        SettingsPurpose::Storage,
+    )
+    .await?;
     let chat = store::create_chat(&state.db, &owner, &title, &settings)
         .await
         .map_err(ApiError::from_store_error)?;
@@ -1209,14 +1323,30 @@ async fn handle_patch_chat(
             let chat = store::load_chat(&state.db, &owner, &id, &defaults)
                 .await
                 .map_err(ApiError::from_store_error)?;
-            Some(merge_settings(&state, &owner, chat.settings, Some(dto), SettingsPurpose::Storage).await?)
+            Some(
+                merge_settings(
+                    &state,
+                    &owner,
+                    chat.settings,
+                    Some(dto),
+                    SettingsPurpose::Storage,
+                )
+                .await?,
+            )
         }
         None => None,
     };
 
-    let updated = store::update_chat(&state.db, &owner, &id, title.as_deref(), settings.as_ref(), &defaults)
-        .await
-        .map_err(ApiError::from_store_error)?;
+    let updated = store::update_chat(
+        &state.db,
+        &owner,
+        &id,
+        title.as_deref(),
+        settings.as_ref(),
+        &defaults,
+    )
+    .await
+    .map_err(ApiError::from_store_error)?;
     chat_dto_with_summary(&state, updated).await
 }
 
@@ -1233,6 +1363,42 @@ async fn append_messages_handler(
     match handle_append_messages(state, request_id.clone(), owner, id, body).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err(err) => err.with_request_id(request_id).into_response(),
+    }
+}
+
+async fn reset_context_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+) -> Response {
+    match store::reset_context(&state.db, &owner, &id).await {
+        Ok(context_generation) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"context_generation": context_generation})),
+        )
+            .into_response(),
+        Err(err) => ApiError::from_store_error(err)
+            .with_request_id(request_id)
+            .into_response(),
+    }
+}
+
+async fn clear_chat_handler(
+    State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
+    Extension(Owner(owner)): Extension<Owner>,
+    Path(id): Path<String>,
+) -> Response {
+    match store::clear_chat(&state.db, &owner, &id).await {
+        Ok(context_generation) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"context_generation": context_generation})),
+        )
+            .into_response(),
+        Err(err) => ApiError::from_store_error(err)
+            .with_request_id(request_id)
+            .into_response(),
     }
 }
 
@@ -1264,7 +1430,8 @@ async fn handle_append_messages(
     for message in &request.messages {
         // Ответ модели из одних вызовов и результат инструмента (у
         // `git_add` вывод пуст) законно приходят без текста.
-        let may_be_empty = !message.tool_calls.is_empty() || matches!(message.role, crate::dto::RoleDto::Tool);
+        let may_be_empty =
+            !message.tool_calls.is_empty() || matches!(message.role, crate::dto::RoleDto::Tool);
         if message.content.trim().is_empty() && !may_be_empty {
             return Err(ApiError::invalid_request(
                 "текст сообщения не должен быть пустым",
@@ -1279,9 +1446,15 @@ async fn handle_append_messages(
         .map(crate::dto::NewMessageDto::into_new_message)
         .collect();
 
-    let rows = store::append_messages(&state.db, &owner, &chat_id, messages)
-        .await
-        .map_err(ApiError::from_store_error)?;
+    let rows = store::append_messages_for_generation(
+        &state.db,
+        &owner,
+        &chat_id,
+        messages,
+        request.context_generation,
+    )
+    .await
+    .map_err(ApiError::from_store_error)?;
 
     // Тексты сообщений в журнал не попадают: их запись включает только
     // AGENTD_LOG_CONTENT, и у дозаписи нет обмена с провайдером, который
@@ -1320,7 +1493,11 @@ async fn get_facts_handler(
     }
 }
 
-async fn handle_get_facts(state: AppState, owner: String, chat_id: String) -> Result<FactsResponse, ApiError> {
+async fn handle_get_facts(
+    state: AppState,
+    owner: String,
+    chat_id: String,
+) -> Result<FactsResponse, ApiError> {
     let defaults = server_defaults(&state);
     store::load_chat(&state.db, &owner, &chat_id, &defaults)
         .await
@@ -1394,7 +1571,12 @@ async fn delete_fact_handler(
     }
 }
 
-async fn handle_delete_fact(state: AppState, owner: String, chat_id: String, key: String) -> Result<(), ApiError> {
+async fn handle_delete_fact(
+    state: AppState,
+    owner: String,
+    chat_id: String,
+    key: String,
+) -> Result<(), ApiError> {
     let defaults = server_defaults(&state);
     store::load_chat(&state.db, &owner, &chat_id, &defaults)
         .await
@@ -1418,7 +1600,11 @@ async fn get_branches_handler(
     }
 }
 
-async fn handle_get_branches(state: AppState, owner: String, chat_id: String) -> Result<BranchesResponse, ApiError> {
+async fn handle_get_branches(
+    state: AppState,
+    owner: String,
+    chat_id: String,
+) -> Result<BranchesResponse, ApiError> {
     let branches = store::list_branches(&state.db, &owner, &chat_id)
         .await
         .map_err(ApiError::from_store_error)?;
@@ -1497,7 +1683,12 @@ async fn handle_get_working_memory(
     let entries = store::load_working_memory(&state.db, &chat_id, &chat.active_task_id)
         .await
         .map_err(ApiError::from_store_error)?;
-    Ok(WorkingMemoryResponse { entries: entries.into_iter().map(WorkingMemoryEntryDto::from).collect() })
+    Ok(WorkingMemoryResponse {
+        entries: entries
+            .into_iter()
+            .map(WorkingMemoryEntryDto::from)
+            .collect(),
+    })
 }
 
 async fn set_working_memory_handler(
@@ -1536,9 +1727,17 @@ async fn handle_set_working_memory(
         )));
     }
     let now = agentcore::agent::now_secs();
-    store::set_working_memory(&state.db, &chat_id, &chat.active_task_id, &body.key, &body.value, "manual", now)
-        .await
-        .map_err(ApiError::from_store_error)?;
+    store::set_working_memory(
+        &state.db,
+        &chat_id,
+        &chat.active_task_id,
+        &body.key,
+        &body.value,
+        "manual",
+        now,
+    )
+    .await
+    .map_err(ApiError::from_store_error)?;
     Ok(WorkingMemoryEntryDto {
         key: body.key,
         value: body.value,
@@ -1608,7 +1807,13 @@ async fn handle_finish_task(
     )
     .await
     .map_err(ApiError::from_store_error)?;
-    Ok(LongTermMemoryResponse { entries: result.transferred.into_iter().map(LongTermMemoryEntryDto::from).collect() })
+    Ok(LongTermMemoryResponse {
+        entries: result
+            .transferred
+            .into_iter()
+            .map(LongTermMemoryEntryDto::from)
+            .collect(),
+    })
 }
 
 // --- Состояние задачи (specs/task-state) ---
@@ -1632,13 +1837,17 @@ fn map_task_error(err: crate::task::TaskError) -> ApiError {
         crate::task::TaskError::StepTooLong => {
             ApiError::task_transition_invalid("текст шага превышает операторский лимит длины")
         }
-        crate::task::TaskError::ExpectedActionTooLong => {
-            ApiError::task_transition_invalid("текст ожидаемого действия превышает операторский лимит длины")
-        }
+        crate::task::TaskError::ExpectedActionTooLong => ApiError::task_transition_invalid(
+            "текст ожидаемого действия превышает операторский лимит длины",
+        ),
     }
 }
 
-async fn task_state_dto(state: &AppState, owner: &str, chat_id: &str) -> Result<TaskStateDto, ApiError> {
+async fn task_state_dto(
+    state: &AppState,
+    owner: &str,
+    chat_id: &str,
+) -> Result<TaskStateDto, ApiError> {
     let task = store::load_task_state(&state.db, owner, chat_id)
         .await
         .map_err(ApiError::from_store_error)?;
@@ -1652,7 +1861,10 @@ async fn task_state_dto(state: &AppState, owner: &str, chat_id: &str) -> Result<
         expected_action: task.expected_action,
         paused: task.paused,
         resume_brief: task.resume_brief,
-        transitions: transitions.into_iter().map(TaskTransitionDto::from).collect(),
+        transitions: transitions
+            .into_iter()
+            .map(TaskTransitionDto::from)
+            .collect(),
     })
 }
 
@@ -1695,7 +1907,9 @@ async fn handle_task_transition(
             // Завершение идёт отдельным путём, но подчиняется тому же
             // автомату: ребро `validation → done` и отсутствие паузы
             // (specs/task-state, «Переход в done завершает задачу»).
-            crate::task::check_can_finish(&state, &owner, &chat_id).await.map_err(map_task_error)?;
+            crate::task::check_can_finish(&state, &owner, &chat_id)
+                .await
+                .map_err(map_task_error)?;
             let result = store::finish_task(
                 &state.db,
                 &owner,
@@ -1707,7 +1921,10 @@ async fn handle_task_transition(
             .await
             .map_err(ApiError::from_store_error)?;
             let task = task_state_dto(&state, &owner, &chat_id).await?;
-            Ok(TaskTransitionResponse { task, new_task_id: Some(result.new_task_id) })
+            Ok(TaskTransitionResponse {
+                task,
+                new_task_id: Some(result.new_task_id),
+            })
         }
         Some(stage) => {
             crate::task::apply_manual_transition(
@@ -1721,14 +1938,26 @@ async fn handle_task_transition(
             .await
             .map_err(map_task_error)?;
             let task = task_state_dto(&state, &owner, &chat_id).await?;
-            Ok(TaskTransitionResponse { task, new_task_id: None })
+            Ok(TaskTransitionResponse {
+                task,
+                new_task_id: None,
+            })
         }
         None => {
-            crate::task::update_fields(&state, &owner, &chat_id, body.step.as_deref(), body.expected_action.as_deref())
-                .await
-                .map_err(map_task_error)?;
+            crate::task::update_fields(
+                &state,
+                &owner,
+                &chat_id,
+                body.step.as_deref(),
+                body.expected_action.as_deref(),
+            )
+            .await
+            .map_err(map_task_error)?;
             let task = task_state_dto(&state, &owner, &chat_id).await?;
-            Ok(TaskTransitionResponse { task, new_task_id: None })
+            Ok(TaskTransitionResponse {
+                task,
+                new_task_id: None,
+            })
         }
     }
 }
@@ -1744,7 +1973,9 @@ async fn task_pause_handler(
             Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
             Err(err) => err.with_request_id(request_id).into_response(),
         },
-        Err(err) => map_task_error(err).with_request_id(request_id).into_response(),
+        Err(err) => map_task_error(err)
+            .with_request_id(request_id)
+            .into_response(),
     }
 }
 
@@ -1759,7 +1990,9 @@ async fn task_resume_handler(
             Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
             Err(err) => err.with_request_id(request_id).into_response(),
         },
-        Err(err) => map_task_error(err).with_request_id(request_id).into_response(),
+        Err(err) => map_task_error(err)
+            .with_request_id(request_id)
+            .into_response(),
     }
 }
 
@@ -1780,11 +2013,19 @@ async fn get_long_term_memory_handler(
 /// рассчитанным на стоимость запроса к модели.
 const MANUAL_LONG_TERM_LIST_LIMIT: u32 = 1000;
 
-async fn handle_get_long_term_memory(state: AppState, owner: String) -> Result<LongTermMemoryResponse, ApiError> {
+async fn handle_get_long_term_memory(
+    state: AppState,
+    owner: String,
+) -> Result<LongTermMemoryResponse, ApiError> {
     let entries = store::load_long_term_memory(&state.db, &owner, MANUAL_LONG_TERM_LIST_LIMIT)
         .await
         .map_err(ApiError::from_store_error)?;
-    Ok(LongTermMemoryResponse { entries: entries.into_iter().map(LongTermMemoryEntryDto::from).collect() })
+    Ok(LongTermMemoryResponse {
+        entries: entries
+            .into_iter()
+            .map(LongTermMemoryEntryDto::from)
+            .collect(),
+    })
 }
 
 async fn set_long_term_memory_handler(
@@ -1804,7 +2045,10 @@ async fn handle_set_long_term_memory(
     owner: String,
     body: SetLongTermMemoryRequest,
 ) -> Result<LongTermMemoryEntryDto, ApiError> {
-    if !matches!(body.entry_type.as_str(), "profile" | "decision" | "knowledge") {
+    if !matches!(
+        body.entry_type.as_str(),
+        "profile" | "decision" | "knowledge"
+    ) {
         return Err(ApiError::invalid_request(format!(
             "неизвестный entry_type долговременной памяти: {}",
             body.entry_type
@@ -1880,7 +2124,9 @@ async fn handle_get_profiles(state: AppState, owner: String) -> Result<ProfilesR
     let profiles = crate::profile::list(&state, &owner)
         .await
         .map_err(ApiError::from_store_error)?;
-    Ok(ProfilesResponse { profiles: profiles.into_iter().map(ProfileDto::from).collect() })
+    Ok(ProfilesResponse {
+        profiles: profiles.into_iter().map(ProfileDto::from).collect(),
+    })
 }
 
 async fn create_profile_handler(
@@ -1901,9 +2147,16 @@ async fn handle_create_profile(
     body: CreateProfileRequest,
 ) -> Result<ProfileDto, ApiError> {
     if body.name.trim().is_empty() {
-        return Err(ApiError::invalid_request("название профиля не может быть пустым"));
+        return Err(ApiError::invalid_request(
+            "название профиля не может быть пустым",
+        ));
     }
-    if !crate::profile::has_any_preference(&body.persona, &body.style, &body.format, &body.constraints) {
+    if !crate::profile::has_any_preference(
+        &body.persona,
+        &body.style,
+        &body.format,
+        &body.constraints,
+    ) {
         return Err(ApiError::profile_rejected(
             "профиль должен содержать хотя бы одно непустое поле предпочтений",
         ));
@@ -1951,7 +2204,11 @@ async fn get_profile_handler(
     }
 }
 
-async fn handle_get_profile(state: AppState, owner: String, id: String) -> Result<ProfileDto, ApiError> {
+async fn handle_get_profile(
+    state: AppState,
+    owner: String,
+    id: String,
+) -> Result<ProfileDto, ApiError> {
     let profile = crate::profile::find(&state, &owner, &id)
         .await
         .map_err(ApiError::from_store_error)?
@@ -1979,12 +2236,16 @@ async fn handle_patch_profile(
     body: UpdateProfileRequest,
 ) -> Result<ProfileDto, ApiError> {
     if crate::profile::find_built_in(&id).is_some() {
-        return Err(ApiError::profile_rejected("встроенный профиль нельзя изменить"));
+        return Err(ApiError::profile_rejected(
+            "встроенный профиль нельзя изменить",
+        ));
     }
     if let Some(name) = &body.name
         && name.trim().is_empty()
     {
-        return Err(ApiError::invalid_request("название профиля не может быть пустым"));
+        return Err(ApiError::invalid_request(
+            "название профиля не может быть пустым",
+        ));
     }
     let updated = store::update_owner_profile(
         &state.db,
@@ -1998,8 +2259,12 @@ async fn handle_patch_profile(
     )
     .await
     .map_err(|err| map_store_error(err, ApiError::profile_not_found()))?;
-    if !crate::profile::has_any_preference(&updated.persona, &updated.style, &updated.format, &updated.constraints)
-    {
+    if !crate::profile::has_any_preference(
+        &updated.persona,
+        &updated.style,
+        &updated.format,
+        &updated.constraints,
+    ) {
         return Err(ApiError::profile_rejected(
             "профиль должен содержать хотя бы одно непустое поле предпочтений",
         ));
@@ -2071,13 +2336,14 @@ pub fn router(state: AppState) -> Router {
         .route("/chats", post(create_chat).get(list_chats_handler))
         .route(
             "/chats/{id}",
-            get(get_chat_handler).patch(patch_chat_handler).delete(delete_chat_handler),
+            get(get_chat_handler)
+                .patch(patch_chat_handler)
+                .delete(delete_chat_handler),
         )
         .route("/chats/{id}/messages", post(append_messages_handler))
-        .route(
-            "/chats/{id}/facts",
-            get(get_facts_handler),
-        )
+        .route("/chats/{id}/clear-context", post(reset_context_handler))
+        .route("/chats/{id}/clear", post(clear_chat_handler))
+        .route("/chats/{id}/facts", get(get_facts_handler))
         .route(
             "/chats/{id}/facts/{key}",
             axum::routing::put(put_fact_handler).delete(delete_fact_handler),
@@ -2190,8 +2456,14 @@ mod context_limit_tests {
 
     #[test]
     fn effective_context_limit_accepts_narrower_client_value() {
-        assert_eq!(effective_context_limit(Some(100), Some(50)).unwrap(), Some(50));
-        assert_eq!(effective_context_limit(Some(100), Some(100)).unwrap(), Some(100));
+        assert_eq!(
+            effective_context_limit(Some(100), Some(50)).unwrap(),
+            Some(50)
+        );
+        assert_eq!(
+            effective_context_limit(Some(100), Some(100)).unwrap(),
+            Some(100)
+        );
     }
 
     #[test]
@@ -2203,7 +2475,10 @@ mod context_limit_tests {
     fn effective_context_limit_accepts_client_value_without_operator_default() {
         // Клиентское значение действует самостоятельно: отсутствие
         // операторского лимита не повод для отказа (design.md, решение 1).
-        assert_eq!(effective_context_limit(None, Some(4000)).unwrap(), Some(4000));
+        assert_eq!(
+            effective_context_limit(None, Some(4000)).unwrap(),
+            Some(4000)
+        );
     }
 
     #[test]

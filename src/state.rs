@@ -9,8 +9,8 @@ use agentupstream::UpstreamAgent;
 use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Сколько раз сервис создавал клиента провайдера. Диагностика: клиент
 // создаётся один раз при старте, а не на каждый входящий запрос.
@@ -47,10 +47,12 @@ pub struct AppState {
     /// Не персистентно: перезапуск сервиса обнуляет счётчики, это тот же
     /// допустимый компромисс, что и однопроцессная SQLite (design.md,
     /// «Риски»).
-    pub memory_route_outcomes: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::memory::RouteOutcome>>>,
+    pub memory_route_outcomes:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, crate::memory::RouteOutcome>>>,
     /// Тот же приём, что `memory_route_outcomes`, для фонового трекера
     /// состояния задачи (specs/task-state, design.md решение 5).
-    pub task_track_outcomes: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::task::TrackOutcome>>>,
+    pub task_track_outcomes:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, crate::task::TrackOutcome>>>,
     /// Временный каталог тестовой базы. Держится здесь, чтобы не удалиться
     /// раньше последнего клона состояния; удаляется вместе с последним.
     #[cfg(test)]
@@ -77,7 +79,9 @@ impl AppState {
             agent: Arc::new(agent),
             invariants: Arc::new(invariants),
             db,
-            memory_route_outcomes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            memory_route_outcomes: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             task_track_outcomes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             _test_db_dir: None,
@@ -121,6 +125,7 @@ fn build_agent(config: &AgentdConfig) -> Result<ServiceAgent> {
     // переменных окружения, а не из пользовательского конфига клиента.
     let core_config = Config {
         model: Some(config.model.clone()),
+        ollama_url: config.ollama_url.clone(),
         ..Config::default()
     };
     // Файлы JSONL внутри контейнера некуда складывать, поэтому в обычном
@@ -172,8 +177,10 @@ impl AppState {
     pub async fn with_env(pairs: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().expect("временный каталог для базы теста");
         let db_path = dir.path().join("agentd.db");
-        let mut owned: Vec<(String, String)> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let mut owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         // Явно заданный в pairs AGENTD_DB_PATH (тест намеренно делит базу
         // между двумя состояниями) не переопределяется временным путём.
         if !owned.iter().any(|(key, _)| key == "AGENTD_DB_PATH") {

@@ -99,7 +99,11 @@ pub async fn list(state: &AppState, owner: &str) -> Result<Vec<Profile>, store::
 /// Один профиль, доступный владельцу: сперва встроенные, затем собственные
 /// хранилища. Чужой профиль неотличим от несуществующего
 /// (specs/user-profiles, «Чужой профиль не читается»).
-pub async fn find(state: &AppState, owner: &str, id: &str) -> Result<Option<Profile>, store::StoreError> {
+pub async fn find(
+    state: &AppState,
+    owner: &str,
+    id: &str,
+) -> Result<Option<Profile>, store::StoreError> {
     if let Some(profile) = find_built_in(id) {
         return Ok(Some(profile));
     }
@@ -112,7 +116,12 @@ pub async fn find(state: &AppState, owner: &str, id: &str) -> Result<Option<Prof
 
 /// Профиль без единого непустого поля предпочтений бессмысленен
 /// (specs/user-profiles, «Профиль без предпочтений отклоняется»).
-pub fn has_any_preference(persona: &str, style: &str, format: &str, constraints: &[String]) -> bool {
+pub fn has_any_preference(
+    persona: &str,
+    style: &str,
+    format: &str,
+    constraints: &[String],
+) -> bool {
     !persona.trim().is_empty()
         || !style.trim().is_empty()
         || !format.trim().is_empty()
@@ -130,7 +139,11 @@ fn raw_section(profile: &Profile) -> String {
     if !profile.format.trim().is_empty() {
         lines.push(format!("Формат ответа: {}", profile.format));
     }
-    let constraints: Vec<&String> = profile.constraints.iter().filter(|c| !c.trim().is_empty()).collect();
+    let constraints: Vec<&String> = profile
+        .constraints
+        .iter()
+        .filter(|c| !c.trim().is_empty())
+        .collect();
     if !constraints.is_empty() {
         lines.push("Ограничения:".to_string());
         for constraint in constraints {
@@ -153,19 +166,33 @@ pub struct BuiltSection {
 /// умолчания (specs/user-profiles, «Профиль выбирается настройкой чата
 /// поверх операторского умолчания»). Пусто и там, и там — запрос собирается
 /// без раздела профиля.
-pub fn effective_profile_id(state: &AppState, settings: &agentcore::config::ChatSettings) -> Option<String> {
-    settings.profile_id.clone().or_else(|| state.config.default_profile.clone())
+pub fn effective_profile_id(
+    state: &AppState,
+    settings: &agentcore::config::ChatSettings,
+) -> Option<String> {
+    settings
+        .profile_id
+        .clone()
+        .or_else(|| state.config.default_profile.clone())
 }
 
 pub fn build_section(profile: &Profile, max_chars: u32) -> BuiltSection {
     let full = raw_section(profile);
     let full_chars = full.chars().count() as u32;
     if full_chars <= max_chars {
-        return BuiltSection { section: full, chars: full_chars, truncated: false };
+        return BuiltSection {
+            section: full,
+            chars: full_chars,
+            truncated: false,
+        };
     }
     let truncated: String = full.chars().take(max_chars as usize).collect();
     let chars = truncated.chars().count() as u32;
-    BuiltSection { section: truncated, chars, truncated: true }
+    BuiltSection {
+        section: truncated,
+        chars,
+        truncated: true,
+    }
 }
 
 #[cfg(test)]
@@ -178,7 +205,12 @@ mod tests {
         assert_eq!(profiles.len(), 3);
         for profile in &profiles {
             assert!(profile.built_in);
-            assert!(has_any_preference(&profile.persona, &profile.style, &profile.format, &profile.constraints));
+            assert!(has_any_preference(
+                &profile.persona,
+                &profile.style,
+                &profile.format,
+                &profile.constraints
+            ));
         }
     }
 

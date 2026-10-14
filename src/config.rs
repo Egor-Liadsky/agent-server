@@ -2,7 +2,7 @@
 //! пользовательский конфиг консольного клиента сервис не трогает.
 
 use agentcore::config::ContextStrategy;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -68,6 +68,8 @@ pub struct AgentdConfig {
     pub model: String,
     /// Адрес локального Ollama. `None` — провайдер `ollama` запрещён.
     pub ollama_url: Option<String>,
+    /// Запрещает облачный провайдер даже при запросе `provider: cloud`.
+    pub ollama_only: bool,
     /// Модели, которые клиент вправе запросить. Всегда непустой список.
     pub allowed_models: Vec<String>,
     pub request_timeout: Duration,
@@ -186,7 +188,9 @@ impl AgentdConfig {
     /// тестом, не трогая глобальное окружение процесса.
     pub fn from_source(source: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
         let get = |key: &str| -> Option<String> {
-            source(key).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+            source(key)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
         };
 
         let upstream_api_key = get(API_KEY_VAR)
@@ -230,6 +234,11 @@ impl AgentdConfig {
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             model,
             ollama_url: get("AGENTD_OLLAMA_URL"),
+            ollama_only: parse_bool_named_default(
+                get("AGENTD_OLLAMA_ONLY"),
+                "AGENTD_OLLAMA_ONLY",
+                false,
+            )?,
             allowed_models,
             request_timeout: Duration::from_secs(parse_number(
                 get("AGENTD_REQUEST_TIMEOUT_SECS"),
@@ -583,7 +592,10 @@ mod tests {
         assert_eq!(config.model, DEFAULT_MODEL);
         assert!(config.client_tokens.is_empty());
         assert!(config.ollama_url.is_none());
-        assert_eq!(config.request_timeout.as_secs(), DEFAULT_REQUEST_TIMEOUT_SECS);
+        assert_eq!(
+            config.request_timeout.as_secs(),
+            DEFAULT_REQUEST_TIMEOUT_SECS
+        );
         assert_eq!(config.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
         assert_eq!(config.max_concurrency, DEFAULT_MAX_CONCURRENCY);
         assert_eq!(config.log_format, LogFormat::Json);
@@ -766,8 +778,8 @@ mod tests {
 
     #[test]
     fn port_variable_sets_listen_addr() {
-        let config =
-            config_from(&[(API_KEY_VAR, "secret-key-value"), ("PORT", "9000")]).expect("конфигурация");
+        let config = config_from(&[(API_KEY_VAR, "secret-key-value"), ("PORT", "9000")])
+            .expect("конфигурация");
         assert_eq!(config.listen_addr.to_string(), "0.0.0.0:9000");
     }
 
@@ -819,7 +831,10 @@ mod tests {
         let config = config_from(&[(API_KEY_VAR, "secret-key-value")]).expect("конфигурация");
         assert_eq!(config.context_strategy, ContextStrategy::Summary);
         assert!(config.allowed_context_strategies.is_empty());
-        assert_eq!(config.context_window_messages, DEFAULT_CONTEXT_WINDOW_MESSAGES);
+        assert_eq!(
+            config.context_window_messages,
+            DEFAULT_CONTEXT_WINDOW_MESSAGES
+        );
         assert_eq!(config.max_facts, DEFAULT_MAX_FACTS);
         assert_eq!(config.fact_value_max_chars, DEFAULT_FACT_VALUE_MAX_CHARS);
         assert_eq!(config.max_branch_depth, DEFAULT_MAX_BRANCH_DEPTH);
@@ -831,7 +846,10 @@ mod tests {
         let config = config_from(&[
             (API_KEY_VAR, "secret-key-value"),
             ("AGENTD_CONTEXT_STRATEGY", "sliding_window"),
-            ("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "summary, sliding_window"),
+            (
+                "AGENTD_ALLOWED_CONTEXT_STRATEGIES",
+                "summary, sliding_window",
+            ),
             ("AGENTD_CONTEXT_WINDOW_MESSAGES", "6"),
             ("AGENTD_MAX_FACTS", "20"),
             ("AGENTD_FACT_VALUE_MAX_CHARS", "200"),
@@ -940,12 +958,30 @@ mod tests {
         assert!(!config.memory_layers_enabled);
         assert!(config.memory_router_enabled);
         assert_eq!(config.memory_router_model, None);
-        assert_eq!(config.memory_working_max_entries, DEFAULT_MEMORY_WORKING_MAX_ENTRIES);
-        assert_eq!(config.memory_working_value_max_chars, DEFAULT_MEMORY_WORKING_VALUE_MAX_CHARS);
-        assert_eq!(config.memory_working_key_max_chars, DEFAULT_MEMORY_WORKING_KEY_MAX_CHARS);
-        assert_eq!(config.memory_long_term_max_entries, DEFAULT_MEMORY_LONG_TERM_MAX_ENTRIES);
-        assert_eq!(config.memory_long_term_value_max_chars, DEFAULT_MEMORY_LONG_TERM_VALUE_MAX_CHARS);
-        assert_eq!(config.memory_long_term_key_max_chars, DEFAULT_MEMORY_LONG_TERM_KEY_MAX_CHARS);
+        assert_eq!(
+            config.memory_working_max_entries,
+            DEFAULT_MEMORY_WORKING_MAX_ENTRIES
+        );
+        assert_eq!(
+            config.memory_working_value_max_chars,
+            DEFAULT_MEMORY_WORKING_VALUE_MAX_CHARS
+        );
+        assert_eq!(
+            config.memory_working_key_max_chars,
+            DEFAULT_MEMORY_WORKING_KEY_MAX_CHARS
+        );
+        assert_eq!(
+            config.memory_long_term_max_entries,
+            DEFAULT_MEMORY_LONG_TERM_MAX_ENTRIES
+        );
+        assert_eq!(
+            config.memory_long_term_value_max_chars,
+            DEFAULT_MEMORY_LONG_TERM_VALUE_MAX_CHARS
+        );
+        assert_eq!(
+            config.memory_long_term_key_max_chars,
+            DEFAULT_MEMORY_LONG_TERM_KEY_MAX_CHARS
+        );
     }
 
     #[test]
@@ -1047,8 +1083,14 @@ mod tests {
         assert!(!config.task_state_auto_enabled);
         assert_eq!(config.task_state_model, None);
         assert_eq!(config.task_step_max_chars, DEFAULT_TASK_STEP_MAX_CHARS);
-        assert_eq!(config.task_expected_action_max_chars, DEFAULT_TASK_EXPECTED_ACTION_MAX_CHARS);
-        assert_eq!(config.task_resume_brief_max_chars, DEFAULT_TASK_RESUME_BRIEF_MAX_CHARS);
+        assert_eq!(
+            config.task_expected_action_max_chars,
+            DEFAULT_TASK_EXPECTED_ACTION_MAX_CHARS
+        );
+        assert_eq!(
+            config.task_resume_brief_max_chars,
+            DEFAULT_TASK_RESUME_BRIEF_MAX_CHARS
+        );
     }
 
     #[test]
@@ -1106,6 +1148,9 @@ mod tests {
             ("AGENTD_INVARIANTS_PATH", "/etc/agentd/invariants.toml"),
         ])
         .expect("конфигурация");
-        assert_eq!(config.invariants_path.as_deref(), Some("/etc/agentd/invariants.toml"));
+        assert_eq!(
+            config.invariants_path.as_deref(),
+            Some("/etc/agentd/invariants.toml")
+        );
     }
 }

@@ -6,7 +6,7 @@ use crate::config::API_KEY_VAR;
 use crate::dto::{ChatRequest, ChatResponse};
 use crate::error::ErrorEnvelope;
 use crate::middleware::REQUEST_ID_HEADER;
-use crate::state::{test_lock, AppState};
+use crate::state::{AppState, test_lock};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
@@ -15,7 +15,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Запрос произвольного метода с необязательными телом и токеном — общий
 /// строитель для тестов управления чатами.
-fn request(method: &str, uri: &str, body: Option<serde_json::Value>, token: Option<&str>) -> Request<Body> {
+fn request(
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+    token: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(token) = token {
         builder = builder.header("authorization", format!("Bearer {token}"));
@@ -124,7 +129,12 @@ async fn seed_exchanges(state: &AppState, chat_id: &str, pairs: &[(&str, &str)])
         append(chat_id, serde_json::json!({ "messages": messages }), None),
     )
     .await;
-    assert_eq!(sent.status, StatusCode::CREATED, "подготовка истории: {}", sent.body);
+    assert_eq!(
+        sent.status,
+        StatusCode::CREATED,
+        "подготовка истории: {}",
+        sent.body
+    );
 }
 
 /// Сервис, у которого апстрим — заданный `wiremock`.
@@ -222,7 +232,11 @@ async fn both_prompt_and_messages_are_rejected() {
 #[tokio::test]
 async fn neither_prompt_nor_messages_is_rejected() {
     let _guard = test_lock();
-    expect_invalid_request(serde_json::json!({ "prompt": "  " }), AppState::for_tests().await).await;
+    expect_invalid_request(
+        serde_json::json!({ "prompt": "  " }),
+        AppState::for_tests().await,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -258,6 +272,74 @@ async fn ollama_without_url_is_rejected() {
         AppState::for_tests().await,
     )
     .await;
+}
+
+#[tokio::test]
+async fn cloud_provider_is_not_called_in_ollama_only_mode() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(provider_reply("не должно быть вызова")),
+        )
+        .mount(&server)
+        .await;
+
+    let state = state_with_provider(&server, &[("AGENTD_OLLAMA_ONLY", "true")]).await;
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "prompt": "проверка",
+            "settings": { "provider": "cloud" }
+        })),
+    )
+    .await;
+
+    assert_eq!(sent.status, StatusCode::BAD_REQUEST);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("запросы mock-сервера")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn ollama_provider_uses_configured_service_url() {
+    let _guard = test_lock();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": { "content": "ответ Ollama" },
+            "prompt_eval_count": 1,
+            "eval_count": 2
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let state = state_with_provider(
+        &server,
+        &[
+            ("AGENTD_OLLAMA_ONLY", "true"),
+            ("AGENTD_OLLAMA_URL", server.uri().as_str()),
+        ],
+    )
+    .await;
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({
+            "prompt": "привет",
+            "settings": { "provider": "ollama", "model": "qwen2.5:1.5b" }
+        })),
+    )
+    .await;
+
+    assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
+    assert_eq!(sent.body["content"], "ответ Ollama");
 }
 
 // --- 5.3 Наложение настроек ---
@@ -504,7 +586,11 @@ async fn readyz_is_503_when_storage_fails_after_start() {
     let sent = send(state.clone(), get("/readyz")).await;
     assert_eq!(sent.status, StatusCode::SERVICE_UNAVAILABLE);
     let healthz = send(state, get("/healthz")).await;
-    assert_eq!(healthz.status, StatusCode::OK, "healthz не должен зависеть от базы");
+    assert_eq!(
+        healthz.status,
+        StatusCode::OK,
+        "healthz не должен зависеть от базы"
+    );
 }
 
 // --- 5.6 Отображение ошибок ---
@@ -550,7 +636,12 @@ async fn provider_timeout_maps_to_504() {
     let state = state_with_provider(&server, &[("AGENTD_REQUEST_TIMEOUT_SECS", "1")]).await;
     let sent = send(state, post_chat(serde_json::json!({ "prompt": "привет" }))).await;
 
-    assert_eq!(sent.status, StatusCode::GATEWAY_TIMEOUT, "тело: {}", sent.body);
+    assert_eq!(
+        sent.status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "тело: {}",
+        sent.body
+    );
     assert_eq!(sent.body["error"]["code"], "upstream_timeout");
 }
 
@@ -641,7 +732,12 @@ async fn oversized_body_is_413() {
     .await;
     let body = serde_json::json!({ "prompt": "x".repeat(500) });
     let sent = send(state, post_chat(body)).await;
-    assert_eq!(sent.status, StatusCode::PAYLOAD_TOO_LARGE, "тело: {}", sent.body);
+    assert_eq!(
+        sent.status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "тело: {}",
+        sent.body
+    );
     assert_eq!(sent.body["error"]["code"], "payload_too_large");
 }
 
@@ -717,12 +813,20 @@ async fn storage_error_does_not_leak_details_and_has_request_id() {
     let state = AppState::for_tests().await;
     state.db.close().await;
     let sent = create_chat(state, None, serde_json::json!({})).await;
-    assert_eq!(sent.status, StatusCode::INTERNAL_SERVER_ERROR, "тело: {}", sent.body);
+    assert_eq!(
+        sent.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "тело: {}",
+        sent.body
+    );
     assert_eq!(sent.body["error"]["code"], "storage_error");
     assert!(!sent.request_id_header.is_empty());
     assert_eq!(sent.body["error"]["request_id"], sent.request_id_header);
     let raw = sent.body.to_string();
-    assert!(!raw.to_lowercase().contains("database"), "текст ошибки хранилища утёк: {raw}");
+    assert!(
+        !raw.to_lowercase().contains("database"),
+        "текст ошибки хранилища утёк: {raw}"
+    );
 }
 
 // 5.3 — создание чата
@@ -776,7 +880,12 @@ async fn list_chats_paginates_over_http() {
     let _guard = test_lock();
     let state = AppState::for_tests().await;
     for i in 0..120 {
-        let sent = create_chat(state.clone(), None, serde_json::json!({ "title": format!("Чат {i}") })).await;
+        let sent = create_chat(
+            state.clone(),
+            None,
+            serde_json::json!({ "title": format!("Чат {i}") }),
+        )
+        .await;
         assert_eq!(sent.status, StatusCode::CREATED);
     }
 
@@ -838,7 +947,11 @@ async fn empty_chat_reads_with_no_messages() {
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap();
 
-    let sent = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let sent = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     assert_eq!(sent.body["messages"], serde_json::json!([]));
     assert!(sent.body["next_after"].is_null());
@@ -867,7 +980,11 @@ async fn chat_messages_are_read_in_parts() {
         assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     }
 
-    let first = send(state.clone(), request("GET", &format!("/v1/chats/{id}?limit=4"), None, None)).await;
+    let first = send(
+        state.clone(),
+        request("GET", &format!("/v1/chats/{id}?limit=4"), None, None),
+    )
+    .await;
     assert_eq!(first.status, StatusCode::OK, "тело: {}", first.body);
     let messages = first.body["messages"].as_array().expect("сообщения");
     assert_eq!(messages.len(), 4);
@@ -950,7 +1067,12 @@ async fn patch_with_empty_body_is_rejected() {
 
     let sent = send(
         state,
-        request("PATCH", &format!("/v1/chats/{id}"), Some(serde_json::json!({})), None),
+        request(
+            "PATCH",
+            &format!("/v1/chats/{id}"),
+            Some(serde_json::json!({})),
+            None,
+        ),
     )
     .await;
     assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
@@ -980,7 +1102,11 @@ async fn patch_with_invalid_settings_does_not_change_chat() {
     .await;
     assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["title"], "Новый чат");
 }
 
@@ -1056,7 +1182,12 @@ async fn summary_keep_messages_above_operator_ceiling_is_rejected() {
         ),
     )
     .await;
-    assert_eq!(patched.status, StatusCode::BAD_REQUEST, "тело: {}", patched.body);
+    assert_eq!(
+        patched.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        patched.body
+    );
     assert_eq!(patched.body["error"]["code"], "summary_settings_invalid");
 
     // Разовое переопределение той же границей.
@@ -1087,7 +1218,12 @@ async fn summary_step_messages_below_operator_floor_is_rejected() {
         serde_json::json!({ "settings": { "summary_step_messages": 2 } }),
     )
     .await;
-    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        created.body
+    );
     assert_eq!(created.body["error"]["code"], "summary_settings_invalid");
 }
 
@@ -1101,7 +1237,12 @@ async fn zero_summary_keep_messages_is_rejected() {
         serde_json::json!({ "settings": { "summary_keep_messages": 0 } }),
     )
     .await;
-    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        created.body
+    );
     assert_eq!(created.body["error"]["code"], "summary_settings_invalid");
 }
 
@@ -1119,7 +1260,12 @@ async fn chat_can_enable_summary_when_operator_default_is_disabled() {
         serde_json::json!({ "settings": { "summary_enabled": true } }),
     )
     .await;
-    assert_eq!(enabled.status, StatusCode::CREATED, "тело: {}", enabled.body);
+    assert_eq!(
+        enabled.status,
+        StatusCode::CREATED,
+        "тело: {}",
+        enabled.body
+    );
     assert_eq!(enabled.body["settings"]["summary_enabled"], true);
 
     let default_chat = create_chat(state, None, serde_json::json!({})).await;
@@ -1135,7 +1281,11 @@ async fn chat_without_summary_reports_null_summary_fields() {
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert!(loaded.body["summary"].is_null());
     assert!(loaded.body["summary_through_seq"].is_null());
 }
@@ -1159,7 +1309,11 @@ async fn patch_with_summary_field_is_rejected_as_read_only() {
     .await;
     assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert!(loaded.body["summary"].is_null());
 }
 
@@ -1172,11 +1326,19 @@ async fn delete_chat_then_second_delete_is_404() {
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let first = send(state.clone(), request("DELETE", &format!("/v1/chats/{id}"), None, None)).await;
+    let first = send(
+        state.clone(),
+        request("DELETE", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(first.status, StatusCode::NO_CONTENT, "тело: {}", first.body);
     assert!(first.body.is_null());
 
-    let second = send(state, request("DELETE", &format!("/v1/chats/{id}"), None, None)).await;
+    let second = send(
+        state,
+        request("DELETE", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(second.status, StatusCode::NOT_FOUND);
     assert_eq!(second.body["error"]["code"], "chat_not_found");
 }
@@ -1255,7 +1417,11 @@ async fn chat_id_call_uses_stored_history_and_reports_chat_id_and_seq() {
     assert_eq!(second.status, StatusCode::OK, "тело: {}", second.body);
     assert_eq!(second.body["seq"], 4);
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["message_count"], 4);
     let messages = loaded.body["messages"].as_array().unwrap();
     assert_eq!(messages[0]["content"], "первый вопрос");
@@ -1285,7 +1451,11 @@ async fn provider_error_with_chat_id_does_not_change_chat() {
     .await;
     assert_eq!(sent.status, StatusCode::BAD_GATEWAY, "тело: {}", sent.body);
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["message_count"], 0);
     assert_eq!(loaded.body["updated_at"], before_updated_at);
 }
@@ -1316,7 +1486,11 @@ async fn settings_override_in_chat_call_does_not_persist() {
     .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_ne!(loaded.body["settings"]["sampling"]["temperature"], 0.9);
 }
 
@@ -1342,7 +1516,11 @@ async fn patch_max_context_tokens_persists() {
     assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
     assert_eq!(patched.body["settings"]["max_context_tokens"], 4000);
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["settings"]["max_context_tokens"], 4000);
 }
 
@@ -1378,7 +1556,11 @@ async fn patch_null_max_context_tokens_clears_stored_limit() {
     assert_eq!(cleared.status, StatusCode::OK, "тело: {}", cleared.body);
     assert!(cleared.body["settings"]["max_context_tokens"].is_null());
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert!(loaded.body["settings"]["max_context_tokens"].is_null());
 }
 
@@ -1413,7 +1595,11 @@ async fn patch_without_max_context_tokens_field_keeps_stored_value() {
     .await;
     assert_eq!(renamed.status, StatusCode::OK, "тело: {}", renamed.body);
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["settings"]["max_context_tokens"], 4000);
 }
 
@@ -1487,7 +1673,11 @@ async fn chat_call_override_does_not_change_stored_chat_limit() {
     .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["settings"]["max_context_tokens"], 500);
 }
 
@@ -1515,10 +1705,19 @@ async fn patch_max_context_tokens_above_operator_default_is_rejected_at_storage(
         ),
     )
     .await;
-    assert_eq!(patched.status, StatusCode::BAD_REQUEST, "тело: {}", patched.body);
+    assert_eq!(
+        patched.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        patched.body
+    );
     assert_eq!(patched.body["error"]["code"], "context_limit_invalid");
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert!(loaded.body["settings"]["max_context_tokens"].is_null());
 }
 
@@ -1541,7 +1740,12 @@ async fn create_chat_with_ollama_provider_and_excessive_limit_is_rejected() {
         serde_json::json!({ "settings": { "provider": "ollama", "max_context_tokens": 8000 } }),
     )
     .await;
-    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        created.body
+    );
     assert_eq!(created.body["error"]["code"], "context_limit_invalid");
 }
 
@@ -1580,7 +1784,11 @@ async fn chat_model_outside_allowed_list_is_rejected() {
     .await;
     assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["message_count"], 0);
 }
 
@@ -1597,7 +1805,11 @@ async fn request_without_chat_id_does_not_touch_storage() {
         .await;
     let state = state_with_provider(&server, &[]).await;
 
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "prompt": "привет" }))).await;
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "prompt": "привет" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     assert!(sent.body["chat_id"].is_null());
 
@@ -1621,7 +1833,11 @@ async fn chat_is_visible_only_to_owner_token() {
     let created = create_chat(state.clone(), Some("token-a"), serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let own_list = send(state.clone(), request("GET", "/v1/chats", None, Some("token-a"))).await;
+    let own_list = send(
+        state.clone(),
+        request("GET", "/v1/chats", None, Some("token-a")),
+    )
+    .await;
     assert_eq!(own_list.body["chats"].as_array().unwrap().len(), 1);
 
     let other_list = send(state, request("GET", "/v1/chats", None, Some("token-b"))).await;
@@ -1658,7 +1874,10 @@ async fn foreign_chat_operations_are_404_and_do_not_call_model() {
         read.body["error"]["code"], missing.body["error"]["code"],
         "чужой чат должен отвечать как несуществующий"
     );
-    assert_eq!(read.body["error"]["message"], missing.body["error"]["message"]);
+    assert_eq!(
+        read.body["error"]["message"],
+        missing.body["error"]["message"]
+    );
 
     let patch = send(
         state.clone(),
@@ -1764,7 +1983,11 @@ async fn enabling_authentication_hides_anonymous_chats() {
 
 // --- Дозапись готовых сообщений (POST /v1/chats/{id}/messages) ---
 
-fn append(chat_id: &str, body: serde_json::Value, token: Option<&str>) -> Request<Body> {
+fn append(chat_id: &str, mut body: serde_json::Value, token: Option<&str>) -> Request<Body> {
+    body.as_object_mut()
+        .expect("тело дозаписи — объект")
+        .entry("context_generation")
+        .or_insert(serde_json::json!(0));
     request(
         "POST",
         &format!("/v1/chats/{chat_id}/messages"),
@@ -1799,7 +2022,10 @@ async fn append_succeeds_without_reachable_provider() {
     // провайдеру не ходит.
     let state = AppState::for_tests().await;
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
 
     let sent = send(state, append(&id, exchange_body(), None)).await;
     assert_eq!(sent.status, StatusCode::CREATED, "тело: {}", sent.body);
@@ -1809,11 +2035,228 @@ async fn append_succeeds_without_reachable_provider() {
 }
 
 #[tokio::test]
+async fn clear_context_is_owner_scoped_and_keeps_history_readable() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        ("AGENTD_UPSTREAM_API_KEY", "test-key"),
+        ("AGENTD_CLIENT_TOKENS", "owner-token,other-token"),
+    ])
+    .await;
+    let first = create_chat(state.clone(), Some("owner-token"), serde_json::json!({})).await;
+    let id = first.body["id"].as_str().unwrap().to_string();
+    let other = create_chat(state.clone(), Some("owner-token"), serde_json::json!({})).await;
+    let other_id = other.body["id"].as_str().unwrap().to_string();
+    let saved = send(
+        state.clone(),
+        append(&id, exchange_body(), Some("owner-token")),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::CREATED);
+
+    let reset = send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("/v1/chats/{id}/clear-context"),
+            None,
+            Some("owner-token"),
+        ),
+    )
+    .await;
+    assert_eq!(reset.status, StatusCode::OK, "ответ: {}", reset.body);
+    assert_eq!(reset.body["context_generation"], 1);
+    let stale = send(state.clone(), append(
+        &id,
+        serde_json::json!({ "context_generation": 0, "messages": [{ "role": "user", "content": "устаревший ход" }] }),
+        Some("owner-token"),
+    )).await;
+    assert_eq!(stale.status, StatusCode::CONFLICT);
+    assert_eq!(stale.body["error"]["code"], "context_reset");
+    let history = send(
+        state.clone(),
+        request("GET", &format!("/v1/chats/{id}"), None, Some("owner-token")),
+    )
+    .await;
+    assert_eq!(history.body["messages"].as_array().unwrap().len(), 2);
+    assert!(
+        history.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["context_generation"] == 0)
+    );
+    let unchanged = send(
+        state.clone(),
+        request(
+            "GET",
+            &format!("/v1/chats/{other_id}"),
+            None,
+            Some("owner-token"),
+        ),
+    )
+    .await;
+    assert_eq!(unchanged.body["context_generation"], 0);
+
+    let foreign = send(
+        state,
+        request(
+            "POST",
+            &format!("/v1/chats/{id}/clear-context"),
+            None,
+            Some("other-token"),
+        ),
+    )
+    .await;
+    assert_eq!(foreign.status, StatusCode::NOT_FOUND);
+    assert_eq!(foreign.body["error"]["code"], "chat_not_found");
+}
+
+#[tokio::test]
+async fn clear_chat_removes_history_and_resets_title() {
+    let _guard = test_lock();
+    let state = AppState::with_env(&[
+        ("AGENTD_UPSTREAM_API_KEY", "test-key"),
+        ("AGENTD_CLIENT_TOKENS", "owner-token,other-token"),
+    ])
+    .await;
+    let created = create_chat(
+        state.clone(),
+        Some("owner-token"),
+        serde_json::json!({"title": "Старое название"}),
+    )
+    .await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let saved = send(
+        state.clone(),
+        append(&id, exchange_body(), Some("owner-token")),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::CREATED);
+
+    let cleared = send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("/v1/chats/{id}/clear"),
+            None,
+            Some("owner-token"),
+        ),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "ответ: {}", cleared.body);
+    assert_eq!(cleared.body["context_generation"], 1);
+
+    let history = send(
+        state.clone(),
+        request("GET", &format!("/v1/chats/{id}"), None, Some("owner-token")),
+    )
+    .await;
+    assert_eq!(history.body["title"], "Новый чат");
+    assert_eq!(history.body["message_count"], 0);
+    assert_eq!(history.body["context_generation"], 1);
+    assert!(history.body["messages"].as_array().unwrap().is_empty());
+
+    let foreign = send(
+        state,
+        request(
+            "POST",
+            &format!("/v1/chats/{id}/clear"),
+            None,
+            Some("other-token"),
+        ),
+    )
+    .await;
+    assert_eq!(foreign.status, StatusCode::NOT_FOUND);
+    assert_eq!(foreign.body["error"]["code"], "chat_not_found");
+}
+
+#[tokio::test]
+async fn cloud_request_after_clear_uses_only_new_generation_and_keeps_old_history() {
+    let _guard = test_lock();
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
+        .mount(&upstream)
+        .await;
+    let state = state_with_provider(&upstream, &[]).await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap().to_string();
+    let first = send(
+        state.clone(),
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "prompt": "уникальный старый текст"
+        })),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK);
+    let reset = send(
+        state.clone(),
+        request("POST", &format!("/v1/chats/{id}/clear-context"), None, None),
+    )
+    .await;
+    assert_eq!(reset.status, StatusCode::OK);
+    let second = send(
+        state.clone(),
+        post_chat(serde_json::json!({
+            "chat_id": id,
+            "prompt": "новый текст"
+        })),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::OK, "ответ: {}", second.body);
+
+    let requests = upstream.received_requests().await.expect("запросы модели");
+    let latest: serde_json::Value =
+        serde_json::from_slice(&requests.last().unwrap().body).expect("тело модели");
+    let model_history = serde_json::to_string(&latest["messages"]).expect("JSON истории");
+    assert!(!model_history.contains("уникальный старый текст"));
+    assert!(model_history.contains("новый текст"));
+    let archive = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
+    assert!(
+        archive.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["content"] == "уникальный старый текст")
+    );
+}
+
+#[tokio::test]
+async fn append_requires_generation_to_prevent_legacy_stale_writes() {
+    let _guard = test_lock();
+    let state = AppState::for_tests().await;
+    let created = create_chat(state.clone(), None, serde_json::json!({})).await;
+    let id = created.body["id"].as_str().unwrap();
+    let response = send(
+        state,
+        request(
+            "POST",
+            &format!("/v1/chats/{id}/messages"),
+            Some(serde_json::json!({ "messages": [{ "role": "user", "content": "текст" }] })),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(response.body["error"]["code"], "invalid_request");
+    assert!(response.body["error"]["request_id"].is_string());
+}
+
+#[tokio::test]
 async fn appended_text_is_not_filtered_by_pipeline() {
     let _guard = test_lock();
     let state = AppState::for_tests().await;
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
     let text = "  текст с краевыми пробелами и словом обход политики  ";
 
     let sent = send(
@@ -1827,7 +2270,11 @@ async fn appended_text_is_not_filtered_by_pipeline() {
     .await;
     assert_eq!(sent.status, StatusCode::CREATED, "тело: {}", sent.body);
 
-    let read = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let read = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(read.body["messages"][0]["content"], text);
 }
 
@@ -1838,7 +2285,10 @@ async fn append_with_api_key_field_is_rejected() {
     let _guard = test_lock();
     let state = AppState::for_tests().await;
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
 
     let sent = send(
         state.clone(),
@@ -1854,7 +2304,11 @@ async fn append_with_api_key_field_is_rejected() {
     assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
     assert_eq!(sent.body["error"]["code"], "invalid_request");
 
-    let read = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let read = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(read.body["messages"], serde_json::json!([]));
 }
 
@@ -1865,7 +2319,10 @@ async fn append_with_empty_messages_is_rejected() {
     let _guard = test_lock();
     let state = AppState::for_tests().await;
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
 
     let sent = send(
         state,
@@ -1881,7 +2338,10 @@ async fn append_with_unknown_role_is_rejected() {
     let _guard = test_lock();
     let state = AppState::for_tests().await;
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
 
     let sent = send(
         state,
@@ -1906,19 +2366,39 @@ async fn append_to_foreign_and_missing_chat_look_identical() {
     ])
     .await;
     let created = create_chat(state.clone(), Some("token-a"), serde_json::json!({})).await;
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
 
     let foreign = send(state.clone(), append(&id, exchange_body(), Some("token-b"))).await;
     let missing = send(
         state.clone(),
-        append("00000000-0000-0000-0000-000000000000", exchange_body(), Some("token-b")),
+        append(
+            "00000000-0000-0000-0000-000000000000",
+            exchange_body(),
+            Some("token-b"),
+        ),
     )
     .await;
 
-    assert_eq!(foreign.status, StatusCode::NOT_FOUND, "тело: {}", foreign.body);
-    assert_eq!(missing.status, StatusCode::NOT_FOUND, "тело: {}", missing.body);
+    assert_eq!(
+        foreign.status,
+        StatusCode::NOT_FOUND,
+        "тело: {}",
+        foreign.body
+    );
+    assert_eq!(
+        missing.status,
+        StatusCode::NOT_FOUND,
+        "тело: {}",
+        missing.body
+    );
     assert_eq!(foreign.body["error"]["code"], missing.body["error"]["code"]);
-    assert_eq!(foreign.body["error"]["message"], missing.body["error"]["message"]);
+    assert_eq!(
+        foreign.body["error"]["message"],
+        missing.body["error"]["message"]
+    );
 
     // История владельца от чужой попытки не изменилась.
     let read = send(
@@ -1935,7 +2415,11 @@ async fn append_error_envelope_carries_request_id() {
     let state = AppState::for_tests().await;
     let sent = send(
         state,
-        append("00000000-0000-0000-0000-000000000000", exchange_body(), None),
+        append(
+            "00000000-0000-0000-0000-000000000000",
+            exchange_body(),
+            None,
+        ),
     )
     .await;
 
@@ -1951,10 +2435,26 @@ async fn append_error_envelope_carries_request_id() {
 async fn appended_messages_are_readable_with_telemetry_and_lift_chat() {
     let _guard = test_lock();
     let state = AppState::for_tests().await;
-    let first = create_chat(state.clone(), None, serde_json::json!({ "title": "Первый" })).await;
-    let second = create_chat(state.clone(), None, serde_json::json!({ "title": "Второй" })).await;
-    let first_id = first.body["id"].as_str().expect("идентификатор чата").to_string();
-    let second_id = second.body["id"].as_str().expect("идентификатор чата").to_string();
+    let first = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "title": "Первый" }),
+    )
+    .await;
+    let second = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "title": "Второй" }),
+    )
+    .await;
+    let first_id = first.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
+    let second_id = second.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
 
     // Время изменения хранится в секундах, поэтому оба чата, созданные в
     // одну секунду, различаются в списке только по идентификатору. Чтобы
@@ -1971,7 +2471,12 @@ async fn appended_messages_are_readable_with_telemetry_and_lift_chat() {
     assert_eq!(before.body["chats"][0]["id"], second_id);
 
     let appended = send(state.clone(), append(&first_id, exchange_body(), None)).await;
-    assert_eq!(appended.status, StatusCode::CREATED, "тело: {}", appended.body);
+    assert_eq!(
+        appended.status,
+        StatusCode::CREATED,
+        "тело: {}",
+        appended.body
+    );
 
     let read = send(
         state.clone(),
@@ -2018,7 +2523,10 @@ fn append_log_records_counts_without_message_text() {
         runtime.block_on(async {
             let state = AppState::for_tests().await;
             let created = create_chat(state.clone(), None, serde_json::json!({})).await;
-            let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+            let id = created.body["id"]
+                .as_str()
+                .expect("идентификатор чата")
+                .to_string();
             let sent = send(state, append(&id, exchange_body(), None)).await;
             assert_eq!(sent.status, StatusCode::CREATED, "тело: {}", sent.body);
             id
@@ -2026,8 +2534,14 @@ fn append_log_records_counts_without_message_text() {
     });
 
     let output = capture.text();
-    assert!(output.contains("сообщения дозаписаны в чат"), "нет записи: {output}");
-    assert!(output.contains("\"messages\":2"), "нет числа сообщений: {output}");
+    assert!(
+        output.contains("сообщения дозаписаны в чат"),
+        "нет записи: {output}"
+    );
+    assert!(
+        output.contains("\"messages\":2"),
+        "нет числа сообщений: {output}"
+    );
     assert!(
         !output.contains("вопрос локальной модели") && !output.contains("ответ локальной модели"),
         "текст сообщений попал в журнал: {output}"
@@ -2080,12 +2594,27 @@ fn debug_logs_api_and_upstream_bodies() {
     let _guard = test_lock();
     let output = captured_chat_log(&[("AGENTD_DEBUG", "true")]);
 
-    assert!(output.contains("тело запроса"), "нет тела запроса: {output}");
-    assert!(output.contains("секретный вопрос"), "нет текста запроса: {output}");
+    assert!(
+        output.contains("тело запроса"),
+        "нет тела запроса: {output}"
+    );
+    assert!(
+        output.contains("секретный вопрос"),
+        "нет текста запроса: {output}"
+    );
     assert!(output.contains("тело ответа"), "нет тела ответа: {output}");
-    assert!(output.contains("запрос провайдеру"), "нет запроса к провайдеру: {output}");
-    assert!(output.contains("ответ провайдера"), "нет ответа провайдера: {output}");
-    assert!(output.contains("ответ модели"), "нет текста ответа модели: {output}");
+    assert!(
+        output.contains("запрос провайдеру"),
+        "нет запроса к провайдеру: {output}"
+    );
+    assert!(
+        output.contains("ответ провайдера"),
+        "нет ответа провайдера: {output}"
+    );
+    assert!(
+        output.contains("ответ модели"),
+        "нет текста ответа модели: {output}"
+    );
 }
 
 /// Прогоняет `/v1/chat` в чате с назначенным встроенным профилем `teacher`
@@ -2121,8 +2650,15 @@ fn captured_chat_log_with_profile(extra: &[(&str, &str)]) -> String {
                 serde_json::json!({ "settings": { "profile_id": "teacher" } }),
             )
             .await;
-            let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
-            let sent = send(state, post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+            let id = created.body["id"]
+                .as_str()
+                .expect("идентификатор чата")
+                .to_string();
+            let sent = send(
+                state,
+                post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" })),
+            )
+            .await;
             assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
         })
     });
@@ -2135,8 +2671,14 @@ fn profile_fields_are_not_logged_by_default() {
     let _guard = test_lock();
     let output = captured_chat_log_with_profile(&[]);
 
-    assert!(output.contains("\"profile_id\":\"teacher\""), "нет идентификатора профиля: {output}");
-    assert!(output.contains("\"chars\":"), "нет размера раздела: {output}");
+    assert!(
+        output.contains("\"profile_id\":\"teacher\""),
+        "нет идентификатора профиля: {output}"
+    );
+    assert!(
+        output.contains("\"chars\":"),
+        "нет размера раздела: {output}"
+    );
     assert!(
         !output.contains("терпеливый преподаватель") && !output.contains("Простой язык"),
         "текст полей профиля попал в журнал: {output}"
@@ -2148,8 +2690,14 @@ fn profile_fields_are_logged_when_log_content_enabled() {
     let _guard = test_lock();
     let output = captured_chat_log_with_profile(&[("AGENTD_LOG_CONTENT", "true")]);
 
-    assert!(output.contains("\"profile_id\":\"teacher\""), "нет идентификатора профиля: {output}");
-    assert!(output.contains("терпеливый преподаватель"), "текст персоны профиля не попал в журнал: {output}");
+    assert!(
+        output.contains("\"profile_id\":\"teacher\""),
+        "нет идентификатора профиля: {output}"
+    );
+    assert!(
+        output.contains("терпеливый преподаватель"),
+        "текст персоны профиля не попал в журнал: {output}"
+    );
 }
 
 #[test]
@@ -2157,10 +2705,22 @@ fn without_debug_bodies_are_not_logged() {
     let _guard = test_lock();
     let output = captured_chat_log(&[]);
 
-    assert!(output.contains("обмен с моделью"), "нет сводки обмена: {output}");
-    assert!(!output.contains("тело запроса"), "тело запроса попало в журнал: {output}");
-    assert!(!output.contains("запрос провайдеру"), "обмен с провайдером в журнале: {output}");
-    assert!(!output.contains("секретный вопрос"), "текст запроса в журнале: {output}");
+    assert!(
+        output.contains("обмен с моделью"),
+        "нет сводки обмена: {output}"
+    );
+    assert!(
+        !output.contains("тело запроса"),
+        "тело запроса попало в журнал: {output}"
+    );
+    assert!(
+        !output.contains("запрос провайдеру"),
+        "обмен с провайдером в журнале: {output}"
+    );
+    assert!(
+        !output.contains("секретный вопрос"),
+        "текст запроса в журнале: {output}"
+    );
 }
 
 // --- Настройки чата с локальным провайдером ---
@@ -2186,12 +2746,24 @@ async fn local_chat_is_stored_without_server_ollama() {
         serde_json::json!({ "title": "Локальный", "settings": local_settings("llama3") }),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "тело: {}", created.body);
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "тело: {}",
+        created.body
+    );
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
     assert_eq!(created.body["settings"]["provider"], "ollama");
     assert_eq!(created.body["settings"]["model"], "llama3");
 
-    let read = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let read = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(read.body["settings"]["provider"], "ollama");
     assert_eq!(read.body["settings"]["model"], "llama3");
 }
@@ -2210,7 +2782,10 @@ async fn local_chat_model_can_be_changed_without_allowlist() {
         serde_json::json!({ "settings": local_settings("llama3") }),
     )
     .await;
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
 
     let patched = send(
         state,
@@ -2242,7 +2817,10 @@ async fn call_in_local_chat_is_rejected_without_server_ollama() {
         serde_json::json!({ "settings": local_settings("llama3") }),
     )
     .await;
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
 
     let sent = send(
         state.clone(),
@@ -2260,7 +2838,11 @@ async fn call_in_local_chat_is_rejected_without_server_ollama() {
         sent.body
     );
 
-    let read = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let read = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(read.body["messages"], serde_json::json!([]));
 }
 
@@ -2295,7 +2877,10 @@ async fn explicit_null_clears_sampling_parameter() {
         serde_json::json!({ "settings": { "temperature": 0.7, "top_p": 0.9 } }),
     )
     .await;
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
     assert_eq!(created.body["settings"]["sampling"]["temperature"], 0.7);
 
     let patched = send(
@@ -2333,7 +2918,10 @@ async fn custom_response_mode_can_be_switched_off() {
         }),
     )
     .await;
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
     assert_eq!(created.body["settings"]["custom_response_mode"], true);
 
     let patched = send(
@@ -2349,7 +2937,10 @@ async fn custom_response_mode_can_be_switched_off() {
     assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
     assert_eq!(patched.body["settings"]["custom_response_mode"], false);
     // Сам формат остаётся сохранённым: выключен режим, а не описание.
-    assert_eq!(patched.body["settings"]["response_format"]["description"], "только JSON");
+    assert_eq!(
+        patched.body["settings"]["response_format"]["description"],
+        "только JSON"
+    );
 }
 
 #[tokio::test]
@@ -2364,7 +2955,10 @@ async fn omitted_settings_fields_stay_unchanged() {
         }),
     )
     .await;
-    let id = created.body["id"].as_str().expect("идентификатор чата").to_string();
+    let id = created.body["id"]
+        .as_str()
+        .expect("идентификатор чата")
+        .to_string();
 
     let patched = send(
         state,
@@ -2379,7 +2973,10 @@ async fn omitted_settings_fields_stay_unchanged() {
     assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
     assert_eq!(patched.body["settings"]["model"], "test-model");
     assert_eq!(patched.body["settings"]["sampling"]["temperature"], 0.4);
-    assert_eq!(patched.body["settings"]["experts"], serde_json::json!(["аналитик"]));
+    assert_eq!(
+        patched.body["settings"]["experts"],
+        serde_json::json!(["аналитик"])
+    );
 }
 
 // --- Компактизация истории: интеграционные тесты через wiremock ---
@@ -2411,7 +3008,11 @@ async fn disabled_summary_sends_full_history_without_summary_calls() {
     seed_exchanges(
         &state,
         &id,
-        &[("вопрос 1", "ответ 1"), ("вопрос 2", "ответ 2"), ("вопрос 3", "ответ 3")],
+        &[
+            ("вопрос 1", "ответ 1"),
+            ("вопрос 2", "ответ 2"),
+            ("вопрос 3", "ответ 3"),
+        ],
     )
     .await;
 
@@ -2425,9 +3026,16 @@ async fn disabled_summary_sends_full_history_without_summary_calls() {
     assert_eq!(sent.body["context"]["summary_built"], false);
 
     let requests = server.received_requests().await.expect("запросы");
-    assert_eq!(requests.len(), 1, "не должно быть отдельного обращения за пересказом");
+    assert_eq!(
+        requests.len(),
+        1,
+        "не должно быть отдельного обращения за пересказом"
+    );
     let body = String::from_utf8_lossy(&requests[0].body);
-    assert!(body.contains("вопрос 1"), "полная история должна дойти до провайдера: {body}");
+    assert!(
+        body.contains("вопрос 1"),
+        "полная история должна дойти до провайдера: {body}"
+    );
 }
 
 // 12.2 — порог достигнут: два обращения, тело второго содержит пересказ и не содержит вытесненных сообщений
@@ -2476,19 +3084,39 @@ async fn reaching_step_builds_summary_and_sends_tail_without_evicted_messages() 
     assert_eq!(sent.body["context"]["summary_built"], true);
 
     let requests = server.received_requests().await.expect("запросы");
-    assert_eq!(requests.len(), 2, "ожидались ровно два обращения: пересказ и ответ");
+    assert_eq!(
+        requests.len(),
+        2,
+        "ожидались ровно два обращения: пересказ и ответ"
+    );
     let main_call = requests
         .iter()
         .find(|r| !String::from_utf8_lossy(&r.body).contains(SUMMARY_CALL_MARKER))
         .expect("основной вызов");
     let body = String::from_utf8_lossy(&main_call.body);
-    assert!(body.contains("Краткое содержание предыдущей части разговора"), "{body}");
+    assert!(
+        body.contains("Краткое содержание предыдущей части разговора"),
+        "{body}"
+    );
     assert!(body.contains("итог пересказа"), "{body}");
-    assert!(body.contains("вопрос 3"), "хвост из последних 4 сообщений должен дойти: {body}");
-    assert!(!body.contains("вопрос 1"), "вытесненное сообщение не должно уйти провайдеру: {body}");
-    assert!(!body.contains("вопрос 2"), "вытесненное сообщение не должно уйти провайдеру: {body}");
+    assert!(
+        body.contains("вопрос 3"),
+        "хвост из последних 4 сообщений должен дойти: {body}"
+    );
+    assert!(
+        !body.contains("вопрос 1"),
+        "вытесненное сообщение не должно уйти провайдеру: {body}"
+    );
+    assert!(
+        !body.contains("вопрос 2"),
+        "вытесненное сообщение не должно уйти провайдеру: {body}"
+    );
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["summary"], "итог пересказа");
     assert_eq!(loaded.body["summary_through_seq"], 4);
 }
@@ -2549,10 +3177,20 @@ async fn next_request_below_step_reuses_stored_summary_with_one_call() {
         .iter()
         .filter(|r| String::from_utf8_lossy(&r.body).contains(SUMMARY_CALL_MARKER))
         .count();
-    assert_eq!(summary_calls, 1, "пересказ не должен перестраиваться на втором запросе");
+    assert_eq!(
+        summary_calls, 1,
+        "пересказ не должен перестраиваться на втором запросе"
+    );
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
-    assert_eq!(loaded.body["summary_through_seq"], 4, "граница пересказа не должна была сдвинуться");
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
+    assert_eq!(
+        loaded.body["summary_through_seq"], 4,
+        "граница пересказа не должна была сдвинуться"
+    );
 }
 
 // 12.4 — ошибка провайдера на вызове пересказа не ломает пользовательский запрос
@@ -2593,12 +3231,24 @@ async fn summary_call_failure_degrades_without_breaking_user_request() {
         post_chat(serde_json::json!({ "chat_id": id, "prompt": "новый вопрос" })),
     )
     .await;
-    assert_eq!(sent.status, StatusCode::OK, "ошибка пересказа не должна ломать ответ: {}", sent.body);
+    assert_eq!(
+        sent.status,
+        StatusCode::OK,
+        "ошибка пересказа не должна ломать ответ: {}",
+        sent.body
+    );
     assert_eq!(sent.body["content"], "ответ модели");
     assert_eq!(sent.body["context"]["summary_built"], false);
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
-    assert!(loaded.body["summary"].is_null(), "сохранённый пересказ не должен был появиться");
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
+    assert!(
+        loaded.body["summary"].is_null(),
+        "сохранённый пересказ не должен был появиться"
+    );
 }
 
 // 12.5 — компактизация спасает от context_limit_exceeded, а компактизованный избыток всё равно отклоняется
@@ -2619,7 +3269,14 @@ async fn compaction_avoids_context_limit_exceeded_when_full_history_would_not_fi
         .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ модели")))
         .mount(&server)
         .await;
-    let state = state_with_provider(&server, &[("AGENTD_MAX_CONTEXT_TOKENS", "200"), ("AGENTD_SUMMARY_STEP_MESSAGES", "1")]).await;
+    let state = state_with_provider(
+        &server,
+        &[
+            ("AGENTD_MAX_CONTEXT_TOKENS", "200"),
+            ("AGENTD_SUMMARY_STEP_MESSAGES", "1"),
+        ],
+    )
+    .await;
     // Хвост (keep=2) — только последний обмен, чтобы компактизованная
     // история (пересказ + один короткий обмен + новое сообщение) уложилась
     // в лимит, даже когда полная история из четырёх длинных ответов — нет.
@@ -2668,7 +3325,14 @@ async fn compacted_history_still_exceeding_limit_is_rejected_without_calling_pro
         .mount(&server)
         .await;
     // Лимит настолько мал, что даже пересказ с хвостом его превышают.
-    let state = state_with_provider(&server, &[("AGENTD_MAX_CONTEXT_TOKENS", "1"), ("AGENTD_SUMMARY_STEP_MESSAGES", "1")]).await;
+    let state = state_with_provider(
+        &server,
+        &[
+            ("AGENTD_MAX_CONTEXT_TOKENS", "1"),
+            ("AGENTD_SUMMARY_STEP_MESSAGES", "1"),
+        ],
+    )
+    .await;
     let created = create_chat(state.clone(), None, summary_chat_settings(4, 3)).await;
     let id = created.body["id"].as_str().unwrap().to_string();
     seed_exchanges(
@@ -2693,7 +3357,9 @@ async fn compacted_history_still_exceeding_limit_is_rejected_without_calling_pro
 
     let requests = server.received_requests().await.expect("запросы");
     assert!(
-        requests.iter().all(|r| String::from_utf8_lossy(&r.body).contains(SUMMARY_CALL_MARKER)),
+        requests
+            .iter()
+            .all(|r| String::from_utf8_lossy(&r.body).contains(SUMMARY_CALL_MARKER)),
         "по пользовательскому сообщению провайдер не должен вызываться"
     );
 }
@@ -2720,10 +3386,19 @@ async fn chat_without_chat_id_is_never_compacted() {
     )
     .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
-    assert!(sent.body.get("context").map(|c| c.is_null()).unwrap_or(true));
+    assert!(
+        sent.body
+            .get("context")
+            .map(|c| c.is_null())
+            .unwrap_or(true)
+    );
 
     let requests = server.received_requests().await.expect("запросы");
-    assert_eq!(requests.len(), 1, "без chat_id обращение за пересказом не делается");
+    assert_eq!(
+        requests.len(),
+        1,
+        "без chat_id обращение за пересказом не делается"
+    );
 }
 
 // --- 4. Переключатель стратегий контекста ---
@@ -2735,7 +3410,12 @@ async fn create_chat_with_strategy(state: AppState, strategy: &str) -> String {
         serde_json::json!({ "settings": { "context_strategy": strategy } }),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "тело: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "тело: {}",
+        created.body
+    );
     created.body["id"].as_str().unwrap().to_string()
 }
 
@@ -2762,7 +3442,11 @@ async fn non_summary_strategy_calls_provider_exactly_once() {
     assert_eq!(sent.body["context"]["strategy"], "sliding_window");
 
     let requests = server.received_requests().await.expect("запросы");
-    assert_eq!(requests.len(), 1, "стратегия без пересказа не делает вспомогательных вызовов");
+    assert_eq!(
+        requests.len(),
+        1,
+        "стратегия без пересказа не делает вспомогательных вызовов"
+    );
 }
 
 // --- 4.3 Валидация стратегии на путях сохранения и вызова ---
@@ -2777,7 +3461,12 @@ async fn unknown_context_strategy_is_rejected_on_create() {
         serde_json::json!({ "settings": { "context_strategy": "magic" } }),
     )
     .await;
-    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        created.body
+    );
     assert_eq!(created.body["error"]["code"], "context_strategy_invalid");
 }
 
@@ -2798,7 +3487,12 @@ async fn unknown_context_strategy_is_rejected_on_patch() {
         ),
     )
     .await;
-    assert_eq!(patched.status, StatusCode::BAD_REQUEST, "тело: {}", patched.body);
+    assert_eq!(
+        patched.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        patched.body
+    );
     assert_eq!(patched.body["error"]["code"], "context_strategy_invalid");
 }
 
@@ -2806,7 +3500,8 @@ async fn unknown_context_strategy_is_rejected_on_patch() {
 async fn disallowed_context_strategy_is_rejected_on_call() {
     let _guard = test_lock();
     let server = MockServer::start().await;
-    let state = state_with_provider(&server, &[("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "summary")]).await;
+    let state =
+        state_with_provider(&server, &[("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "summary")]).await;
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
@@ -2849,7 +3544,11 @@ async fn call_override_does_not_persist_context_strategy() {
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     assert_eq!(sent.body["context"]["strategy"], "sliding_window");
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["settings"]["context_strategy"], "facts");
 }
 
@@ -2898,7 +3597,12 @@ async fn sliding_window_rescues_chat_from_context_limit_exceeded() {
         serde_json::json!({ "settings": { "context_strategy": "sliding_window", "context_window_messages": 1 } }),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "тело: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "тело: {}",
+        created.body
+    );
     let id = created.body["id"].as_str().unwrap().to_string();
 
     // Каждое сообщение само под лимитом, но пять таких сообщений вместе — уже
@@ -2919,8 +3623,15 @@ async fn sliding_window_rescues_chat_from_context_limit_exceeded() {
         );
     }
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
-    assert_eq!(loaded.body["message_count"], 10, "вся история чата сохранена, несмотря на окно в запросах");
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
+    assert_eq!(
+        loaded.body["message_count"], 10,
+        "вся история чата сохранена, несмотря на окно в запросах"
+    );
 }
 
 // --- 5.2 Границы context_window_messages ---
@@ -2935,7 +3646,12 @@ async fn zero_context_window_messages_is_rejected() {
         serde_json::json!({ "settings": { "context_window_messages": 0 } }),
     )
     .await;
-    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        created.body
+    );
     assert_eq!(created.body["error"]["code"], "context_window_invalid");
 }
 
@@ -2953,7 +3669,12 @@ async fn context_window_messages_above_operator_ceiling_is_rejected() {
         serde_json::json!({ "settings": { "context_window_messages": 11 } }),
     )
     .await;
-    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        created.body
+    );
     assert_eq!(created.body["error"]["code"], "context_window_invalid");
 }
 
@@ -2993,10 +3714,21 @@ async fn window_of_six_out_of_twenty_messages_reaches_provider_and_full_history_
     let last = requests.last().expect("запрос к провайдеру");
     let body: serde_json::Value = serde_json::from_slice(&last.body).expect("тело запроса");
     let messages = body["messages"].as_array().expect("messages");
-    assert_eq!(messages.len(), 8, "системное сообщение, 6 сообщений окна плюс новое");
+    assert_eq!(
+        messages.len(),
+        8,
+        "системное сообщение, 6 сообщений окна плюс новое"
+    );
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
-    assert_eq!(loaded.body["message_count"], 22, "чтение чата возвращает всю сохранённую историю");
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
+    assert_eq!(
+        loaded.body["message_count"], 22,
+        "чтение чата возвращает всю сохранённую историю"
+    );
 }
 
 // --- 6.5 Эндпоинты фактов ---
@@ -3018,7 +3750,12 @@ async fn fact_can_be_set_read_and_deleted() {
 
     let set = send(
         state.clone(),
-        request("PUT", &fact_uri(&id, "budget"), Some(serde_json::json!({ "value": "200000" })), None),
+        request(
+            "PUT",
+            &fact_uri(&id, "budget"),
+            Some(serde_json::json!({ "value": "200000" })),
+            None,
+        ),
     )
     .await;
     assert_eq!(set.status, StatusCode::OK, "тело: {}", set.body);
@@ -3032,14 +3769,27 @@ async fn fact_can_be_set_read_and_deleted() {
 
     let overwritten = send(
         state.clone(),
-        request("PUT", &fact_uri(&id, "budget"), Some(serde_json::json!({ "value": "300000" })), None),
+        request(
+            "PUT",
+            &fact_uri(&id, "budget"),
+            Some(serde_json::json!({ "value": "300000" })),
+            None,
+        ),
     )
     .await;
     assert_eq!(overwritten.body["value"], "300000");
     let listed = send(state.clone(), request("GET", &facts_uri(&id), None, None)).await;
-    assert_eq!(listed.body["facts"].as_array().unwrap().len(), 1, "перезапись не создаёт вторую запись");
+    assert_eq!(
+        listed.body["facts"].as_array().unwrap().len(),
+        1,
+        "перезапись не создаёт вторую запись"
+    );
 
-    let deleted = send(state.clone(), request("DELETE", &fact_uri(&id, "budget"), None, None)).await;
+    let deleted = send(
+        state.clone(),
+        request("DELETE", &fact_uri(&id, "budget"), None, None),
+    )
+    .await;
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
     let listed = send(state, request("GET", &facts_uri(&id), None, None)).await;
     assert!(listed.body["facts"].as_array().unwrap().is_empty());
@@ -3052,8 +3802,17 @@ async fn deleting_missing_fact_is_404() {
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let deleted = send(state, request("DELETE", &fact_uri(&id, "missing"), None, None)).await;
-    assert_eq!(deleted.status, StatusCode::NOT_FOUND, "тело: {}", deleted.body);
+    let deleted = send(
+        state,
+        request("DELETE", &fact_uri(&id, "missing"), None, None),
+    )
+    .await;
+    assert_eq!(
+        deleted.status,
+        StatusCode::NOT_FOUND,
+        "тело: {}",
+        deleted.body
+    );
     assert_eq!(deleted.body["error"]["code"], "fact_not_found");
 }
 
@@ -3069,32 +3828,62 @@ async fn foreign_chat_facts_are_not_exposed() {
     let id = created.body["id"].as_str().unwrap().to_string();
     send(
         state.clone(),
-        request("PUT", &fact_uri(&id, "secret"), Some(serde_json::json!({ "value": "x" })), Some("owner-a")),
+        request(
+            "PUT",
+            &fact_uri(&id, "secret"),
+            Some(serde_json::json!({ "value": "x" })),
+            Some("owner-a"),
+        ),
     )
     .await;
 
-    let foreign = send(state, request("GET", &facts_uri(&id), None, Some("owner-b"))).await;
-    assert_eq!(foreign.status, StatusCode::NOT_FOUND, "тело: {}", foreign.body);
+    let foreign = send(
+        state,
+        request("GET", &facts_uri(&id), None, Some("owner-b")),
+    )
+    .await;
+    assert_eq!(
+        foreign.status,
+        StatusCode::NOT_FOUND,
+        "тело: {}",
+        foreign.body
+    );
 }
 
 #[tokio::test]
 async fn manual_fact_over_limit_is_rejected() {
     let _guard = test_lock();
-    let state = AppState::with_env(&[(API_KEY_VAR, "secret-key-value"), ("AGENTD_MAX_FACTS", "1")]).await;
+    let state =
+        AppState::with_env(&[(API_KEY_VAR, "secret-key-value"), ("AGENTD_MAX_FACTS", "1")]).await;
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
     send(
         state.clone(),
-        request("PUT", &fact_uri(&id, "first"), Some(serde_json::json!({ "value": "a" })), None),
+        request(
+            "PUT",
+            &fact_uri(&id, "first"),
+            Some(serde_json::json!({ "value": "a" })),
+            None,
+        ),
     )
     .await;
 
     let over_limit = send(
         state,
-        request("PUT", &fact_uri(&id, "second"), Some(serde_json::json!({ "value": "b" })), None),
+        request(
+            "PUT",
+            &fact_uri(&id, "second"),
+            Some(serde_json::json!({ "value": "b" })),
+            None,
+        ),
     )
     .await;
-    assert_eq!(over_limit.status, StatusCode::BAD_REQUEST, "тело: {}", over_limit.body);
+    assert_eq!(
+        over_limit.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        over_limit.body
+    );
     assert_eq!(over_limit.body["error"]["code"], "facts_limit_exceeded");
 }
 
@@ -3130,11 +3919,19 @@ async fn facts_update_failure_does_not_break_main_response() {
         post_chat(serde_json::json!({ "chat_id": id, "prompt": "бюджет — 200000" })),
     )
     .await;
-    assert_eq!(sent.status, StatusCode::OK, "основной ответ не должен зависеть от обновления фактов: {}", sent.body);
+    assert_eq!(
+        sent.status,
+        StatusCode::OK,
+        "основной ответ не должен зависеть от обновления фактов: {}",
+        sent.body
+    );
     assert_eq!(sent.body["context"]["facts_updated"], false);
 
     let facts = send(state, request("GET", &facts_uri(&id), None, None)).await;
-    assert!(facts.body["facts"].as_array().unwrap().is_empty(), "факты остаются прежними при отказе обновления");
+    assert!(
+        facts.body["facts"].as_array().unwrap().is_empty(),
+        "факты остаются прежними при отказе обновления"
+    );
 }
 
 // --- 4.4/4.5 Автоматическое название чата (specs/chat-title) ---
@@ -3146,7 +3943,9 @@ async fn title_generation_saves_provider_title_after_first_exchange() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(BodyContains(crate::title::TITLE_UPDATE_MARKER))
-        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("\"Бюджет проекта\".")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(provider_reply("\"Бюджет проекта\".")),
+        )
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -3159,21 +3958,31 @@ async fn title_generation_saves_provider_title_after_first_exchange() {
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
     let owner = crate::store::ANONYMOUS_OWNER.to_string();
-    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
-        .await
-        .expect("чат");
+    let chat = crate::store::load_chat(
+        &state.db,
+        &owner,
+        &id,
+        &agentcore::config::ChatSettings::default(),
+    )
+    .await
+    .expect("чат");
 
     crate::title::generate_and_save(
         state.clone(),
         id.clone(),
         owner,
         chat.settings.clone(),
+        chat.context_generation,
         state.config.system_prompt.clone(),
         "бюджет на проект".to_string(),
     )
     .await;
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["title"], "Бюджет проекта");
 }
 
@@ -3190,22 +3999,35 @@ async fn title_generation_failure_leaves_default_title() {
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
     let owner = crate::store::ANONYMOUS_OWNER.to_string();
-    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
-        .await
-        .expect("чат");
+    let chat = crate::store::load_chat(
+        &state.db,
+        &owner,
+        &id,
+        &agentcore::config::ChatSettings::default(),
+    )
+    .await
+    .expect("чат");
 
     crate::title::generate_and_save(
         state.clone(),
         id.clone(),
         owner,
         chat.settings.clone(),
+        chat.context_generation,
         state.config.system_prompt.clone(),
         "бюджет на проект".to_string(),
     )
     .await;
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
-    assert_eq!(loaded.body["title"], "Новый чат", "отказ генерации не должен менять название");
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
+    assert_eq!(
+        loaded.body["title"], "Новый чат",
+        "отказ генерации не должен менять название"
+    );
 }
 
 #[tokio::test]
@@ -3214,16 +4036,23 @@ async fn manual_rename_during_generation_is_kept() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("Название от модели")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(provider_reply("Название от модели")),
+        )
         .mount(&server)
         .await;
     let state = state_with_provider(&server, &[]).await;
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
     let owner = crate::store::ANONYMOUS_OWNER.to_string();
-    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
-        .await
-        .expect("чат");
+    let chat = crate::store::load_chat(
+        &state.db,
+        &owner,
+        &id,
+        &agentcore::config::ChatSettings::default(),
+    )
+    .await
+    .expect("чат");
 
     // Клиент переименовывает чат ДО того, как фоновая генерация успела
     // записать результат (specs/chat-title, «Ручное переименование во время
@@ -3244,13 +4073,21 @@ async fn manual_rename_during_generation_is_kept() {
         id.clone(),
         owner,
         chat.settings.clone(),
+        chat.context_generation,
         state.config.system_prompt.clone(),
         "бюджет на проект".to_string(),
     )
     .await;
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
-    assert_eq!(loaded.body["title"], "Название клиента", "название клиента не должно быть перезаписано");
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
+    assert_eq!(
+        loaded.body["title"], "Название клиента",
+        "название клиента не должно быть перезаписано"
+    );
 }
 
 #[tokio::test]
@@ -3266,14 +4103,26 @@ async fn auto_title_disabled_sends_no_title_request() {
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "первый вопрос" }))).await;
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "первый вопрос" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let requests = server.received_requests().await.expect("запросы");
-    assert_eq!(requests.len(), 1, "выключенная генерация не делает второго вызова к провайдеру");
+    assert_eq!(
+        requests.len(),
+        1,
+        "выключенная генерация не делает второго вызова к провайдеру"
+    );
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["title"], "Новый чат");
 }
 
@@ -3287,17 +4136,34 @@ async fn chat_created_with_own_title_skips_generation() {
         .mount(&server)
         .await;
     let state = state_with_provider(&server, &[]).await;
-    let created = create_chat(state.clone(), None, serde_json::json!({ "title": "Своё название" })).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "title": "Своё название" }),
+    )
+    .await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "первый вопрос" }))).await;
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "первый вопрос" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let requests = server.received_requests().await.expect("запросы");
-    assert_eq!(requests.len(), 1, "чат со своим названием не запускает генерацию");
+    assert_eq!(
+        requests.len(),
+        1,
+        "чат со своим названием не запускает генерацию"
+    );
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(loaded.body["title"], "Своё название");
 }
 
@@ -3333,17 +4199,30 @@ async fn memory_router_failure_does_not_break_main_response_or_change_memory() {
         post_chat(serde_json::json!({ "chat_id": id, "prompt": "бюджет — 200000" })),
     )
     .await;
-    assert_eq!(sent.status, StatusCode::OK, "основной ответ не должен зависеть от маршрутизатора памяти: {}", sent.body);
+    assert_eq!(
+        sent.status,
+        StatusCode::OK,
+        "основной ответ не должен зависеть от маршрутизатора памяти: {}",
+        sent.body
+    );
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let owner = crate::store::ANONYMOUS_OWNER.to_string();
-    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
-        .await
-        .expect("чат");
+    let chat = crate::store::load_chat(
+        &state.db,
+        &owner,
+        &id,
+        &agentcore::config::ChatSettings::default(),
+    )
+    .await
+    .expect("чат");
     let working = crate::store::load_working_memory(&state.db, &id, &chat.active_task_id)
         .await
         .expect("рабочая память");
-    assert!(working.is_empty(), "отказ маршрутизатора не должен менять состояние памяти");
+    assert!(
+        working.is_empty(),
+        "отказ маршрутизатора не должен менять состояние памяти"
+    );
 }
 
 /// `memory_layers` — больше не значение `context_strategy`: запрос с ним
@@ -3354,7 +4233,8 @@ async fn memory_router_failure_does_not_break_main_response_or_change_memory() {
 async fn context_strategy_memory_layers_is_rejected_as_unknown_value() {
     let _guard = test_lock();
     let server = MockServer::start().await;
-    let state = state_with_provider(&server, &[("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "summary")]).await;
+    let state =
+        state_with_provider(&server, &[("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "summary")]).await;
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
@@ -3384,7 +4264,11 @@ async fn memory_layers_enabled_works_over_a_strategy_allowed_by_the_operator_lis
         .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
         .mount(&server)
         .await;
-    let state = state_with_provider(&server, &[("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "sliding_window")]).await;
+    let state = state_with_provider(
+        &server,
+        &[("AGENTD_ALLOWED_CONTEXT_STRATEGIES", "sliding_window")],
+    )
+    .await;
     let created = create_chat(
         state.clone(),
         None,
@@ -3393,7 +4277,11 @@ async fn memory_layers_enabled_works_over_a_strategy_allowed_by_the_operator_lis
     .await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let sent = send(state, post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     assert_eq!(sent.body["context"]["strategy"], "sliding_window");
     assert_eq!(sent.body["context"]["memory_long_term_entries"], 0);
@@ -3425,11 +4313,18 @@ async fn memory_router_runs_only_when_memory_layers_enabled_regardless_of_strate
     )
     .await;
     let enabled_id = enabled.body["id"].as_str().unwrap().to_string();
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": enabled_id, "prompt": "вопрос" }))).await;
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": enabled_id, "prompt": "вопрос" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let requests_after_enabled = server.received_requests().await.expect("запросы").len();
-    assert_eq!(requests_after_enabled, 2, "маршрутизатор должен вызваться вторым запросом при включённой памяти");
+    assert_eq!(
+        requests_after_enabled, 2,
+        "маршрутизатор должен вызваться вторым запросом при включённой памяти"
+    );
 
     let disabled = create_chat(
         state.clone(),
@@ -3438,7 +4333,11 @@ async fn memory_router_runs_only_when_memory_layers_enabled_regardless_of_strate
     )
     .await;
     let disabled_id = disabled.body["id"].as_str().unwrap().to_string();
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": disabled_id, "prompt": "вопрос" }))).await;
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": disabled_id, "prompt": "вопрос" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let requests_after_disabled = server.received_requests().await.expect("запросы").len();
@@ -3470,13 +4369,34 @@ async fn memory_layers_combines_with_each_context_strategy() {
         )
         .await;
         let id = created.body["id"].as_str().unwrap().to_string();
-        crate::store::set_long_term_memory(&state.db, crate::store::ANONYMOUS_OWNER, "decision", Some("auth"), "Clerk", "manual", None, 1)
-            .await
-            .expect("долговременная запись");
+        crate::store::set_long_term_memory(
+            &state.db,
+            crate::store::ANONYMOUS_OWNER,
+            "decision",
+            Some("auth"),
+            "Clerk",
+            "manual",
+            None,
+            1,
+        )
+        .await
+        .expect("долговременная запись");
 
-        let sent = send(state, post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
-        assert_eq!(sent.status, StatusCode::OK, "стратегия {strategy}: тело {}", sent.body);
-        assert_eq!(sent.body["context"]["strategy"], strategy, "стратегия {strategy}");
+        let sent = send(
+            state,
+            post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" })),
+        )
+        .await;
+        assert_eq!(
+            sent.status,
+            StatusCode::OK,
+            "стратегия {strategy}: тело {}",
+            sent.body
+        );
+        assert_eq!(
+            sent.body["context"]["strategy"], strategy,
+            "стратегия {strategy}"
+        );
         assert_eq!(
             sent.body["context"]["memory_long_term_entries"], 1,
             "стратегия {strategy}: поля памяти должны присутствовать вместе с полями стратегии"
@@ -3504,12 +4424,27 @@ async fn facts_and_memory_layers_sections_both_land_in_next_system_message() {
     )
     .await;
     let id = created.body["id"].as_str().unwrap().to_string();
-    crate::store::set_fact(&state.db, &id, "budget", "200000", 1).await.expect("факт сохранён");
-    crate::store::set_long_term_memory(&state.db, crate::store::ANONYMOUS_OWNER, "decision", Some("auth"), "Clerk", "manual", None, 1)
+    crate::store::set_fact(&state.db, &id, "budget", "200000", 1)
         .await
-        .expect("долговременная запись");
+        .expect("факт сохранён");
+    crate::store::set_long_term_memory(
+        &state.db,
+        crate::store::ANONYMOUS_OWNER,
+        "decision",
+        Some("auth"),
+        "Clerk",
+        "manual",
+        None,
+        1,
+    )
+    .await
+    .expect("долговременная запись");
 
-    let sent = send(state, post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
 
     // Первый запрос — основной вызов модели (с системным сообщением);
@@ -3517,9 +4452,17 @@ async fn facts_and_memory_layers_sections_both_land_in_next_system_message() {
     let requests = server.received_requests().await.expect("запросы");
     let first = requests.first().expect("хотя бы один запрос");
     let body: serde_json::Value = first.body_json().expect("тело запроса — JSON");
-    let system = body["messages"][0]["content"].as_str().expect("системное сообщение");
-    assert!(system.contains("Факты чата:"), "раздел фактов отсутствует: {system}");
-    assert!(system.contains("Долговременная память:"), "раздел памяти отсутствует: {system}");
+    let system = body["messages"][0]["content"]
+        .as_str()
+        .expect("системное сообщение");
+    assert!(
+        system.contains("Факты чата:"),
+        "раздел фактов отсутствует: {system}"
+    );
+    assert!(
+        system.contains("Долговременная память:"),
+        "раздел памяти отсутствует: {system}"
+    );
 }
 
 // --- 6.2/6.3 Эндпоинты памяти (specs/memory-layers) ---
@@ -3549,18 +4492,36 @@ async fn working_memory_set_read_delete_over_http() {
 
     let set = send(
         state.clone(),
-        request("POST", &working_memory_uri(&id), Some(serde_json::json!({ "key": "budget", "value": "200000" })), None),
+        request(
+            "POST",
+            &working_memory_uri(&id),
+            Some(serde_json::json!({ "key": "budget", "value": "200000" })),
+            None,
+        ),
     )
     .await;
     assert_eq!(set.status, StatusCode::OK, "тело: {}", set.body);
     assert_eq!(set.body["value"], "200000");
     assert_eq!(set.body["source"], "manual");
 
-    let read = send(state.clone(), request("GET", &working_memory_uri(&id), None, None)).await;
+    let read = send(
+        state.clone(),
+        request("GET", &working_memory_uri(&id), None, None),
+    )
+    .await;
     assert_eq!(read.body["entries"].as_array().unwrap().len(), 1);
     assert_eq!(read.body["entries"][0]["key"], "budget");
 
-    let deleted = send(state.clone(), request("DELETE", &delete_working_memory_uri(&id, "budget"), None, None)).await;
+    let deleted = send(
+        state.clone(),
+        request(
+            "DELETE",
+            &delete_working_memory_uri(&id, "budget"),
+            None,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
 
     let read_after = send(state, request("GET", &working_memory_uri(&id), None, None)).await;
@@ -3578,8 +4539,17 @@ async fn foreign_owner_cannot_read_or_write_working_memory() {
     let created = create_chat(state.clone(), Some("owner-a"), serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let foreign_read = send(state.clone(), request("GET", &working_memory_uri(&id), None, Some("owner-b"))).await;
-    assert_eq!(foreign_read.status, StatusCode::NOT_FOUND, "тело: {}", foreign_read.body);
+    let foreign_read = send(
+        state.clone(),
+        request("GET", &working_memory_uri(&id), None, Some("owner-b")),
+    )
+    .await;
+    assert_eq!(
+        foreign_read.status,
+        StatusCode::NOT_FOUND,
+        "тело: {}",
+        foreign_read.body
+    );
 
     let foreign_set = send(
         state,
@@ -3591,7 +4561,12 @@ async fn foreign_owner_cannot_read_or_write_working_memory() {
         ),
     )
     .await;
-    assert_eq!(foreign_set.status, StatusCode::NOT_FOUND, "тело: {}", foreign_set.body);
+    assert_eq!(
+        foreign_set.status,
+        StatusCode::NOT_FOUND,
+        "тело: {}",
+        foreign_set.body
+    );
 }
 
 #[tokio::test]
@@ -3606,17 +4581,35 @@ async fn manual_working_memory_write_overrides_earlier_automatic_operation_same_
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
     let owner = crate::store::ANONYMOUS_OWNER.to_string();
-    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
-        .await
-        .expect("чат");
+    let chat = crate::store::load_chat(
+        &state.db,
+        &owner,
+        &id,
+        &agentcore::config::ChatSettings::default(),
+    )
+    .await
+    .expect("чат");
 
-    crate::store::set_working_memory(&state.db, &id, &chat.active_task_id, "k", "от роутера", "router", 1)
-        .await
-        .expect("ранняя автоматическая запись");
+    crate::store::set_working_memory(
+        &state.db,
+        &id,
+        &chat.active_task_id,
+        "k",
+        "от роутера",
+        "router",
+        1,
+    )
+    .await
+    .expect("ранняя автоматическая запись");
 
     let set = send(
         state.clone(),
-        request("POST", &working_memory_uri(&id), Some(serde_json::json!({ "key": "k", "value": "от клиента" })), None),
+        request(
+            "POST",
+            &working_memory_uri(&id),
+            Some(serde_json::json!({ "key": "k", "value": "от клиента" })),
+            None,
+        ),
     )
     .await;
     assert_eq!(set.status, StatusCode::OK, "тело: {}", set.body);
@@ -3637,13 +4630,23 @@ async fn finish_task_over_http_transfers_carried_entries_and_rotates_task() {
 
     send(
         state.clone(),
-        request("POST", &working_memory_uri(&id), Some(serde_json::json!({ "key": "carried", "value": "значение" })), None),
+        request(
+            "POST",
+            &working_memory_uri(&id),
+            Some(serde_json::json!({ "key": "carried", "value": "значение" })),
+            None,
+        ),
     )
     .await;
 
     let finished = send(
         state.clone(),
-        request("POST", &finish_task_uri(&id), Some(serde_json::json!({ "carry_forward_keys": ["carried"] })), None),
+        request(
+            "POST",
+            &finish_task_uri(&id),
+            Some(serde_json::json!({ "carry_forward_keys": ["carried"] })),
+            None,
+        ),
     )
     .await;
     assert_eq!(finished.status, StatusCode::OK, "тело: {}", finished.body);
@@ -3652,7 +4655,10 @@ async fn finish_task_over_http_transfers_carried_entries_and_rotates_task() {
     assert_eq!(transferred[0]["value"], "значение");
 
     let working_after = send(state, request("GET", &working_memory_uri(&id), None, None)).await;
-    assert!(working_after.body["entries"].as_array().unwrap().is_empty(), "рабочая память прежней задачи очищена");
+    assert!(
+        working_after.body["entries"].as_array().unwrap().is_empty(),
+        "рабочая память прежней задачи очищена"
+    );
 }
 
 #[tokio::test]
@@ -3673,10 +4679,23 @@ async fn long_term_memory_set_read_delete_over_http() {
     assert_eq!(set.status, StatusCode::OK, "тело: {}", set.body);
     let entry_id = set.body["id"].as_str().unwrap().to_string();
 
-    let read = send(state.clone(), request("GET", "/v1/memory/long-term", None, None)).await;
+    let read = send(
+        state.clone(),
+        request("GET", "/v1/memory/long-term", None, None),
+    )
+    .await;
     assert_eq!(read.body["entries"].as_array().unwrap().len(), 1);
 
-    let deleted = send(state.clone(), request("DELETE", &delete_long_term_memory_uri(&entry_id), None, None)).await;
+    let deleted = send(
+        state.clone(),
+        request(
+            "DELETE",
+            &delete_long_term_memory_uri(&entry_id),
+            None,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
 
     let read_after = send(state, request("GET", "/v1/memory/long-term", None, None)).await;
@@ -3703,15 +4722,32 @@ async fn foreign_owner_cannot_read_or_delete_long_term_memory() {
     .await;
     let entry_id = set.body["id"].as_str().unwrap().to_string();
 
-    let foreign_read = send(state.clone(), request("GET", "/v1/memory/long-term", None, Some("owner-b"))).await;
-    assert!(foreign_read.body["entries"].as_array().unwrap().is_empty(), "чужая долговременная память не видна");
+    let foreign_read = send(
+        state.clone(),
+        request("GET", "/v1/memory/long-term", None, Some("owner-b")),
+    )
+    .await;
+    assert!(
+        foreign_read.body["entries"].as_array().unwrap().is_empty(),
+        "чужая долговременная память не видна"
+    );
 
     let foreign_delete = send(
         state,
-        request("DELETE", &delete_long_term_memory_uri(&entry_id), None, Some("owner-b")),
+        request(
+            "DELETE",
+            &delete_long_term_memory_uri(&entry_id),
+            None,
+            Some("owner-b"),
+        ),
     )
     .await;
-    assert_eq!(foreign_delete.status, StatusCode::NOT_FOUND, "тело: {}", foreign_delete.body);
+    assert_eq!(
+        foreign_delete.status,
+        StatusCode::NOT_FOUND,
+        "тело: {}",
+        foreign_delete.body
+    );
 }
 
 // --- Профили (specs/user-profiles) ---
@@ -3749,13 +4785,22 @@ async fn created_profile_is_visible_in_list_with_non_built_in_flag() {
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "тело: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "тело: {}",
+        created.body
+    );
     assert_eq!(created.body["built_in"], false);
 
     let list = send(state, request("GET", "/v1/profiles", None, None)).await;
     let profiles = list.body["profiles"].as_array().unwrap();
     assert_eq!(profiles.len(), 4);
-    assert!(profiles.iter().any(|p| p["name"] == "Свой" && p["built_in"] == false));
+    assert!(
+        profiles
+            .iter()
+            .any(|p| p["name"] == "Свой" && p["built_in"] == false)
+    );
 }
 
 #[tokio::test]
@@ -3764,10 +4809,20 @@ async fn profile_without_any_preference_is_rejected() {
     let state = AppState::for_tests().await;
     let created = send(
         state,
-        request("POST", "/v1/profiles", Some(serde_json::json!({ "name": "Пустой" })), None),
+        request(
+            "POST",
+            "/v1/profiles",
+            Some(serde_json::json!({ "name": "Пустой" })),
+            None,
+        ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        created.body
+    );
     assert_eq!(created.body["error"]["code"], "profile_rejected");
 }
 
@@ -3789,12 +4844,20 @@ async fn patching_profile_changes_only_given_field() {
 
     let patched = send(
         state,
-        request("PATCH", &profile_uri(&id), Some(serde_json::json!({ "format": "прозой" })), None),
+        request(
+            "PATCH",
+            &profile_uri(&id),
+            Some(serde_json::json!({ "format": "прозой" })),
+            None,
+        ),
     )
     .await;
     assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
     assert_eq!(patched.body["format"], "прозой");
-    assert_eq!(patched.body["persona"], "персона", "остальные поля не затёрты");
+    assert_eq!(
+        patched.body["persona"], "персона",
+        "остальные поля не затёрты"
+    );
     assert_eq!(patched.body["name"], "Свой");
 }
 
@@ -3804,12 +4867,21 @@ async fn deleted_profile_returns_404_and_leaves_list() {
     let state = AppState::for_tests().await;
     let created = send(
         state.clone(),
-        request("POST", "/v1/profiles", Some(serde_json::json!({ "name": "Свой", "style": "кратко" })), None),
+        request(
+            "POST",
+            "/v1/profiles",
+            Some(serde_json::json!({ "name": "Свой", "style": "кратко" })),
+            None,
+        ),
     )
     .await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let deleted = send(state.clone(), request("DELETE", &profile_uri(&id), None, None)).await;
+    let deleted = send(
+        state.clone(),
+        request("DELETE", &profile_uri(&id), None, None),
+    )
+    .await;
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
 
     let read = send(state.clone(), request("GET", &profile_uri(&id), None, None)).await;
@@ -3826,19 +4898,41 @@ async fn built_in_profile_cannot_be_changed_or_deleted() {
 
     let patched = send(
         state.clone(),
-        request("PATCH", &profile_uri("teacher"), Some(serde_json::json!({ "style": "иначе" })), None),
+        request(
+            "PATCH",
+            &profile_uri("teacher"),
+            Some(serde_json::json!({ "style": "иначе" })),
+            None,
+        ),
     )
     .await;
-    assert_eq!(patched.status, StatusCode::BAD_REQUEST, "тело: {}", patched.body);
+    assert_eq!(
+        patched.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        patched.body
+    );
     assert_eq!(patched.body["error"]["code"], "profile_rejected");
 
-    let deleted = send(state.clone(), request("DELETE", &profile_uri("teacher"), None, None)).await;
-    assert_eq!(deleted.status, StatusCode::BAD_REQUEST, "тело: {}", deleted.body);
+    let deleted = send(
+        state.clone(),
+        request("DELETE", &profile_uri("teacher"), None, None),
+    )
+    .await;
+    assert_eq!(
+        deleted.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        deleted.body
+    );
     assert_eq!(deleted.body["error"]["code"], "profile_rejected");
 
     let read = send(state, request("GET", &profile_uri("teacher"), None, None)).await;
     assert_eq!(read.status, StatusCode::OK);
-    assert_eq!(read.body["style"], "Простой язык, короткие предложения, примеры перед абстракцией.");
+    assert_eq!(
+        read.body["style"],
+        "Простой язык, короткие предложения, примеры перед абстракцией."
+    );
 }
 
 #[tokio::test]
@@ -3861,14 +4955,30 @@ async fn foreign_owner_cannot_read_or_modify_profile() {
     .await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let foreign_list = send(state.clone(), request("GET", "/v1/profiles", None, Some("owner-b"))).await;
+    let foreign_list = send(
+        state.clone(),
+        request("GET", "/v1/profiles", None, Some("owner-b")),
+    )
+    .await;
     let profiles = foreign_list.body["profiles"].as_array().unwrap();
-    assert_eq!(profiles.len(), 3, "чужой профиль не виден в списке владельца Y");
+    assert_eq!(
+        profiles.len(),
+        3,
+        "чужой профиль не виден в списке владельца Y"
+    );
 
-    let foreign_read = send(state.clone(), request("GET", &profile_uri(&id), None, Some("owner-b"))).await;
+    let foreign_read = send(
+        state.clone(),
+        request("GET", &profile_uri(&id), None, Some("owner-b")),
+    )
+    .await;
     assert_eq!(foreign_read.status, StatusCode::NOT_FOUND);
 
-    let foreign_delete = send(state, request("DELETE", &profile_uri(&id), None, Some("owner-b"))).await;
+    let foreign_delete = send(
+        state,
+        request("DELETE", &profile_uri(&id), None, Some("owner-b")),
+    )
+    .await;
     assert_eq!(foreign_delete.status, StatusCode::NOT_FOUND);
 }
 
@@ -3882,17 +4992,32 @@ async fn creating_profile_beyond_operator_limit_is_rejected() {
     .await;
     let first = send(
         state.clone(),
-        request("POST", "/v1/profiles", Some(serde_json::json!({ "name": "Первый", "style": "кратко" })), None),
+        request(
+            "POST",
+            "/v1/profiles",
+            Some(serde_json::json!({ "name": "Первый", "style": "кратко" })),
+            None,
+        ),
     )
     .await;
     assert_eq!(first.status, StatusCode::CREATED, "тело: {}", first.body);
 
     let second = send(
         state.clone(),
-        request("POST", "/v1/profiles", Some(serde_json::json!({ "name": "Второй", "style": "длинно" })), None),
+        request(
+            "POST",
+            "/v1/profiles",
+            Some(serde_json::json!({ "name": "Второй", "style": "длинно" })),
+            None,
+        ),
     )
     .await;
-    assert_eq!(second.status, StatusCode::BAD_REQUEST, "тело: {}", second.body);
+    assert_eq!(
+        second.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        second.body
+    );
     assert_eq!(second.body["error"]["code"], "profile_rejected");
 
     let list = send(state, request("GET", "/v1/profiles", None, None)).await;
@@ -3981,7 +5106,12 @@ async fn unknown_profile_id_in_chat_settings_is_rejected_with_400() {
         serde_json::json!({ "settings": { "profile_id": "no-such-profile" } }),
     )
     .await;
-    assert_eq!(created.status, StatusCode::BAD_REQUEST, "тело: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        created.body
+    );
     assert_eq!(created.body["error"]["code"], "profile_invalid");
 }
 
@@ -4021,7 +5151,8 @@ async fn same_question_under_three_profiles_yields_three_different_system_messag
     let system_messages: Vec<String> = requests
         .iter()
         .map(|r| {
-            let body: serde_json::Value = serde_json::from_slice(&r.body).expect("тело запроса провайдеру");
+            let body: serde_json::Value =
+                serde_json::from_slice(&r.body).expect("тело запроса провайдеру");
             body["messages"][0]["content"].as_str().unwrap().to_string()
         })
         .collect();
@@ -4048,7 +5179,11 @@ async fn branch_created_listed_and_activated_over_http() {
     let id = created.body["id"].as_str().unwrap().to_string();
     seed_exchanges(&state, &id, &[("вопрос", "ответ")]).await;
 
-    let branches = send(state.clone(), request("GET", &branches_uri(&id), None, None)).await;
+    let branches = send(
+        state.clone(),
+        request("GET", &branches_uri(&id), None, None),
+    )
+    .await;
     assert_eq!(branches.status, StatusCode::OK, "тело: {}", branches.body);
     assert_eq!(branches.body["branches"].as_array().unwrap().len(), 1);
 
@@ -4062,15 +5197,30 @@ async fn branch_created_listed_and_activated_over_http() {
         ),
     )
     .await;
-    assert_eq!(created_branch.status, StatusCode::CREATED, "тело: {}", created_branch.body);
+    assert_eq!(
+        created_branch.status,
+        StatusCode::CREATED,
+        "тело: {}",
+        created_branch.body
+    );
     let branch_id = created_branch.body["id"].as_str().unwrap().to_string();
 
     let activated = send(
         state.clone(),
-        request("POST", &format!("{}/{branch_id}/activate", branches_uri(&id)), None, None),
+        request(
+            "POST",
+            &format!("{}/{branch_id}/activate", branches_uri(&id)),
+            None,
+            None,
+        ),
     )
     .await;
-    assert_eq!(activated.status, StatusCode::NO_CONTENT, "тело: {}", activated.body);
+    assert_eq!(
+        activated.status,
+        StatusCode::NO_CONTENT,
+        "тело: {}",
+        activated.body
+    );
 
     let branches = send(state, request("GET", &branches_uri(&id), None, None)).await;
     let list = branches.body["branches"].as_array().unwrap();
@@ -4123,9 +5273,18 @@ async fn branch_operations_on_foreign_chat_are_404() {
         ),
     )
     .await;
-    assert_eq!(appended.status, StatusCode::CREATED, "подготовка истории: {}", appended.body);
+    assert_eq!(
+        appended.status,
+        StatusCode::CREATED,
+        "подготовка истории: {}",
+        appended.body
+    );
 
-    let list = send(state.clone(), request("GET", &branches_uri(&id), None, Some("owner-b"))).await;
+    let list = send(
+        state.clone(),
+        request("GET", &branches_uri(&id), None, Some("owner-b")),
+    )
+    .await;
     assert_eq!(list.status, StatusCode::NOT_FOUND, "тело: {}", list.body);
 
     let create = send(
@@ -4138,14 +5297,29 @@ async fn branch_operations_on_foreign_chat_are_404() {
         ),
     )
     .await;
-    assert_eq!(create.status, StatusCode::NOT_FOUND, "тело: {}", create.body);
+    assert_eq!(
+        create.status,
+        StatusCode::NOT_FOUND,
+        "тело: {}",
+        create.body
+    );
 
     let activate = send(
         state,
-        request("POST", &format!("{}/whatever/activate", branches_uri(&id)), None, Some("owner-b")),
+        request(
+            "POST",
+            &format!("{}/whatever/activate", branches_uri(&id)),
+            None,
+            Some("owner-b"),
+        ),
     )
     .await;
-    assert_eq!(activate.status, StatusCode::NOT_FOUND, "тело: {}", activate.body);
+    assert_eq!(
+        activate.status,
+        StatusCode::NOT_FOUND,
+        "тело: {}",
+        activate.body
+    );
 }
 
 // --- 7.4 Чтение чата с указанием ветки ---
@@ -4158,9 +5332,12 @@ async fn reading_explicit_branch_does_not_change_active_branch() {
     let id = created.body["id"].as_str().unwrap().to_string();
     seed_exchanges(&state, &id, &[("общий вопрос", "общий ответ")]).await;
 
-    let root_branch_id = send(state.clone(), request("GET", &format!("/v1/chats/{id}"), None, None))
-        .await
-        .body["branch_id"]
+    let root_branch_id = send(
+        state.clone(),
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await
+    .body["branch_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -4178,18 +5355,32 @@ async fn reading_explicit_branch_does_not_change_active_branch() {
     let branch_id = created_branch.body["id"].as_str().unwrap().to_string();
     send(
         state.clone(),
-        request("POST", &format!("{}/{branch_id}/activate", branches_uri(&id)), None, None),
+        request(
+            "POST",
+            &format!("{}/{branch_id}/activate", branches_uri(&id)),
+            None,
+            None,
+        ),
     )
     .await;
 
     let explicit = send(
         state.clone(),
-        request("GET", &format!("/v1/chats/{id}?branch={root_branch_id}"), None, None),
+        request(
+            "GET",
+            &format!("/v1/chats/{id}?branch={root_branch_id}"),
+            None,
+            None,
+        ),
     )
     .await;
     assert_eq!(explicit.body["branch_id"], root_branch_id);
 
-    let default_read = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let default_read = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     assert_eq!(
         default_read.body["branch_id"], branch_id,
         "явное указание ветки не переключает активную ветку чата"
@@ -4216,22 +5407,35 @@ async fn branching_strategy_keeps_sibling_branches_independent() {
     .await;
     let id = created.body["id"].as_str().unwrap().to_string();
     seed_exchanges(&state, &id, &[("общий вопрос", "общий ответ")]).await;
-    let root_branch_id = send(state.clone(), request("GET", &format!("/v1/chats/{id}"), None, None))
-        .await
-        .body["branch_id"]
+    let root_branch_id = send(
+        state.clone(),
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await
+    .body["branch_id"]
         .as_str()
         .unwrap()
         .to_string();
 
     let branch_a = send(
         state.clone(),
-        request("POST", &branches_uri(&id), Some(serde_json::json!({ "from_seq": 2, "name": "A" })), None),
+        request(
+            "POST",
+            &branches_uri(&id),
+            Some(serde_json::json!({ "from_seq": 2, "name": "A" })),
+            None,
+        ),
     )
     .await;
     let branch_a_id = branch_a.body["id"].as_str().unwrap().to_string();
     send(
         state.clone(),
-        request("POST", &format!("{}/{branch_a_id}/activate", branches_uri(&id)), None, None),
+        request(
+            "POST",
+            &format!("{}/{branch_a_id}/activate", branches_uri(&id)),
+            None,
+            None,
+        ),
     )
     .await;
     send(
@@ -4242,19 +5446,34 @@ async fn branching_strategy_keeps_sibling_branches_independent() {
 
     send(
         state.clone(),
-        request("POST", &format!("{}/{root_branch_id}/activate", branches_uri(&id)), None, None),
+        request(
+            "POST",
+            &format!("{}/{root_branch_id}/activate", branches_uri(&id)),
+            None,
+            None,
+        ),
     )
     .await;
 
     let branch_b = send(
         state.clone(),
-        request("POST", &branches_uri(&id), Some(serde_json::json!({ "from_seq": 2, "name": "B" })), None),
+        request(
+            "POST",
+            &branches_uri(&id),
+            Some(serde_json::json!({ "from_seq": 2, "name": "B" })),
+            None,
+        ),
     )
     .await;
     let branch_b_id = branch_b.body["id"].as_str().unwrap().to_string();
     send(
         state.clone(),
-        request("POST", &format!("{}/{branch_b_id}/activate", branches_uri(&id)), None, None),
+        request(
+            "POST",
+            &format!("{}/{branch_b_id}/activate", branches_uri(&id)),
+            None,
+            None,
+        ),
     )
     .await;
     server.reset().await;
@@ -4274,7 +5493,10 @@ async fn branching_strategy_keeps_sibling_branches_independent() {
     let requests = server.received_requests().await.expect("запросы");
     let last = requests.last().expect("запрос к провайдеру");
     let body = String::from_utf8_lossy(&last.body);
-    assert!(!body.contains("только в ветке A"), "сообщения соседней ветки не должны попасть в запрос: {body}");
+    assert!(
+        !body.contains("только в ветке A"),
+        "сообщения соседней ветки не должны попасть в запрос: {body}"
+    );
 }
 
 // --- 9.1/9.2 Сравнение стратегий: сценарий сбора ТЗ против wiremock ---
@@ -4315,7 +5537,10 @@ fn load_scenario() -> Scenario {
 fn last_request_contains_detail(requests: &[wiremock::Request], scenario: &Scenario) -> bool {
     let last = requests.last().expect("хотя бы один запрос к провайдеру");
     let body = String::from_utf8_lossy(&last.body);
-    scenario.control_answer_contains.iter().any(|needle| body.contains(needle))
+    scenario
+        .control_answer_contains
+        .iter()
+        .any(|needle| body.contains(needle))
 }
 
 #[tokio::test]
@@ -4334,18 +5559,28 @@ async fn scenario_on_summary_strategy_keeps_detail_via_summary_text() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(BodyLacks(SUMMARY_CALL_MARKER))
-        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")),
+        )
         .mount(&server)
         .await;
     let state = state_with_provider(
         &server,
-        &[("AGENTD_SUMMARY_ENABLED", "true"), ("AGENTD_SUMMARY_KEEP_MESSAGES", "4"), ("AGENTD_SUMMARY_STEP_MESSAGES", "1")],
+        &[
+            ("AGENTD_SUMMARY_ENABLED", "true"),
+            ("AGENTD_SUMMARY_KEEP_MESSAGES", "4"),
+            ("AGENTD_SUMMARY_STEP_MESSAGES", "1"),
+        ],
     )
     .await;
     let created = create_chat_with_strategy(state.clone(), "summary").await;
 
     for message in &scenario.messages {
-        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": message }))).await;
+        let sent = send(
+            state.clone(),
+            post_chat(serde_json::json!({ "chat_id": created, "prompt": message })),
+        )
+        .await;
         assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     }
 
@@ -4369,14 +5604,20 @@ async fn scenario_on_sliding_window_strategy_loses_early_detail() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")),
+        )
         .mount(&server)
         .await;
     let state = state_with_provider(&server, &[("AGENTD_CONTEXT_WINDOW_MESSAGES", "4")]).await;
     let created = create_chat_with_strategy(state.clone(), "sliding_window").await;
 
     for message in &scenario.messages {
-        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": message }))).await;
+        let sent = send(
+            state.clone(),
+            post_chat(serde_json::json!({ "chat_id": created, "prompt": message })),
+        )
+        .await;
         assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     }
 
@@ -4403,14 +5644,20 @@ async fn scenario_on_facts_strategy_keeps_detail_via_fact() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(BodyLacks(crate::facts::FACTS_UPDATE_MARKER))
-        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")),
+        )
         .mount(&server)
         .await;
     let state = state_with_provider(&server, &[("AGENTD_CONTEXT_WINDOW_MESSAGES", "4")]).await;
     let created = create_chat_with_strategy(state.clone(), "facts").await;
 
     for message in &scenario.messages {
-        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": message }))).await;
+        let sent = send(
+            state.clone(),
+            post_chat(serde_json::json!({ "chat_id": created, "prompt": message })),
+        )
+        .await;
         assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     }
 
@@ -4434,7 +5681,9 @@ async fn scenario_on_branching_strategy_checkpoints_and_switches() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")),
+        )
         .mount(&server)
         .await;
     let state = state_with_provider(&server, &[]).await;
@@ -4443,17 +5692,27 @@ async fn scenario_on_branching_strategy_checkpoints_and_switches() {
     // Первая половина сценария — общий ствол диалога (checkpoint).
     let midpoint = scenario.messages.len() / 2;
     for message in &scenario.messages[..midpoint] {
-        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": message }))).await;
+        let sent = send(
+            state.clone(),
+            post_chat(serde_json::json!({ "chat_id": created, "prompt": message })),
+        )
+        .await;
         assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     }
-    let checkpoint_seq = send(state.clone(), request("GET", &format!("/v1/chats/{created}"), None, None))
-        .await
-        .body["message_count"]
+    let checkpoint_seq = send(
+        state.clone(),
+        request("GET", &format!("/v1/chats/{created}"), None, None),
+    )
+    .await
+    .body["message_count"]
         .as_i64()
         .unwrap();
-    let root_branch_id = send(state.clone(), request("GET", &format!("/v1/chats/{created}"), None, None))
-        .await
-        .body["branch_id"]
+    let root_branch_id = send(
+        state.clone(),
+        request("GET", &format!("/v1/chats/{created}"), None, None),
+    )
+    .await
+    .body["branch_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -4469,13 +5728,37 @@ async fn scenario_on_branching_strategy_checkpoints_and_switches() {
     )
     .await;
     let branch_a_id = branch_a.body["id"].as_str().unwrap().to_string();
-    send(state.clone(), request("POST", &format!("{}/{branch_a_id}/activate", branches_uri(&created)), None, None)).await;
+    send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/{branch_a_id}/activate", branches_uri(&created)),
+            None,
+            None,
+        ),
+    )
+    .await;
     for message in &scenario.messages[midpoint..] {
-        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": format!("[A] {message}") }))).await;
+        let sent = send(
+            state.clone(),
+            post_chat(
+                serde_json::json!({ "chat_id": created, "prompt": format!("[A] {message}") }),
+            ),
+        )
+        .await;
         assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     }
 
-    send(state.clone(), request("POST", &format!("{}/{root_branch_id}/activate", branches_uri(&created)), None, None)).await;
+    send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/{root_branch_id}/activate", branches_uri(&created)),
+            None,
+            None,
+        ),
+    )
+    .await;
     let branch_b = send(
         state.clone(),
         request(
@@ -4487,23 +5770,49 @@ async fn scenario_on_branching_strategy_checkpoints_and_switches() {
     )
     .await;
     let branch_b_id = branch_b.body["id"].as_str().unwrap().to_string();
-    send(state.clone(), request("POST", &format!("{}/{branch_b_id}/activate", branches_uri(&created)), None, None)).await;
+    send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/{branch_b_id}/activate", branches_uri(&created)),
+            None,
+            None,
+        ),
+    )
+    .await;
     server.reset().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(provider_reply("принято, продолжаем")),
+        )
         .mount(&server)
         .await;
     for message in &scenario.messages[midpoint..] {
-        let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": created, "prompt": format!("[B] {message}") }))).await;
+        let sent = send(
+            state.clone(),
+            post_chat(
+                serde_json::json!({ "chat_id": created, "prompt": format!("[B] {message}") }),
+            ),
+        )
+        .await;
         assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     }
 
-    let requests = server.received_requests().await.expect("запросы после переключения на B");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("запросы после переключения на B");
     let last = requests.last().expect("запрос к провайдеру");
     let body = String::from_utf8_lossy(&last.body);
-    assert!(!body.contains("[A]"), "ветка B не должна видеть сообщения ветки A: {body}");
-    assert!(body.contains("[B]"), "ветка B должна видеть собственные сообщения: {body}");
+    assert!(
+        !body.contains("[A]"),
+        "ветка B не должна видеть сообщения ветки A: {body}"
+    );
+    assert!(
+        body.contains("[B]"),
+        "ветка B должна видеть собственные сообщения: {body}"
+    );
 }
 
 // --- Состояние задачи (specs/task-state) ---
@@ -4581,15 +5890,28 @@ async fn skipping_a_stage_over_http_is_rejected_with_request_id() {
 
     let sent = send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "validation" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "validation" })),
+            None,
+        ),
     )
     .await;
     assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
     assert_eq!(sent.body["error"]["code"], "task_transition_invalid");
-    assert!(!sent.body["error"]["request_id"].as_str().unwrap().is_empty());
+    assert!(
+        !sent.body["error"]["request_id"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
 
     let after = send(state, get(&task_uri(&id))).await;
-    assert_eq!(after.body["stage"], "planning", "состояние не должно меняться при отказе");
+    assert_eq!(
+        after.body["stage"], "planning",
+        "состояние не должно меняться при отказе"
+    );
 }
 
 #[tokio::test]
@@ -4599,43 +5921,76 @@ async fn transition_to_done_carries_new_task_id_and_clears_working_memory() {
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
     let owner = crate::store::ANONYMOUS_OWNER.to_string();
-    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
-        .await
-        .expect("чат");
+    let chat = crate::store::load_chat(
+        &state.db,
+        &owner,
+        &id,
+        &agentcore::config::ChatSettings::default(),
+    )
+    .await
+    .expect("чат");
     crate::store::set_working_memory(&state.db, &id, &chat.active_task_id, "k", "v", "manual", 1)
         .await
         .expect("рабочая память");
 
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "clarification" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "clarification" })),
+            None,
+        ),
     )
     .await;
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "execution" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "execution" })),
+            None,
+        ),
     )
     .await;
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "validation" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "validation" })),
+            None,
+        ),
     )
     .await;
     let done = send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "done" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "done" })),
+            None,
+        ),
     )
     .await;
     assert_eq!(done.status, StatusCode::OK, "тело: {}", done.body);
-    let new_task_id = done.body["new_task_id"].as_str().expect("новая задача").to_string();
+    let new_task_id = done.body["new_task_id"]
+        .as_str()
+        .expect("новая задача")
+        .to_string();
     assert_ne!(new_task_id, chat.active_task_id);
 
     let after = send(state.clone(), get(&task_uri(&id))).await;
     assert_eq!(after.body["stage"], "planning");
     assert_eq!(after.body["id"], new_task_id);
 
-    let working = crate::store::load_working_memory(&state.db, &id, &chat.active_task_id).await.expect("память");
-    assert!(working.is_empty(), "рабочая память прежней задачи очищена переходом в done");
+    let working = crate::store::load_working_memory(&state.db, &id, &chat.active_task_id)
+        .await
+        .expect("память");
+    assert!(
+        working.is_empty(),
+        "рабочая память прежней задачи очищена переходом в done"
+    );
 }
 
 #[tokio::test]
@@ -4647,12 +6002,25 @@ async fn transition_to_done_outside_validation_is_rejected_and_keeps_task() {
     for stage in ["planning", "clarification", "execution"] {
         let created = create_chat(state.clone(), None, serde_json::json!({})).await;
         let id = created.body["id"].as_str().unwrap().to_string();
-        let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
-            .await
-            .expect("чат");
-        crate::store::set_working_memory(&state.db, &id, &chat.active_task_id, "k", "v", "manual", 1)
-            .await
-            .expect("рабочая память");
+        let chat = crate::store::load_chat(
+            &state.db,
+            &owner,
+            &id,
+            &agentcore::config::ChatSettings::default(),
+        )
+        .await
+        .expect("чат");
+        crate::store::set_working_memory(
+            &state.db,
+            &id,
+            &chat.active_task_id,
+            "k",
+            "v",
+            "manual",
+            1,
+        )
+        .await
+        .expect("рабочая память");
         if stage != "planning" {
             send(
                 state.clone(),
@@ -4668,30 +6036,62 @@ async fn transition_to_done_outside_validation_is_rejected_and_keeps_task() {
         if stage == "execution" {
             send(
                 state.clone(),
-                request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "execution" })), None),
+                request(
+                    "POST",
+                    &format!("{}/transition", task_uri(&id)),
+                    Some(serde_json::json!({ "stage": "execution" })),
+                    None,
+                ),
             )
             .await;
         }
 
         let done = send(
             state.clone(),
-            request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "done" })), None),
+            request(
+                "POST",
+                &format!("{}/transition", task_uri(&id)),
+                Some(serde_json::json!({ "stage": "done" })),
+                None,
+            ),
         )
         .await;
-        assert_eq!(done.status, StatusCode::BAD_REQUEST, "этап {stage}, тело: {}", done.body);
+        assert_eq!(
+            done.status,
+            StatusCode::BAD_REQUEST,
+            "этап {stage}, тело: {}",
+            done.body
+        );
         assert_eq!(done.body["error"]["code"], "task_transition_invalid");
         assert!(
-            done.body["error"]["message"].as_str().unwrap().contains("допустимые рёбра"),
+            done.body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("допустимые рёбра"),
             "этап {stage}, тело: {}",
             done.body
         );
 
-        let after_chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
+        let after_chat = crate::store::load_chat(
+            &state.db,
+            &owner,
+            &id,
+            &agentcore::config::ChatSettings::default(),
+        )
+        .await
+        .expect("чат");
+        assert_eq!(
+            after_chat.active_task_id, chat.active_task_id,
+            "этап {stage}: задача не ротируется"
+        );
+        let working = crate::store::load_working_memory(&state.db, &id, &chat.active_task_id)
             .await
-            .expect("чат");
-        assert_eq!(after_chat.active_task_id, chat.active_task_id, "этап {stage}: задача не ротируется");
-        let working = crate::store::load_working_memory(&state.db, &id, &chat.active_task_id).await.expect("память");
-        assert_eq!(working.len(), 1, "этап {stage}: рабочая память не очищается");
+            .expect("память");
+        assert_eq!(
+            working.len(),
+            1,
+            "этап {stage}: рабочая память не очищается"
+        );
         let after = send(state.clone(), get(&task_uri(&id))).await;
         assert_eq!(after.body["stage"], stage, "этап не меняется при отказе");
     }
@@ -4704,30 +6104,69 @@ async fn transition_to_done_while_paused_is_rejected() {
     let owner = crate::store::ANONYMOUS_OWNER.to_string();
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
-    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
-        .await
-        .expect("чат");
+    let chat = crate::store::load_chat(
+        &state.db,
+        &owner,
+        &id,
+        &agentcore::config::ChatSettings::default(),
+    )
+    .await
+    .expect("чат");
     for stage in ["clarification", "execution", "validation"] {
         send(
             state.clone(),
-            request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": stage })), None),
+            request(
+                "POST",
+                &format!("{}/transition", task_uri(&id)),
+                Some(serde_json::json!({ "stage": stage })),
+                None,
+            ),
         )
         .await;
     }
-    send(state.clone(), request("POST", &format!("{}/pause", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+    send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/pause", task_uri(&id)),
+            Some(serde_json::json!({})),
+            None,
+        ),
+    )
+    .await;
 
     let done = send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "done" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "done" })),
+            None,
+        ),
     )
     .await;
     assert_eq!(done.status, StatusCode::BAD_REQUEST, "тело: {}", done.body);
-    assert!(done.body["error"]["message"].as_str().unwrap().contains("паузе"), "тело: {}", done.body);
+    assert!(
+        done.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("паузе"),
+        "тело: {}",
+        done.body
+    );
 
-    let after_chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
-        .await
-        .expect("чат");
-    assert_eq!(after_chat.active_task_id, chat.active_task_id, "задача на паузе не завершается");
+    let after_chat = crate::store::load_chat(
+        &state.db,
+        &owner,
+        &id,
+        &agentcore::config::ChatSettings::default(),
+    )
+    .await
+    .expect("чат");
+    assert_eq!(
+        after_chat.active_task_id, chat.active_task_id,
+        "задача на паузе не завершается"
+    );
 }
 
 #[tokio::test]
@@ -4737,18 +6176,40 @@ async fn finish_task_endpoint_is_not_restricted_by_stage() {
     let owner = crate::store::ANONYMOUS_OWNER.to_string();
     let created = create_chat(state.clone(), None, serde_json::json!({})).await;
     let id = created.body["id"].as_str().unwrap().to_string();
-    let chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
-        .await
-        .expect("чат");
+    let chat = crate::store::load_chat(
+        &state.db,
+        &owner,
+        &id,
+        &agentcore::config::ChatSettings::default(),
+    )
+    .await
+    .expect("чат");
 
     // Ротация задачи в рабочей памяти — другой путь с другим смыслом, ребром
     // `validation → done` он не ограничен (design.md, решение 3).
-    let finished = send(state.clone(), request("POST", &finish_task_uri(&id), Some(serde_json::json!({})), None)).await;
+    let finished = send(
+        state.clone(),
+        request(
+            "POST",
+            &finish_task_uri(&id),
+            Some(serde_json::json!({})),
+            None,
+        ),
+    )
+    .await;
     assert_eq!(finished.status, StatusCode::OK, "тело: {}", finished.body);
-    let after_chat = crate::store::load_chat(&state.db, &owner, &id, &agentcore::config::ChatSettings::default())
-        .await
-        .expect("чат");
-    assert_ne!(after_chat.active_task_id, chat.active_task_id, "задача ротирована");
+    let after_chat = crate::store::load_chat(
+        &state.db,
+        &owner,
+        &id,
+        &agentcore::config::ChatSettings::default(),
+    )
+    .await
+    .expect("чат");
+    assert_ne!(
+        after_chat.active_task_id, chat.active_task_id,
+        "задача ротирована"
+    );
 }
 
 #[tokio::test]
@@ -4760,10 +6221,20 @@ async fn unknown_stage_name_is_rejected_with_its_own_reason() {
 
     let unknown = send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "mystery" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "mystery" })),
+            None,
+        ),
     )
     .await;
-    assert_eq!(unknown.status, StatusCode::BAD_REQUEST, "тело: {}", unknown.body);
+    assert_eq!(
+        unknown.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        unknown.body
+    );
     assert_eq!(unknown.body["error"]["code"], "task_transition_invalid");
     assert_eq!(unknown.body["error"]["message"], "неизвестный этап задачи");
 
@@ -4771,14 +6242,30 @@ async fn unknown_stage_name_is_rejected_with_its_own_reason() {
     // причину (specs/task-state, ADDED Requirements).
     let invalid_edge = send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "execution" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "execution" })),
+            None,
+        ),
     )
     .await;
-    assert_eq!(invalid_edge.status, StatusCode::BAD_REQUEST, "тело: {}", invalid_edge.body);
-    assert_eq!(invalid_edge.body["error"]["message"], "переход не входит в допустимые рёбра автомата");
+    assert_eq!(
+        invalid_edge.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        invalid_edge.body
+    );
+    assert_eq!(
+        invalid_edge.body["error"]["message"],
+        "переход не входит в допустимые рёбра автомата"
+    );
 
     let after = send(state, get(&task_uri(&id))).await;
-    assert_eq!(after.body["stage"], "planning", "состояние не меняется ни при одном из отказов");
+    assert_eq!(
+        after.body["stage"], "planning",
+        "состояние не меняется ни при одном из отказов"
+    );
 }
 
 // --- 6.2 Журнал переходов ---
@@ -4791,29 +6278,52 @@ async fn manual_transition_journal_entry_has_manual_source_and_new_task_journal_
     let id = created.body["id"].as_str().unwrap().to_string();
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "clarification" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "clarification" })),
+            None,
+        ),
     )
     .await;
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "execution" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "execution" })),
+            None,
+        ),
     )
     .await;
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "validation" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "validation" })),
+            None,
+        ),
     )
     .await;
     let done = send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "done" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "done" })),
+            None,
+        ),
     )
     .await;
     let new_task_id = done.body["new_task_id"].as_str().unwrap().to_string();
 
     let after = send(state, get(&task_uri(&id))).await;
     assert_eq!(after.body["id"], new_task_id);
-    assert!(after.body["transitions"].as_array().unwrap().is_empty(), "журнал новой задачи пуст");
+    assert!(
+        after.body["transitions"].as_array().unwrap().is_empty(),
+        "журнал новой задачи пуст"
+    );
 }
 
 // --- Пауза и возобновление ---
@@ -4826,7 +6336,12 @@ async fn pause_preserves_state_and_resume_keeps_stage() {
     let id = created.body["id"].as_str().unwrap().to_string();
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "clarification" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "clarification" })),
+            None,
+        ),
     )
     .await;
     send(
@@ -4840,7 +6355,16 @@ async fn pause_preserves_state_and_resume_keeps_stage() {
     )
     .await;
 
-    let paused = send(state.clone(), request("POST", &format!("{}/pause", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+    let paused = send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/pause", task_uri(&id)),
+            Some(serde_json::json!({})),
+            None,
+        ),
+    )
+    .await;
     assert_eq!(paused.status, StatusCode::OK, "тело: {}", paused.body);
     assert_eq!(paused.body["paused"], true);
     assert_eq!(paused.body["stage"], "execution");
@@ -4849,16 +6373,44 @@ async fn pause_preserves_state_and_resume_keeps_stage() {
     // Явный переход на паузе отклоняется.
     let rejected = send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "validation" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "validation" })),
+            None,
+        ),
     )
     .await;
-    assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "тело: {}", rejected.body);
+    assert_eq!(
+        rejected.status,
+        StatusCode::BAD_REQUEST,
+        "тело: {}",
+        rejected.body
+    );
 
     // Повторная пауза — не ошибка.
-    let paused_again = send(state.clone(), request("POST", &format!("{}/pause", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+    let paused_again = send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/pause", task_uri(&id)),
+            Some(serde_json::json!({})),
+            None,
+        ),
+    )
+    .await;
     assert_eq!(paused_again.status, StatusCode::OK);
 
-    let resumed = send(state.clone(), request("POST", &format!("{}/resume", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+    let resumed = send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/resume", task_uri(&id)),
+            Some(serde_json::json!({})),
+            None,
+        ),
+    )
+    .await;
     assert_eq!(resumed.status, StatusCode::OK, "тело: {}", resumed.body);
     assert_eq!(resumed.body["paused"], false);
     assert_eq!(resumed.body["stage"], "execution");
@@ -4877,9 +6429,18 @@ async fn task_state_section_is_present_when_enabled_and_absent_when_disabled() {
         .await;
     let state = state_with_provider(&server, &[]).await;
 
-    let enabled = create_chat(state.clone(), None, serde_json::json!({ "settings": { "task_state_enabled": true } })).await;
+    let enabled = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "task_state_enabled": true } }),
+    )
+    .await;
     let enabled_id = enabled.body["id"].as_str().unwrap().to_string();
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": enabled_id, "prompt": "вопрос" }))).await;
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": enabled_id, "prompt": "вопрос" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     assert_eq!(sent.body["context"]["task_stage"], "planning");
     assert_eq!(sent.body["context"]["task_paused"], false);
@@ -4893,9 +6454,18 @@ async fn task_state_section_is_present_when_enabled_and_absent_when_disabled() {
         .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("ответ")))
         .mount(&server)
         .await;
-    let disabled = create_chat(state.clone(), None, serde_json::json!({ "settings": { "task_state_enabled": false } })).await;
+    let disabled = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "task_state_enabled": false } }),
+    )
+    .await;
     let disabled_id = disabled.body["id"].as_str().unwrap().to_string();
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": disabled_id, "prompt": "вопрос" }))).await;
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": disabled_id, "prompt": "вопрос" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     assert!(sent.body["context"]["task_stage"].is_null());
     let requests = server.received_requests().await.expect("запросы");
@@ -4925,13 +6495,23 @@ async fn client_enables_task_state_over_operator_default_and_disables_tracker() 
     .await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
-    assert_eq!(sent.body["context"]["task_stage"], "planning", "клиент включил состояние задачи поверх умолчания");
+    assert_eq!(
+        sent.body["context"]["task_stage"], "planning",
+        "клиент включил состояние задачи поверх умолчания"
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let requests_with_auto = server.received_requests().await.expect("запросы").len();
-    assert_eq!(requests_with_auto, 2, "трекер должен вызваться вторым запросом при включённом автотрекере чата");
+    assert_eq!(
+        requests_with_auto, 2,
+        "трекер должен вызваться вторым запросом при включённом автотрекере чата"
+    );
 
     let disabled_tracker = create_chat(
         state.clone(),
@@ -4940,11 +6520,19 @@ async fn client_enables_task_state_over_operator_default_and_disables_tracker() 
     )
     .await;
     let id2 = disabled_tracker.body["id"].as_str().unwrap().to_string();
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id2, "prompt": "вопрос" }))).await;
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id2, "prompt": "вопрос" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let requests_after = server.received_requests().await.expect("запросы").len();
-    assert_eq!(requests_after, requests_with_auto + 1, "клиент выключил трекер поверх умолчания сервиса");
+    assert_eq!(
+        requests_after,
+        requests_with_auto + 1,
+        "клиент выключил трекер поверх умолчания сервиса"
+    );
 }
 
 // --- 6.3 Трекер ---
@@ -4976,14 +6564,28 @@ async fn tracker_applies_valid_proposal_and_next_response_reports_it() {
     .await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let first = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "начнём" }))).await;
+    let first = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "начнём" })),
+    )
+    .await;
     assert_eq!(first.status, StatusCode::OK, "тело: {}", first.body);
-    assert_eq!(first.body["context"]["task_tracker_applied"], 0, "у первого ответа ещё нет прогона трекера");
+    assert_eq!(
+        first.body["context"]["task_tracker_applied"], 0,
+        "у первого ответа ещё нет прогона трекера"
+    );
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let second = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "продолжаем" }))).await;
+    let second = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "продолжаем" })),
+    )
+    .await;
     assert_eq!(second.status, StatusCode::OK, "тело: {}", second.body);
-    assert_eq!(second.body["context"]["task_stage"], "clarification", "предложение трекера применилось к состоянию");
+    assert_eq!(
+        second.body["context"]["task_stage"], "clarification",
+        "предложение трекера применилось к состоянию"
+    );
     assert_eq!(second.body["context"]["task_tracker_applied"], 1);
     assert_eq!(second.body["context"]["task_tracker_rejected"], 0);
 }
@@ -5016,17 +6618,33 @@ async fn tracker_applies_execution_only_after_explicit_user_confirmation_in_clar
     let id = created.body["id"].as_str().unwrap().to_string();
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "clarification" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "clarification" })),
+            None,
+        ),
     )
     .await;
 
-    let first = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "готов начинать?" }))).await;
+    let first = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "готов начинать?" })),
+    )
+    .await;
     assert_eq!(first.status, StatusCode::OK, "тело: {}", first.body);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let second = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "продолжаем" }))).await;
+    let second = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "продолжаем" })),
+    )
+    .await;
     assert_eq!(second.status, StatusCode::OK, "тело: {}", second.body);
-    assert_eq!(second.body["context"]["task_stage"], "execution", "переход в execution применился по автомату");
+    assert_eq!(
+        second.body["context"]["task_stage"], "execution",
+        "переход в execution применился по автомату"
+    );
     assert_eq!(second.body["context"]["task_tracker_applied"], 1);
     assert_eq!(second.body["context"]["task_tracker_rejected"], 0);
 }
@@ -5059,27 +6677,53 @@ async fn tracker_never_applies_done_even_when_edge_is_valid() {
     let id = created.body["id"].as_str().unwrap().to_string();
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "clarification" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "clarification" })),
+            None,
+        ),
     )
     .await;
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "execution" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "execution" })),
+            None,
+        ),
     )
     .await;
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "validation" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "validation" })),
+            None,
+        ),
     )
     .await;
 
-    let first = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "готово?" }))).await;
+    let first = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "готово?" })),
+    )
+    .await;
     assert_eq!(first.status, StatusCode::OK, "тело: {}", first.body);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let second = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "и что дальше" }))).await;
+    let second = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "и что дальше" })),
+    )
+    .await;
     assert_eq!(second.status, StatusCode::OK, "тело: {}", second.body);
-    assert_eq!(second.body["context"]["task_stage"], "validation", "предложение done не применяется трекером");
+    assert_eq!(
+        second.body["context"]["task_stage"], "validation",
+        "предложение done не применяется трекером"
+    );
     assert_eq!(second.body["context"]["task_tracker_rejected"], 1);
 }
 
@@ -5098,7 +6742,9 @@ async fn tracker_request_carries_both_user_message_and_assistant_reply() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(BodyLacks(crate::task::TASK_TRACKER_MARKER))
-        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("МЕТКА-ОТВЕТА-МОДЕЛИ")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(provider_reply("МЕТКА-ОТВЕТА-МОДЕЛИ")),
+        )
         .mount(&server)
         .await;
     let state = state_with_provider(&server, &[("AGENTD_AUTO_TITLE", "false")]).await;
@@ -5110,7 +6756,11 @@ async fn tracker_request_carries_both_user_message_and_assistant_reply() {
     .await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "МЕТКА-РЕПЛИКИ-ПОЛЬЗОВАТЕЛЯ" }))).await;
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "МЕТКА-РЕПЛИКИ-ПОЛЬЗОВАТЕЛЯ" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -5120,8 +6770,14 @@ async fn tracker_request_carries_both_user_message_and_assistant_reply() {
         .map(|request| String::from_utf8_lossy(&request.body).to_string())
         .find(|body| body.contains(crate::task::TASK_TRACKER_MARKER))
         .expect("запрос трекера");
-    assert!(tracker_body.contains("МЕТКА-РЕПЛИКИ-ПОЛЬЗОВАТЕЛЯ"), "вход трекера без реплики пользователя: {tracker_body}");
-    assert!(tracker_body.contains("МЕТКА-ОТВЕТА-МОДЕЛИ"), "вход трекера без ответа модели: {tracker_body}");
+    assert!(
+        tracker_body.contains("МЕТКА-РЕПЛИКИ-ПОЛЬЗОВАТЕЛЯ"),
+        "вход трекера без реплики пользователя: {tracker_body}"
+    );
+    assert!(
+        tracker_body.contains("МЕТКА-ОТВЕТА-МОДЕЛИ"),
+        "вход трекера без ответа модели: {tracker_body}"
+    );
 }
 
 #[tokio::test]
@@ -5163,11 +6819,18 @@ async fn tracker_proposal_with_current_stage_updates_fields_without_transition()
     let before = send(state.clone(), get(&task_uri(&id))).await;
     let transitions_before = before.body["transitions"].as_array().unwrap().len();
 
-    send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "отвечаю на вопросы" }))).await;
+    send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "отвечаю на вопросы" })),
+    )
+    .await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let after = send(state.clone(), get(&task_uri(&id))).await;
-    assert_eq!(after.body["stage"], "clarification", "этап не меняется предложением с текущим этапом");
+    assert_eq!(
+        after.body["stage"], "clarification",
+        "этап не меняется предложением с текущим этапом"
+    );
     assert_eq!(after.body["step"], "новый шаг");
     assert_eq!(after.body["expected_action"], "новое действие");
     assert_eq!(
@@ -5176,7 +6839,11 @@ async fn tracker_proposal_with_current_stage_updates_fields_without_transition()
         "журнал переходов не растёт при обновлении полей"
     );
 
-    let second = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "продолжаем" }))).await;
+    let second = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "продолжаем" })),
+    )
+    .await;
     assert_eq!(second.body["context"]["task_tracker_updated"], 1);
     assert_eq!(second.body["context"]["task_tracker_applied"], 0);
     assert_eq!(second.body["context"]["task_tracker_rejected"], 0);
@@ -5199,13 +6866,29 @@ async fn tracker_does_not_run_while_task_is_paused() {
     )
     .await;
     let id = created.body["id"].as_str().unwrap().to_string();
-    send(state.clone(), request("POST", &format!("{}/pause", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+    send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/pause", task_uri(&id)),
+            Some(serde_json::json!({})),
+            None,
+        ),
+    )
+    .await;
 
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" })),
+    )
+    .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let requests = server.received_requests().await.expect("запросы").len();
-    assert_eq!(requests, 1, "трекер не должен вызываться, пока задача на паузе");
+    assert_eq!(
+        requests, 1,
+        "трекер не должен вызываться, пока задача на паузе"
+    );
 }
 
 #[tokio::test]
@@ -5232,8 +6915,17 @@ async fn tracker_failure_does_not_break_main_response() {
     .await;
     let id = created.body["id"].as_str().unwrap().to_string();
 
-    let sent = send(state.clone(), post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" }))).await;
-    assert_eq!(sent.status, StatusCode::OK, "основной ответ не должен зависеть от отказа трекера: {}", sent.body);
+    let sent = send(
+        state.clone(),
+        post_chat(serde_json::json!({ "chat_id": id, "prompt": "вопрос" })),
+    )
+    .await;
+    assert_eq!(
+        sent.status,
+        StatusCode::OK,
+        "основной ответ не должен зависеть от отказа трекера: {}",
+        sent.body
+    );
 }
 
 // --- 4.4/5.3 Бриф возобновления в системном сообщении ---
@@ -5248,11 +6940,21 @@ async fn resumed_task_system_message_carries_prior_stage_step_and_resume_brief()
         .mount(&server)
         .await;
     let state = state_with_provider(&server, &[]).await;
-    let created = create_chat(state.clone(), None, serde_json::json!({ "settings": { "task_state_enabled": true } })).await;
+    let created = create_chat(
+        state.clone(),
+        None,
+        serde_json::json!({ "settings": { "task_state_enabled": true } }),
+    )
+    .await;
     let id = created.body["id"].as_str().unwrap().to_string();
     send(
         state.clone(),
-        request("POST", &format!("{}/transition", task_uri(&id)), Some(serde_json::json!({ "stage": "clarification" })), None),
+        request(
+            "POST",
+            &format!("{}/transition", task_uri(&id)),
+            Some(serde_json::json!({ "stage": "clarification" })),
+            None,
+        ),
     )
     .await;
     send(
@@ -5265,12 +6967,32 @@ async fn resumed_task_system_message_carries_prior_stage_step_and_resume_brief()
         ),
     )
     .await;
-    send(state.clone(), request("POST", &format!("{}/pause", task_uri(&id)), Some(serde_json::json!({})), None)).await;
-    send(state.clone(), request("POST", &format!("{}/resume", task_uri(&id)), Some(serde_json::json!({})), None)).await;
+    send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/pause", task_uri(&id)),
+            Some(serde_json::json!({})),
+            None,
+        ),
+    )
+    .await;
+    send(
+        state.clone(),
+        request(
+            "POST",
+            &format!("{}/resume", task_uri(&id)),
+            Some(serde_json::json!({})),
+            None,
+        ),
+    )
+    .await;
 
     let sent = send(
         state.clone(),
-        post_chat(serde_json::json!({ "chat_id": id, "prompt": "продолжаем, без пересказа контекста" })),
+        post_chat(
+            serde_json::json!({ "chat_id": id, "prompt": "продолжаем, без пересказа контекста" }),
+        ),
     )
     .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
@@ -5283,7 +7005,6 @@ async fn resumed_task_system_message_carries_prior_stage_step_and_resume_brief()
     assert!(body.contains("правит парсер"), "тело: {body}");
     assert!(body.contains("ждёт ревью"), "тело: {body}");
 }
-
 
 // --- Инварианты: `AGENTD_INVARIANTS_PATH`, отказ `invariant_violation`,
 // отклонение клиентского поля `invariants`
@@ -5334,9 +7055,18 @@ async fn invariant_violation_is_rejected_with_dedicated_code_and_request_id() {
         .await;
 
     let state = state_with_provider(&server, &[("AGENTD_INVARIANTS_PATH", &invariants_path)]).await;
-    let sent = send(state, post_chat(serde_json::json!({ "prompt": "как передать ключ клиенту?" }))).await;
+    let sent = send(
+        state,
+        post_chat(serde_json::json!({ "prompt": "как передать ключ клиенту?" })),
+    )
+    .await;
 
-    assert_eq!(sent.status, StatusCode::UNPROCESSABLE_ENTITY, "тело: {}", sent.body);
+    assert_eq!(
+        sent.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "тело: {}",
+        sent.body
+    );
     assert_eq!(sent.body["error"]["code"], "invariant_violation");
     assert!(
         sent.body["error"]["message"]
@@ -5440,18 +7170,26 @@ async fn request_without_chat_passes_tools_and_returns_tool_calls() {
 
     let sent = send(
         state,
-        post_chat(serde_json::json!({ "prompt": "что в рабочей копии?", "tools": [git_status_tool()] })),
+        post_chat(
+            serde_json::json!({ "prompt": "что в рабочей копии?", "tools": [git_status_tool()] }),
+        ),
     )
     .await;
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     assert_eq!(sent.body["content"], "");
     assert_eq!(sent.body["tool_calls"][0]["id"], "call_0");
     assert_eq!(sent.body["tool_calls"][0]["name"], "git_status");
-    assert_eq!(sent.body["tool_calls"][0]["arguments"], serde_json::json!({}));
+    assert_eq!(
+        sent.body["tool_calls"][0]["arguments"],
+        serde_json::json!({})
+    );
 
     let sent_to_provider: serde_json::Value =
         serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
-    assert_eq!(sent_to_provider["tools"][0]["function"]["name"], "git_status");
+    assert_eq!(
+        sent_to_provider["tools"][0]["function"]["name"],
+        "git_status"
+    );
 }
 
 #[tokio::test]
@@ -5468,7 +7206,8 @@ async fn final_response_always_has_empty_tool_calls() {
     assert_eq!(sent.status, StatusCode::OK, "тело: {}", sent.body);
     assert_eq!(sent.body["tool_calls"], serde_json::json!([]));
     // Без инструментов поле `tools` провайдеру не уходит вовсе.
-    let body = String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body).to_string();
+    let body =
+        String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body).to_string();
     assert!(!body.contains("\"tools\""), "тело: {body}");
 }
 
@@ -5479,7 +7218,9 @@ async fn tool_turn_in_chat_is_stored_in_parts_and_background_runs_once() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(BodyContains(crate::title::TITLE_UPDATE_MARKER))
-        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("Статус репозитория")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(provider_reply("Статус репозитория")),
+        )
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -5493,7 +7234,9 @@ async fn tool_turn_in_chat_is_stored_in_parts_and_background_runs_once() {
         .and(path("/chat/completions"))
         .and(BodyLacks(crate::title::TITLE_UPDATE_MARKER))
         .and(BodyContains("\"role\":\"tool\""))
-        .respond_with(ResponseTemplate::new(200).set_body_json(provider_reply("рабочая копия чистая")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(provider_reply("рабочая копия чистая")),
+        )
         .mount(&server)
         .await;
     let state = state_with_provider(&server, &[]).await;
@@ -5511,7 +7254,10 @@ async fn tool_turn_in_chat_is_stored_in_parts_and_background_runs_once() {
 
     // Промежуточный ответ фоновых задач не запускает: названия ещё нет.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(provider_requests_containing(&server, crate::title::TITLE_UPDATE_MARKER).await, 0);
+    assert_eq!(
+        provider_requests_containing(&server, crate::title::TITLE_UPDATE_MARKER).await,
+        0
+    );
 
     let second = send(
         state.clone(),
@@ -5540,22 +7286,36 @@ async fn tool_turn_in_chat_is_stored_in_parts_and_background_runs_once() {
     let tool = messages.iter().find(|m| m["role"] == "tool").unwrap();
     assert_eq!(tool["tool_call_id"], "call_0");
     assert_eq!(tool["content"], "nothing to commit");
-    let call = messages.iter().find(|m| m.get("tool_calls").is_some()).unwrap();
+    let call = messages
+        .iter()
+        .find(|m| m.get("tool_calls").is_some())
+        .unwrap();
     assert_eq!(call["tool_calls"][0]["id"], "call_0");
 
     let mut title_requests = 0;
     for _ in 0..40 {
-        title_requests = provider_requests_containing(&server, crate::title::TITLE_UPDATE_MARKER).await;
+        title_requests =
+            provider_requests_containing(&server, crate::title::TITLE_UPDATE_MARKER).await;
         if title_requests > 0 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert_eq!(title_requests, 1, "фоновые задачи запускаются один раз, после окончательного ответа");
+    assert_eq!(
+        title_requests, 1,
+        "фоновые задачи запускаются один раз, после окончательного ответа"
+    );
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     let messages = loaded.body["messages"].as_array().unwrap();
-    let roles: Vec<&str> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
     assert_eq!(roles, vec!["user", "assistant", "tool", "assistant"]);
     assert_eq!(messages[1]["tool_calls"][0]["name"], "git_status");
     assert_eq!(messages[2]["tool_call_id"], "call_0");
@@ -5577,7 +7337,9 @@ async fn foreign_tool_call_id_is_rejected_in_error_envelope() {
     let id = created.body["id"].as_str().unwrap().to_string();
     let first = send(
         state.clone(),
-        post_chat(serde_json::json!({ "chat_id": id, "prompt": "статус", "tools": [git_status_tool()] })),
+        post_chat(
+            serde_json::json!({ "chat_id": id, "prompt": "статус", "tools": [git_status_tool()] }),
+        ),
     )
     .await;
     assert_eq!(first.status, StatusCode::OK, "тело: {}", first.body);
@@ -5595,7 +7357,11 @@ async fn foreign_tool_call_id_is_rejected_in_error_envelope() {
     assert_eq!(sent.body["error"]["code"], "tool_results_mismatch");
     assert!(!sent.request_id_header.is_empty());
     assert_eq!(sent.body["error"]["request_id"], sent.request_id_header);
-    assert_eq!(server.received_requests().await.unwrap().len(), calls_before, "модель не вызывалась");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        calls_before,
+        "модель не вызывалась"
+    );
 }
 
 #[tokio::test]
@@ -5650,7 +7416,10 @@ async fn invalid_tool_name_is_rejected() {
         )
         .await;
         assert_eq!(sent.status, StatusCode::BAD_REQUEST, "тело: {}", sent.body);
-        assert_eq!(sent.body["error"]["code"], "tools_invalid", "инструменты: {tools}");
+        assert_eq!(
+            sent.body["error"]["code"], "tools_invalid",
+            "инструменты: {tools}"
+        );
         assert_eq!(sent.body["error"]["request_id"], sent.request_id_header);
     }
 }
@@ -5697,12 +7466,23 @@ async fn patch_git_tool_settings_persist_and_read_back() {
     .await;
     assert_eq!(patched.status, StatusCode::OK, "тело: {}", patched.body);
 
-    let loaded = send(state.clone(), request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state.clone(),
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     let settings = &loaded.body["chat"]["settings"];
-    let settings = if settings.is_null() { &loaded.body["settings"] } else { settings };
+    let settings = if settings.is_null() {
+        &loaded.body["settings"]
+    } else {
+        settings
+    };
     assert_eq!(settings["git_tools_enabled"], true);
     assert_eq!(settings["git_repository"], "/tmp/git-mcp-demo");
-    assert_eq!(settings["git_allowed_tools"], serde_json::json!(["git_add", "git_commit"]));
+    assert_eq!(
+        settings["git_allowed_tools"],
+        serde_json::json!(["git_add", "git_commit"])
+    );
     assert_eq!(settings["tool_max_iterations"], 4);
 
     // Поля нет — значение остаётся; `null` — снимается.
@@ -5804,9 +7584,18 @@ async fn appended_tool_turn_round_trips_through_chat_history() {
         ),
     )
     .await;
-    assert_eq!(appended.status, StatusCode::CREATED, "тело: {}", appended.body);
+    assert_eq!(
+        appended.status,
+        StatusCode::CREATED,
+        "тело: {}",
+        appended.body
+    );
 
-    let loaded = send(state, request("GET", &format!("/v1/chats/{id}"), None, None)).await;
+    let loaded = send(
+        state,
+        request("GET", &format!("/v1/chats/{id}"), None, None),
+    )
+    .await;
     let messages = loaded.body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[1]["tool_calls"][0]["name"], "git_status");

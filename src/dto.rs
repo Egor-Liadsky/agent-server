@@ -711,6 +711,8 @@ pub struct ChatDto {
     pub created_at: i64,
     pub updated_at: i64,
     pub message_count: i64,
+    /// Поколение сообщений, допустимых в контексте модели.
+    pub context_generation: i64,
     /// Текст пересказа вытесненной части истории. Только для чтения: входные
     /// DTO это поле не объявляют (specs/context-summary, «Наблюдаемость
     /// компактизации»).
@@ -730,6 +732,7 @@ impl From<store::Chat> for ChatDto {
             created_at: chat.created_at,
             updated_at: chat.updated_at,
             message_count: chat.message_count,
+            context_generation: chat.context_generation,
             summary: None,
             summary_through_seq: None,
         }
@@ -754,6 +757,7 @@ impl ChatDto {
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageView {
     pub seq: i64,
+    pub context_generation: i64,
     pub role: RoleDto,
     pub content: String,
     pub created_at: i64,
@@ -794,6 +798,7 @@ impl From<store::ChatMessage> for MessageView {
         };
         Self {
             seq: message.seq,
+            context_generation: message.context_generation,
             role,
             content: message.content,
             created_at: message.created_at,
@@ -915,6 +920,7 @@ impl NewMessageDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendMessagesRequest {
     pub messages: Vec<NewMessageDto>,
+    pub context_generation: i64,
 }
 
 /// Ответ дозаписи: назначенные хранилищем номера сообщений в том же

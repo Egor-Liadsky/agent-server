@@ -33,17 +33,38 @@ pub struct StrategyCtx<'a> {
 
 #[async_trait]
 trait ContextStrategyImpl {
-    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> Assembled;
+    async fn assemble(
+        &self,
+        ctx: &StrategyCtx<'_>,
+        stored: Vec<store::ChatMessage>,
+        new_messages: Vec<Message>,
+    ) -> Assembled;
 }
 
 struct SummaryImpl;
 
 #[async_trait]
 impl ContextStrategyImpl for SummaryImpl {
-    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> Assembled {
-        let compaction = compact_history(ctx.state, &ctx.chat.id, ctx.settings, stored, new_messages).await;
+    async fn assemble(
+        &self,
+        ctx: &StrategyCtx<'_>,
+        stored: Vec<store::ChatMessage>,
+        new_messages: Vec<Message>,
+    ) -> Assembled {
+        let compaction = compact_history(
+            ctx.state,
+            &ctx.chat.id,
+            ctx.chat.context_generation,
+            ctx.settings,
+            stored,
+            new_messages,
+        )
+        .await;
         Assembled {
-            context: ContextDto::for_summary(compaction.replaced_messages, compaction.summary_built),
+            context: ContextDto::for_summary(
+                compaction.replaced_messages,
+                compaction.summary_built,
+            ),
             sections: compaction.summary_section.into_iter().collect(),
             history: compaction.history,
         }
@@ -54,8 +75,17 @@ struct WindowImpl;
 
 #[async_trait]
 impl ContextStrategyImpl for WindowImpl {
-    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> Assembled {
-        let outcome = crate::window::assemble(stored, effective_window(ctx.state, ctx.settings), new_messages);
+    async fn assemble(
+        &self,
+        ctx: &StrategyCtx<'_>,
+        stored: Vec<store::ChatMessage>,
+        new_messages: Vec<Message>,
+    ) -> Assembled {
+        let outcome = crate::window::assemble(
+            stored,
+            effective_window(ctx.state, ctx.settings),
+            new_messages,
+        );
         Assembled {
             context: crate::window::context_dto(&outcome),
             sections: Vec::new(),
@@ -68,9 +98,16 @@ struct FactsImpl;
 
 #[async_trait]
 impl ContextStrategyImpl for FactsImpl {
-    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> Assembled {
+    async fn assemble(
+        &self,
+        ctx: &StrategyCtx<'_>,
+        stored: Vec<store::ChatMessage>,
+        new_messages: Vec<Message>,
+    ) -> Assembled {
         let window_size = effective_window(ctx.state, ctx.settings);
-        let outcome = crate::facts::assemble(ctx.state, &ctx.chat.id, window_size, stored, new_messages).await;
+        let outcome =
+            crate::facts::assemble(ctx.state, &ctx.chat.id, window_size, stored, new_messages)
+                .await;
         let context = crate::facts::context_dto(&outcome);
         Assembled {
             context,
@@ -84,7 +121,12 @@ struct BranchingImpl;
 
 #[async_trait]
 impl ContextStrategyImpl for BranchingImpl {
-    async fn assemble(&self, ctx: &StrategyCtx<'_>, stored: Vec<store::ChatMessage>, new_messages: Vec<Message>) -> Assembled {
+    async fn assemble(
+        &self,
+        ctx: &StrategyCtx<'_>,
+        stored: Vec<store::ChatMessage>,
+        new_messages: Vec<Message>,
+    ) -> Assembled {
         let outcome = crate::branch::assemble(ctx.state, ctx.chat, stored, new_messages).await;
         Assembled {
             context: ContextDto::for_branching(outcome.sent_messages, outcome.branch_id),
@@ -122,8 +164,18 @@ pub async fn assemble(
     stored: Vec<store::ChatMessage>,
     new_messages: Vec<Message>,
 ) -> Assembled {
-    let ctx = StrategyCtx { state, chat, settings };
-    let mut assembled = impl_for(strategy).assemble(&ctx, stored, new_messages).await;
+    let stored: Vec<_> = stored
+        .into_iter()
+        .filter(|message| message.context_generation == chat.context_generation)
+        .collect();
+    let ctx = StrategyCtx {
+        state,
+        chat,
+        settings,
+    };
+    let mut assembled = impl_for(strategy)
+        .assemble(&ctx, stored, new_messages)
+        .await;
     if crate::memory::effective_layers_enabled(state, settings) {
         let memory = crate::memory::layers(state, chat, settings, owner).await;
         crate::memory::merge_into_context(&mut assembled.context, &memory, &assembled.history);
@@ -150,7 +202,9 @@ pub async fn assemble(
     if crate::task::effective_enabled(state, settings) {
         if let Ok(task) = store::load_task_state(&state.db, owner, &chat.id).await {
             crate::task::merge_into_context(&mut assembled.context, &task);
-            assembled.sections.push(crate::task::system_message_section(&task));
+            assembled
+                .sections
+                .push(crate::task::system_message_section(&task));
             let tracker = state
                 .task_track_outcomes
                 .lock()
@@ -192,7 +246,8 @@ pub async fn assemble(
             assembled.sections.insert(0, built.section);
         }
     }
-    let system_message = crate::system_message::build(&state.config.system_prompt, &assembled.sections);
+    let system_message =
+        crate::system_message::build(&state.config.system_prompt, &assembled.sections);
     assembled.history.insert(0, system_message);
     // Висячий вызов инструмента остаётся в истории, если клиент упал
     // посреди хода или ветка создана от середины хода; провайдер такую
@@ -214,7 +269,9 @@ pub fn effective_window(state: &AppState, settings: &ChatSettings) -> u32 {
 /// умолчания (specs/context-strategies, «Операторские умолчание и список
 /// разрешённых стратегий»).
 pub fn effective_strategy(state: &AppState, settings: &ChatSettings) -> ContextStrategy {
-    settings.context_strategy.unwrap_or(state.config.context_strategy)
+    settings
+        .context_strategy
+        .unwrap_or(state.config.context_strategy)
 }
 
 #[cfg(test)]
@@ -289,7 +346,141 @@ mod tests {
         .await;
         assert!(matches!(assembled.history[0].role, Role::System));
         assert!(assembled.history[0].content.contains("Факты чата:"));
-        assert!(assembled.history.iter().skip(1).all(|m| !m.content.contains("Факты чата:")));
+        assert!(
+            assembled
+                .history
+                .iter()
+                .skip(1)
+                .all(|m| !m.content.contains("Факты чата:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_generation_filters_archive_before_every_context_strategy() {
+        let _guard = crate::state::test_lock();
+        let state = AppState::for_tests().await;
+        let settings = ChatSettings::default();
+        let mut chat = store::create_chat(&state.db, "owner-1", "Чат", &settings)
+            .await
+            .expect("чат");
+        store::append_messages_for_generation(
+            &state.db,
+            "owner-1",
+            &chat.id,
+            vec![store::NewMessage::from_message(Message::user(
+                "старая переписка",
+            ))],
+            0,
+        )
+        .await
+        .expect("старое сообщение");
+        let root_branch = chat.active_branch.clone();
+        let branch = store::create_branch(&state.db, "owner-1", &chat.id, 1, "после сброса")
+            .await
+            .expect("ветка");
+        store::activate_branch(&state.db, "owner-1", &chat.id, &branch.id)
+            .await
+            .expect("активная ветка");
+        chat.active_branch = branch.id.clone();
+        store::reset_context(&state.db, "owner-1", &chat.id)
+            .await
+            .expect("сброс");
+        store::append_messages_for_generation(
+            &state.db,
+            "owner-1",
+            &chat.id,
+            vec![
+                store::NewMessage::from_message(Message::assistant_with_tool_calls(
+                    "",
+                    vec![agentcore::agent::ToolCall {
+                        id: "call".into(),
+                        name: "search".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                )),
+                store::NewMessage::from_message(Message::tool_result(
+                    "call",
+                    "search",
+                    "результат нового хода",
+                )),
+                store::NewMessage::from_message(Message::user("новая переписка")),
+            ],
+            1,
+        )
+        .await
+        .expect("новые сообщения");
+        chat.context_generation = 1;
+        let archived = store::load_messages(&state.db, &chat.id, 0, 20, None, 8)
+            .await
+            .expect("архив")
+            .messages;
+
+        for strategy in [
+            ContextStrategy::Summary,
+            ContextStrategy::SlidingWindow,
+            ContextStrategy::Facts,
+            ContextStrategy::Branching,
+        ] {
+            let mut settings = settings.clone();
+            settings.context_strategy = Some(strategy);
+            settings.summary_enabled = Some(false);
+            let assembled = assemble(
+                &state,
+                &chat,
+                &settings,
+                "owner-1",
+                strategy,
+                archived.clone(),
+                Vec::new(),
+            )
+            .await;
+            let model_text = assembled
+                .history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !model_text.contains("старая переписка"),
+                "старая реплика попала в {strategy:?}"
+            );
+            assert!(
+                model_text.contains("новая переписка"),
+                "новая реплика отсутствует в {strategy:?}"
+            );
+            assert!(
+                model_text.contains("результат нового хода"),
+                "сообщение инструмента отсутствует в {strategy:?}"
+            );
+        }
+
+        store::activate_branch(&state.db, "owner-1", &chat.id, &root_branch)
+            .await
+            .expect("переключение на старую ветку");
+        chat.active_branch = root_branch;
+        let old_branch = store::load_messages(&state.db, &chat.id, 0, 20, None, 8)
+            .await
+            .expect("история старой ветки")
+            .messages;
+        let switched = assemble(
+            &state,
+            &chat,
+            &ChatSettings {
+                context_strategy: Some(ContextStrategy::Branching),
+                ..settings
+            },
+            "owner-1",
+            ContextStrategy::Branching,
+            old_branch,
+            Vec::new(),
+        )
+        .await;
+        assert!(
+            switched
+                .history
+                .iter()
+                .all(|m| !m.content.contains("старая переписка"))
+        );
     }
 
     // --- Слоистая память как обёртка над стратегией (decouple-memory-layers) ---
@@ -305,6 +496,7 @@ mod tests {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_name: None,
+            context_generation: 0,
         }
     }
 
@@ -318,13 +510,32 @@ mod tests {
             memory_layers_enabled: Some(true),
             ..ChatSettings::default()
         };
-        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
-        store::set_long_term_memory(&state.db, "owner-1", "decision", Some("auth"), "Clerk", "manual", None, 1)
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings)
             .await
-            .expect("долговременная запись");
-        store::set_working_memory(&state.db, &chat.id, &chat.active_task_id, "target", "iOS 17+", "manual", 1)
-            .await
-            .expect("рабочая запись");
+            .expect("чат");
+        store::set_long_term_memory(
+            &state.db,
+            "owner-1",
+            "decision",
+            Some("auth"),
+            "Clerk",
+            "manual",
+            None,
+            1,
+        )
+        .await
+        .expect("долговременная запись");
+        store::set_working_memory(
+            &state.db,
+            &chat.id,
+            &chat.active_task_id,
+            "target",
+            "iOS 17+",
+            "manual",
+            1,
+        )
+        .await
+        .expect("рабочая запись");
 
         // Достаточно сообщений, чтобы хвост стратегии summary не покрыл всю
         // историю (умолчание `AGENTD_SUMMARY_KEEP_MESSAGES` — 20), и уже
@@ -339,7 +550,9 @@ mod tests {
                 }
             })
             .collect();
-        store::save_summary(&state.db, &chat.id, "итог прошлого", stored[4].seq).await.expect("пересказ сохранён");
+        store::save_summary(&state.db, &chat.id, "итог прошлого", stored[4].seq)
+            .await
+            .expect("пересказ сохранён");
 
         let assembled = assemble(
             &state,
@@ -353,11 +566,23 @@ mod tests {
         .await;
 
         let system = &assembled.history[0].content;
-        let long_term_at = system.find("Долговременная память:").expect("раздел долговременной памяти");
-        let working_at = system.find("Рабочая память задачи:").expect("раздел рабочей памяти");
-        let summary_at = system.find(crate::summary::SUMMARY_MARKER).expect("раздел пересказа");
-        assert!(long_term_at < working_at, "долговременная память должна идти раньше рабочей");
-        assert!(working_at < summary_at, "разделы памяти должны идти раньше раздела стратегии");
+        let long_term_at = system
+            .find("Долговременная память:")
+            .expect("раздел долговременной памяти");
+        let working_at = system
+            .find("Рабочая память задачи:")
+            .expect("раздел рабочей памяти");
+        let summary_at = system
+            .find(crate::summary::SUMMARY_MARKER)
+            .expect("раздел пересказа");
+        assert!(
+            long_term_at < working_at,
+            "долговременная память должна идти раньше рабочей"
+        );
+        assert!(
+            working_at < summary_at,
+            "разделы памяти должны идти раньше раздела стратегии"
+        );
     }
 
     // --- Профиль как раздел, встающий первым (specs/user-profiles) ---
@@ -373,13 +598,32 @@ mod tests {
             profile_id: Some("teacher".to_string()),
             ..ChatSettings::default()
         };
-        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
-        store::set_long_term_memory(&state.db, "owner-1", "decision", Some("auth"), "Clerk", "manual", None, 1)
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings)
             .await
-            .expect("долговременная запись");
-        store::set_working_memory(&state.db, &chat.id, &chat.active_task_id, "target", "iOS 17+", "manual", 1)
-            .await
-            .expect("рабочая запись");
+            .expect("чат");
+        store::set_long_term_memory(
+            &state.db,
+            "owner-1",
+            "decision",
+            Some("auth"),
+            "Clerk",
+            "manual",
+            None,
+            1,
+        )
+        .await
+        .expect("долговременная запись");
+        store::set_working_memory(
+            &state.db,
+            &chat.id,
+            &chat.active_task_id,
+            "target",
+            "iOS 17+",
+            "manual",
+            1,
+        )
+        .await
+        .expect("рабочая запись");
         let stored: Vec<store::ChatMessage> = (1..=25)
             .map(|seq| {
                 if seq % 2 == 1 {
@@ -389,7 +633,9 @@ mod tests {
                 }
             })
             .collect();
-        store::save_summary(&state.db, &chat.id, "итог прошлого", stored[4].seq).await.expect("пересказ сохранён");
+        store::save_summary(&state.db, &chat.id, "итог прошлого", stored[4].seq)
+            .await
+            .expect("пересказ сохранён");
 
         let assembled = assemble(
             &state,
@@ -404,10 +650,19 @@ mod tests {
 
         let system = &assembled.history[0].content;
         let profile_at = system.find("Профиль:").expect("раздел профиля");
-        let long_term_at = system.find("Долговременная память:").expect("раздел долговременной памяти");
-        let working_at = system.find("Рабочая память задачи:").expect("раздел рабочей памяти");
-        let summary_at = system.find(crate::summary::SUMMARY_MARKER).expect("раздел пересказа");
-        assert!(profile_at < long_term_at, "профиль должен идти раньше долговременной памяти");
+        let long_term_at = system
+            .find("Долговременная память:")
+            .expect("раздел долговременной памяти");
+        let working_at = system
+            .find("Рабочая память задачи:")
+            .expect("раздел рабочей памяти");
+        let summary_at = system
+            .find(crate::summary::SUMMARY_MARKER)
+            .expect("раздел пересказа");
+        assert!(
+            profile_at < long_term_at,
+            "профиль должен идти раньше долговременной памяти"
+        );
         assert!(long_term_at < working_at);
         assert!(working_at < summary_at);
         assert_eq!(assembled.context.profile_id.as_deref(), Some("teacher"));
@@ -425,7 +680,9 @@ mod tests {
         ])
         .await;
         let settings = ChatSettings::default();
-        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings)
+            .await
+            .expect("чат");
         let assembled = assemble(
             &state,
             &chat,
@@ -450,8 +707,13 @@ mod tests {
             ("AGENTD_DEFAULT_PROFILE", "teacher"),
         ])
         .await;
-        let settings = ChatSettings { profile_id: Some("reviewer".to_string()), ..ChatSettings::default() };
-        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
+        let settings = ChatSettings {
+            profile_id: Some("reviewer".to_string()),
+            ..ChatSettings::default()
+        };
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings)
+            .await
+            .expect("чат");
         let assembled = assemble(
             &state,
             &chat,
@@ -475,7 +737,9 @@ mod tests {
             memory_layers_enabled: Some(true),
             ..ChatSettings::default()
         };
-        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings)
+            .await
+            .expect("чат");
         let assembled = assemble(
             &state,
             &chat,
@@ -501,8 +765,13 @@ mod tests {
         for strategy in ContextStrategy::ALL {
             let _guard = crate::state::test_lock();
             let state = AppState::for_tests().await;
-            let without_profile = ChatSettings { context_strategy: Some(strategy), ..ChatSettings::default() };
-            let chat_a = store::create_chat(&state.db, "owner-1", "Чат", &without_profile).await.expect("чат");
+            let without_profile = ChatSettings {
+                context_strategy: Some(strategy),
+                ..ChatSettings::default()
+            };
+            let chat_a = store::create_chat(&state.db, "owner-1", "Чат", &without_profile)
+                .await
+                .expect("чат");
             let baseline = assemble(
                 &state,
                 &chat_a,
@@ -519,7 +788,9 @@ mod tests {
                 profile_id: Some("teacher".to_string()),
                 ..ChatSettings::default()
             };
-            let chat_b = store::create_chat(&state.db, "owner-1", "Чат", &with_profile).await.expect("чат");
+            let chat_b = store::create_chat(&state.db, "owner-1", "Чат", &with_profile)
+                .await
+                .expect("чат");
             let with_profile_assembled = assemble(
                 &state,
                 &chat_b,
@@ -532,7 +803,9 @@ mod tests {
             .await;
 
             assert!(
-                with_profile_assembled.history[0].content.contains("Профиль:"),
+                with_profile_assembled.history[0]
+                    .content
+                    .contains("Профиль:"),
                 "стратегия {strategy:?}: раздел профиля должен присутствовать"
             );
             let mut baseline_context = baseline.context.clone();
@@ -558,13 +831,32 @@ mod tests {
             profile_id: Some("teacher".to_string()),
             ..ChatSettings::default()
         };
-        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
-        store::set_long_term_memory(&state.db, "owner-1", "decision", Some("auth"), "Clerk", "manual", None, 1)
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings)
             .await
-            .expect("долговременная запись");
-        store::set_working_memory(&state.db, &chat.id, &chat.active_task_id, "target", "iOS 17+", "manual", 1)
-            .await
-            .expect("рабочая запись");
+            .expect("чат");
+        store::set_long_term_memory(
+            &state.db,
+            "owner-1",
+            "decision",
+            Some("auth"),
+            "Clerk",
+            "manual",
+            None,
+            1,
+        )
+        .await
+        .expect("долговременная запись");
+        store::set_working_memory(
+            &state.db,
+            &chat.id,
+            &chat.active_task_id,
+            "target",
+            "iOS 17+",
+            "manual",
+            1,
+        )
+        .await
+        .expect("рабочая запись");
 
         let assembled = assemble(
             &state,
@@ -587,24 +879,58 @@ mod tests {
         for strategy in ContextStrategy::ALL {
             let _guard = crate::state::test_lock();
             let state = AppState::for_tests().await;
-            let settings = ChatSettings { context_strategy: Some(strategy), ..ChatSettings::default() };
-            let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings).await.expect("чат");
-            store::set_long_term_memory(&state.db, "owner-1", "decision", Some("auth"), "Clerk", "manual", None, 1)
+            let settings = ChatSettings {
+                context_strategy: Some(strategy),
+                ..ChatSettings::default()
+            };
+            let chat = store::create_chat(&state.db, "owner-1", "Чат", &settings)
                 .await
-                .expect("долговременная запись");
-            store::set_working_memory(&state.db, &chat.id, &chat.active_task_id, "target", "iOS 17+", "manual", 1)
-                .await
-                .expect("рабочая запись");
+                .expect("чат");
+            store::set_long_term_memory(
+                &state.db,
+                "owner-1",
+                "decision",
+                Some("auth"),
+                "Clerk",
+                "manual",
+                None,
+                1,
+            )
+            .await
+            .expect("долговременная запись");
+            store::set_working_memory(
+                &state.db,
+                &chat.id,
+                &chat.active_task_id,
+                "target",
+                "iOS 17+",
+                "manual",
+                1,
+            )
+            .await
+            .expect("рабочая запись");
 
-            let assembled =
-                assemble(&state, &chat, &settings, "owner-1", strategy, Vec::new(), vec![Message::user("новое")]).await;
+            let assembled = assemble(
+                &state,
+                &chat,
+                &settings,
+                "owner-1",
+                strategy,
+                Vec::new(),
+                vec![Message::user("новое")],
+            )
+            .await;
 
             let system = &assembled.history[0].content;
             assert!(
-                !system.contains("Долговременная память:") && !system.contains("Рабочая память задачи:"),
+                !system.contains("Долговременная память:")
+                    && !system.contains("Рабочая память задачи:"),
                 "стратегия {strategy:?}: разделы памяти не должны появляться при выключенной слоистой памяти"
             );
-            assert!(assembled.context.memory_long_term_entries.is_none(), "стратегия {strategy:?}");
+            assert!(
+                assembled.context.memory_long_term_entries.is_none(),
+                "стратегия {strategy:?}"
+            );
         }
     }
 }

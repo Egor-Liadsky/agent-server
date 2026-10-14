@@ -99,8 +99,17 @@ impl Layer {
 
 #[derive(Debug, PartialEq)]
 enum ValidatedOp {
-    Set { layer: Layer, key: String, value: String, entry_type: Option<String>, carry_forward: bool },
-    Delete { layer: Layer, key: String },
+    Set {
+        layer: Layer,
+        key: String,
+        value: String,
+        entry_type: Option<String>,
+        carry_forward: bool,
+    },
+    Delete {
+        layer: Layer,
+        key: String,
+    },
     FinishTask,
 }
 
@@ -138,14 +147,29 @@ impl RejectReason {
 /// разовая (в отличие от секрета, случайно попавшего в текст ответа, — тот
 /// хотя бы не переживает чат).
 const SECRET_LIKE_MARKERS: &[&str] = &[
-    "пароль", "password", "passwd", "токен", "token", "секрет", "secret", "api_key", "apikey",
-    "api key", "приватный ключ", "private key", "ключ доступа", "access key", "credential",
+    "пароль",
+    "password",
+    "passwd",
+    "токен",
+    "token",
+    "секрет",
+    "secret",
+    "api_key",
+    "apikey",
+    "api key",
+    "приватный ключ",
+    "private key",
+    "ключ доступа",
+    "access key",
+    "credential",
 ];
 
 fn looks_like_secret(key: &str, value: &str) -> bool {
     let key_lower = key.to_lowercase();
     let value_lower = value.to_lowercase();
-    SECRET_LIKE_MARKERS.iter().any(|marker| key_lower.contains(marker) || value_lower.contains(marker))
+    SECRET_LIKE_MARKERS
+        .iter()
+        .any(|marker| key_lower.contains(marker) || value_lower.contains(marker))
 }
 
 struct Limits {
@@ -187,7 +211,14 @@ fn validate(op: RawMemoryOp, limits: &Limits) -> Result<ValidatedOp, RejectReaso
             }
             Ok(ValidatedOp::Delete { layer, key })
         }
-        RawMemoryOp::Set { layer, key, value, entry_type, carry_forward, .. } => {
+        RawMemoryOp::Set {
+            layer,
+            key,
+            value,
+            entry_type,
+            carry_forward,
+            ..
+        } => {
             let layer = Layer::parse(&layer).ok_or(RejectReason::UnknownLayer)?;
             let key = key.unwrap_or_default();
             if key.trim().is_empty() {
@@ -195,7 +226,10 @@ fn validate(op: RawMemoryOp, limits: &Limits) -> Result<ValidatedOp, RejectReaso
             }
             let (key_max, value_max) = match layer {
                 Layer::Working => (limits.working_key_max_chars, limits.working_value_max_chars),
-                Layer::LongTerm => (limits.long_term_key_max_chars, limits.long_term_value_max_chars),
+                Layer::LongTerm => (
+                    limits.long_term_key_max_chars,
+                    limits.long_term_value_max_chars,
+                ),
             };
             if key.chars().count() > key_max {
                 return Err(RejectReason::KeyTooLong);
@@ -213,25 +247,46 @@ fn validate(op: RawMemoryOp, limits: &Limits) -> Result<ValidatedOp, RejectReaso
                     return Err(RejectReason::UnknownEntryType);
                 }
             }
-            Ok(ValidatedOp::Set { layer, key, value, entry_type, carry_forward })
+            Ok(ValidatedOp::Set {
+                layer,
+                key,
+                value,
+                entry_type,
+                carry_forward,
+            })
         }
     }
 }
 
-fn router_prompt(long_term: &[store::LongTermMemoryEntry], working: &[store::WorkingMemoryEntry], user_message: &str) -> String {
+fn router_prompt(
+    long_term: &[store::LongTermMemoryEntry],
+    working: &[store::WorkingMemoryEntry],
+    user_message: &str,
+) -> String {
     let long_term_text = if long_term.is_empty() {
         "(пока пусто)".to_string()
     } else {
         long_term
             .iter()
-            .map(|e| format!("- [{}] {}: {}", e.entry_type, e.key.as_deref().unwrap_or("(без ключа)"), e.value))
+            .map(|e| {
+                format!(
+                    "- [{}] {}: {}",
+                    e.entry_type,
+                    e.key.as_deref().unwrap_or("(без ключа)"),
+                    e.value
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
     let working_text = if working.is_empty() {
         "(пока пусто)".to_string()
     } else {
-        working.iter().map(|e| format!("- {}: {}", e.key, e.value)).collect::<Vec<_>>().join("\n")
+        working
+            .iter()
+            .map(|e| format!("- {}: {}", e.key, e.value))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     format!(
         "Текущая долговременная память (профиль, решения, знания):\n{long_term_text}\n\n\
@@ -279,10 +334,16 @@ pub async fn route_after_exchange(
     user_message: &str,
 ) -> RouteOutcome {
     let limits = Limits::from_config(&state.config);
-    let long_term = store::load_long_term_memory(&state.db, owner, effective_long_term_max_entries(state, settings))
+    let long_term = store::load_long_term_memory(
+        &state.db,
+        owner,
+        effective_long_term_max_entries(state, settings),
+    )
+    .await
+    .unwrap_or_default();
+    let working = store::load_working_memory(&state.db, &chat.id, &chat.active_task_id)
         .await
         .unwrap_or_default();
-    let working = store::load_working_memory(&state.db, &chat.id, &chat.active_task_id).await.unwrap_or_default();
 
     let prompt = router_prompt(&long_term, &working, user_message);
     let mut router_settings = settings.clone();
@@ -293,7 +354,11 @@ pub async fn route_after_exchange(
     router_settings.thinking = ThinkingMode::Disabled;
     router_settings.custom_response_mode = false;
 
-    let reply = match state.agent.ask(&[Message::user(prompt)], &router_settings).await {
+    let reply = match state
+        .agent
+        .ask(&[Message::user(prompt)], &router_settings)
+        .await
+    {
         Ok(reply) => reply,
         Err(err) => {
             tracing::warn!(chat_id = %chat.id, error = %err, "не удалось запросить операции маршрутизатора памяти: вызов модели не удался");
@@ -344,7 +409,13 @@ pub async fn route_after_exchange(
                     tracing::warn!(chat_id = %chat.id, error = %err, "не удалось выполнить finish_task маршрутизатора памяти");
                 }
             }
-            Ok(ValidatedOp::Set { layer, key, value, entry_type, carry_forward }) => {
+            Ok(ValidatedOp::Set {
+                layer,
+                key,
+                value,
+                entry_type,
+                carry_forward,
+            }) => {
                 log_applied(state, chat, layer, "set", &key, &value, reason_logged);
                 if layer == Layer::Working && carry_forward {
                     carry_forward_keys.push(key.clone());
@@ -355,32 +426,64 @@ pub async fn route_after_exchange(
                 };
                 let applied = match layer {
                     Layer::Working => {
-                        store::set_working_memory(&state.db, &chat.id, &chat.active_task_id, &key, &value, "router", now).await
+                        store::set_working_memory(
+                            &state.db,
+                            &chat.id,
+                            &chat.active_task_id,
+                            &key,
+                            &value,
+                            "router",
+                            now,
+                        )
+                        .await
                     }
                     Layer::LongTerm => {
                         let entry_type = entry_type.as_deref().unwrap_or("knowledge");
-                        store::set_long_term_memory(&state.db, owner, entry_type, Some(&key), &value, "router", Some(&chat.id), now)
-                            .await
-                            .map(|(_, applied)| applied)
+                        store::set_long_term_memory(
+                            &state.db,
+                            owner,
+                            entry_type,
+                            Some(&key),
+                            &value,
+                            "router",
+                            Some(&chat.id),
+                            now,
+                        )
+                        .await
+                        .map(|(_, applied)| applied)
                     }
                 };
                 match applied {
                     Ok(true) if existed => outcome.applied_update += 1,
                     Ok(true) => outcome.applied_set += 1,
                     Ok(false) => {}
-                    Err(err) => tracing::warn!(chat_id = %chat.id, error = %err, "не удалось применить операцию set маршрутизатора памяти"),
+                    Err(err) => {
+                        tracing::warn!(chat_id = %chat.id, error = %err, "не удалось применить операцию set маршрутизатора памяти")
+                    }
                 }
             }
             Ok(ValidatedOp::Delete { layer, key }) => {
                 log_applied(state, chat, layer, "delete", &key, "", reason_logged);
                 let result = match layer {
-                    Layer::Working => store::delete_working_memory(&state.db, &chat.id, &chat.active_task_id, &key).await,
-                    Layer::LongTerm => store::delete_long_term_memory_by_key(&state.db, owner, &key).await,
+                    Layer::Working => {
+                        store::delete_working_memory(
+                            &state.db,
+                            &chat.id,
+                            &chat.active_task_id,
+                            &key,
+                        )
+                        .await
+                    }
+                    Layer::LongTerm => {
+                        store::delete_long_term_memory_by_key(&state.db, owner, &key).await
+                    }
                 };
                 match result {
                     Ok(()) => outcome.applied_delete += 1,
                     Err(store::StoreError::NotFound) => {}
-                    Err(err) => tracing::warn!(chat_id = %chat.id, error = %err, "не удалось применить операцию delete маршрутизатора памяти"),
+                    Err(err) => {
+                        tracing::warn!(chat_id = %chat.id, error = %err, "не удалось применить операцию delete маршрутизатора памяти")
+                    }
                 }
             }
         }
@@ -391,7 +494,15 @@ pub async fn route_after_exchange(
 /// Значение (`value`) в журнале — только при `AGENTD_LOG_CONTENT=true`, тем
 /// же приёмом, что и остальное содержимое (specs/memory-layers, «Тексты
 /// записей памяти маскируются в журнале»).
-fn log_applied(state: &AppState, chat: &store::Chat, layer: Layer, op: &str, key: &str, value: &str, reason: Option<&str>) {
+fn log_applied(
+    state: &AppState,
+    chat: &store::Chat,
+    layer: Layer,
+    op: &str,
+    key: &str,
+    value: &str,
+    reason: Option<&str>,
+) {
     let layer_str = match layer {
         Layer::Working => "working",
         Layer::LongTerm => "long_term",
@@ -406,7 +517,11 @@ fn log_applied(state: &AppState, chat: &store::Chat, layer: Layer, op: &str, key
 /// Пояснение модели — такое же содержимое, как значение записи, поэтому в
 /// журнал попадает только при `AGENTD_LOG_CONTENT=true`.
 fn loggable_reason<'a>(state: &AppState, reason: Option<&'a str>) -> Option<&'a str> {
-    if state.config.log_content { reason } else { None }
+    if state.config.log_content {
+        reason
+    } else {
+        None
+    }
 }
 
 // --- Слоистая память как обёртка над стратегией контекста (design.md, решение 1) ---
@@ -417,7 +532,14 @@ fn long_term_section(entries: &[store::LongTermMemoryEntry]) -> Option<String> {
     }
     let lines: Vec<String> = entries
         .iter()
-        .map(|e| format!("- [{}] {}: {}", e.entry_type, e.key.as_deref().unwrap_or("(без ключа)"), e.value))
+        .map(|e| {
+            format!(
+                "- [{}] {}: {}",
+                e.entry_type,
+                e.key.as_deref().unwrap_or("(без ключа)"),
+                e.value
+            )
+        })
         .collect();
     Some(format!("{LONG_TERM_SECTION_HEADING}\n{}", lines.join("\n")))
 }
@@ -426,7 +548,10 @@ fn working_section(entries: &[store::WorkingMemoryEntry]) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
-    let lines: Vec<String> = entries.iter().map(|e| format!("- {}: {}", e.key, e.value)).collect();
+    let lines: Vec<String> = entries
+        .iter()
+        .map(|e| format!("- {}: {}", e.key, e.value))
+        .collect();
     Some(format!("{WORKING_SECTION_HEADING}\n{}", lines.join("\n")))
 }
 
@@ -448,11 +573,22 @@ pub struct MemoryLayers {
 /// Читает долговременную и рабочую память с операторскими/чатовыми лимитами
 /// и строит их разделы в порядке `[long_term, working]`, пропуская пустые
 /// (specs/memory-layers, «Порядок разделов памяти при обеих непустых»).
-pub async fn layers(state: &AppState, chat: &store::Chat, settings: &ChatSettings, owner: &str) -> MemoryLayers {
-    let long_term = store::load_long_term_memory(&state.db, owner, effective_long_term_max_entries(state, settings))
+pub async fn layers(
+    state: &AppState,
+    chat: &store::Chat,
+    settings: &ChatSettings,
+    owner: &str,
+) -> MemoryLayers {
+    let long_term = store::load_long_term_memory(
+        &state.db,
+        owner,
+        effective_long_term_max_entries(state, settings),
+    )
+    .await
+    .unwrap_or_default();
+    let working = store::load_working_memory(&state.db, &chat.id, &chat.active_task_id)
         .await
         .unwrap_or_default();
-    let working = store::load_working_memory(&state.db, &chat.id, &chat.active_task_id).await.unwrap_or_default();
     let working: Vec<_> = working
         .into_iter()
         .take(effective_working_max_entries(state, settings) as usize)
@@ -471,7 +607,13 @@ pub async fn layers(state: &AppState, chat: &store::Chat, settings: &ChatSetting
         sections.push(section);
     }
 
-    MemoryLayers { sections, long_term_entries, long_term_chars, working_entries, working_chars }
+    MemoryLayers {
+        sections,
+        long_term_entries,
+        long_term_chars,
+        working_entries,
+        working_chars,
+    }
 }
 
 /// Заполняет поля памяти уже собранного `ContextDto` действующей стратегии,
@@ -504,19 +646,27 @@ pub fn merge_router_counters(context: &mut ContextDto, router: RouteOutcome) {
 /// операторского умолчания (specs/memory-layers, «Операторские умолчания и
 /// лимиты слоистой памяти»).
 pub fn effective_layers_enabled(state: &AppState, settings: &ChatSettings) -> bool {
-    settings.memory_layers_enabled.unwrap_or(state.config.memory_layers_enabled)
+    settings
+        .memory_layers_enabled
+        .unwrap_or(state.config.memory_layers_enabled)
 }
 
 pub fn effective_router_enabled(state: &AppState, settings: &ChatSettings) -> bool {
-    settings.memory_router_enabled.unwrap_or(state.config.memory_router_enabled)
+    settings
+        .memory_router_enabled
+        .unwrap_or(state.config.memory_router_enabled)
 }
 
 pub fn effective_working_max_entries(state: &AppState, settings: &ChatSettings) -> u32 {
-    settings.memory_working_max_entries.unwrap_or(state.config.memory_working_max_entries)
+    settings
+        .memory_working_max_entries
+        .unwrap_or(state.config.memory_working_max_entries)
 }
 
 pub fn effective_long_term_max_entries(state: &AppState, settings: &ChatSettings) -> u32 {
-    settings.memory_long_term_max_entries.unwrap_or(state.config.memory_long_term_max_entries)
+    settings
+        .memory_long_term_max_entries
+        .unwrap_or(state.config.memory_long_term_max_entries)
 }
 
 #[cfg(test)]
@@ -533,7 +683,12 @@ mod tests {
     }
 
     fn working_entry(key: &str, value: &str) -> store::WorkingMemoryEntry {
-        store::WorkingMemoryEntry { key: key.to_string(), value: value.to_string(), source: "manual".to_string(), updated_at: 0 }
+        store::WorkingMemoryEntry {
+            key: key.to_string(),
+            value: value.to_string(),
+            source: "manual".to_string(),
+            updated_at: 0,
+        }
     }
 
     fn long_term_entry(entry_type: &str, key: &str, value: &str) -> store::LongTermMemoryEntry {
@@ -561,7 +716,9 @@ mod tests {
         ]"#;
         let ops = parse_operations(content).expect("операции разобраны");
         assert_eq!(ops.len(), 4);
-        assert!(matches!(&ops[0], RawMemoryOp::Set { layer, key: Some(k), .. } if layer == "working" && k == "target"));
+        assert!(
+            matches!(&ops[0], RawMemoryOp::Set { layer, key: Some(k), .. } if layer == "working" && k == "target")
+        );
         assert!(matches!(&ops[3], RawMemoryOp::FinishTask { .. }));
     }
 
@@ -579,7 +736,10 @@ mod tests {
     #[test]
     fn router_prompt_states_layer_choice_rule() {
         let prompt = router_prompt(&[], &[], "тест");
-        assert!(prompt.contains("Правило выбора слоя"), "промпт должен объяснять критерий working/long_term: {prompt}");
+        assert!(
+            prompt.contains("Правило выбора слоя"),
+            "промпт должен объяснять критерий working/long_term: {prompt}"
+        );
         assert!(prompt.contains("При сомнении выбирай working"));
     }
 
@@ -666,7 +826,10 @@ mod tests {
     #[test]
     fn router_prompt_forbids_storing_secrets() {
         let prompt = router_prompt(&[], &[], "тест");
-        assert!(prompt.contains("Пароли, токены, API-ключи"), "промпт должен явно запрещать сохранять секреты: {prompt}");
+        assert!(
+            prompt.contains("Пароли, токены, API-ключи"),
+            "промпт должен явно запрещать сохранять секреты: {prompt}"
+        );
     }
 
     #[test]
@@ -693,13 +856,22 @@ mod tests {
             reason: None,
         };
         let validated = validate(op, &limits()).expect("валидная операция");
-        assert!(matches!(validated, ValidatedOp::Set { carry_forward: true, .. }));
+        assert!(matches!(
+            validated,
+            ValidatedOp::Set {
+                carry_forward: true,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn finish_task_is_always_valid() {
         let op = RawMemoryOp::FinishTask { reason: None };
-        assert!(matches!(validate(op, &limits()), Ok(ValidatedOp::FinishTask)));
+        assert!(matches!(
+            validate(op, &limits()),
+            Ok(ValidatedOp::FinishTask)
+        ));
     }
 
     // --- 4.1/4.3 Сборка разделов ---
@@ -716,7 +888,8 @@ mod tests {
 
     #[test]
     fn long_term_section_lists_entries_with_type() {
-        let section = long_term_section(&[long_term_entry("decision", "auth", "Clerk")]).expect("раздел");
+        let section =
+            long_term_section(&[long_term_entry("decision", "auth", "Clerk")]).expect("раздел");
         assert!(section.contains(LONG_TERM_SECTION_HEADING));
         assert!(section.contains("decision"));
         assert!(section.contains("auth: Clerk"));
@@ -734,13 +907,32 @@ mod tests {
     #[tokio::test]
     async fn layers_orders_long_term_section_before_working_section() {
         let state = AppState::for_tests().await;
-        let chat = store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
-        store::set_long_term_memory(&state.db, "owner-1", "decision", Some("auth"), "Clerk", "manual", None, 1)
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default())
             .await
-            .expect("долговременная запись");
-        store::set_working_memory(&state.db, &chat.id, &chat.active_task_id, "target", "iOS 17+", "manual", 1)
-            .await
-            .expect("рабочая запись");
+            .expect("чат");
+        store::set_long_term_memory(
+            &state.db,
+            "owner-1",
+            "decision",
+            Some("auth"),
+            "Clerk",
+            "manual",
+            None,
+            1,
+        )
+        .await
+        .expect("долговременная запись");
+        store::set_working_memory(
+            &state.db,
+            &chat.id,
+            &chat.active_task_id,
+            "target",
+            "iOS 17+",
+            "manual",
+            1,
+        )
+        .await
+        .expect("рабочая запись");
 
         let memory = layers(&state, &chat, &chat.settings, "owner-1").await;
         assert_eq!(memory.sections.len(), 2);
@@ -752,12 +944,24 @@ mod tests {
 
     #[test]
     fn merge_into_context_counts_short_term_from_passed_history_not_a_separate_setting() {
-        let memory = MemoryLayers { sections: Vec::new(), long_term_entries: 0, long_term_chars: 0, working_entries: 0, working_chars: 0 };
-        let history = vec![Message::user("вопрос"), Message::assistant("ответ подлиннее")];
+        let memory = MemoryLayers {
+            sections: Vec::new(),
+            long_term_entries: 0,
+            long_term_chars: 0,
+            working_entries: 0,
+            working_chars: 0,
+        };
+        let history = vec![
+            Message::user("вопрос"),
+            Message::assistant("ответ подлиннее"),
+        ];
         let mut context = ContextDto::for_window(0, 0);
         merge_into_context(&mut context, &memory, &history);
         assert_eq!(context.memory_short_term_messages, Some(2));
-        let expected_chars: u32 = history.iter().map(|m| m.content.chars().count() as u32).sum();
+        let expected_chars: u32 = history
+            .iter()
+            .map(|m| m.content.chars().count() as u32)
+            .sum();
         assert_eq!(context.memory_short_term_chars, Some(expected_chars));
     }
 
@@ -765,11 +969,22 @@ mod tests {
 
     #[test]
     fn merge_into_context_counters_reflect_actual_assembly() {
-        let memory = MemoryLayers { sections: Vec::new(), long_term_entries: 2, long_term_chars: 40, working_entries: 1, working_chars: 10 };
+        let memory = MemoryLayers {
+            sections: Vec::new(),
+            long_term_entries: 2,
+            long_term_chars: 40,
+            working_entries: 1,
+            working_chars: 10,
+        };
         let history = vec![Message::user("а"), Message::user("б"), Message::user("в")];
         let mut context = ContextDto::for_window(0, 0);
         merge_into_context(&mut context, &memory, &history);
-        let router = RouteOutcome { applied_set: 1, applied_update: 0, applied_delete: 0, rejected: 1 };
+        let router = RouteOutcome {
+            applied_set: 1,
+            applied_update: 0,
+            applied_delete: 0,
+            rejected: 1,
+        };
         merge_router_counters(&mut context, router);
         assert_eq!(context.memory_long_term_entries, Some(2));
         assert_eq!(context.memory_working_entries, Some(1));
@@ -783,8 +998,14 @@ mod tests {
     #[tokio::test]
     async fn chat_setting_overrides_operator_default_layers_enabled() {
         let state = AppState::for_tests().await;
-        assert_eq!(effective_layers_enabled(&state, &ChatSettings::default()), state.config.memory_layers_enabled);
-        let settings = ChatSettings { memory_layers_enabled: Some(true), ..ChatSettings::default() };
+        assert_eq!(
+            effective_layers_enabled(&state, &ChatSettings::default()),
+            state.config.memory_layers_enabled
+        );
+        let settings = ChatSettings {
+            memory_layers_enabled: Some(true),
+            ..ChatSettings::default()
+        };
         assert!(effective_layers_enabled(&state, &settings));
     }
 
@@ -792,7 +1013,10 @@ mod tests {
 
     fn captured(f: impl FnOnce()) -> String {
         let capture = crate::telemetry::capture::Capture::default();
-        let subscriber = tracing_subscriber::fmt().json().with_writer(capture.clone()).finish();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
         tracing::subscriber::with_default(subscriber, f);
         capture.text()
     }
@@ -801,28 +1025,63 @@ mod tests {
     async fn applied_operation_value_is_absent_from_log_by_default() {
         let mut state = AppState::for_tests().await;
         std::sync::Arc::make_mut(&mut state.config).log_content = false;
-        let chat = store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default())
+            .await
+            .expect("чат");
 
         let output = captured(|| {
             let reason = loggable_reason(&state, Some("секретное пояснение"));
-            log_applied(&state, &chat, Layer::Working, "set", "budget", "секретное значение 200000", reason);
+            log_applied(
+                &state,
+                &chat,
+                Layer::Working,
+                "set",
+                "budget",
+                "секретное значение 200000",
+                reason,
+            );
         });
-        assert!(output.contains("\"key\":\"budget\""), "ключ должен остаться в журнале: {output}");
-        assert!(!output.contains("секретное значение"), "значение не должно попасть в журнал: {output}");
-        assert!(!output.contains("секретное пояснение"), "пояснение не должно попасть в журнал: {output}");
+        assert!(
+            output.contains("\"key\":\"budget\""),
+            "ключ должен остаться в журнале: {output}"
+        );
+        assert!(
+            !output.contains("секретное значение"),
+            "значение не должно попасть в журнал: {output}"
+        );
+        assert!(
+            !output.contains("секретное пояснение"),
+            "пояснение не должно попасть в журнал: {output}"
+        );
     }
 
     #[tokio::test]
     async fn applied_operation_value_is_logged_when_enabled() {
         let mut state = AppState::for_tests().await;
         std::sync::Arc::make_mut(&mut state.config).log_content = true;
-        let chat = store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default()).await.expect("чат");
+        let chat = store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default())
+            .await
+            .expect("чат");
 
         let output = captured(|| {
             let reason = loggable_reason(&state, Some("видимое пояснение"));
-            log_applied(&state, &chat, Layer::Working, "set", "budget", "видимое значение", reason);
+            log_applied(
+                &state,
+                &chat,
+                Layer::Working,
+                "set",
+                "budget",
+                "видимое значение",
+                reason,
+            );
         });
-        assert!(output.contains("видимое значение"), "значение должно попасть в журнал при AGENTD_LOG_CONTENT=true: {output}");
-        assert!(output.contains("видимое пояснение"), "пояснение должно попасть в журнал при AGENTD_LOG_CONTENT=true: {output}");
+        assert!(
+            output.contains("видимое значение"),
+            "значение должно попасть в журнал при AGENTD_LOG_CONTENT=true: {output}"
+        );
+        assert!(
+            output.contains("видимое пояснение"),
+            "пояснение должно попасть в журнал при AGENTD_LOG_CONTENT=true: {output}"
+        );
     }
 }

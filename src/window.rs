@@ -21,7 +21,11 @@ pub struct WindowOutcome {
 /// пользователя, с границей, сдвинутой к сообщению пользователя
 /// (specs/context-sliding-window, «Окно начинается с сообщения
 /// пользователя»).
-pub fn assemble(stored: Vec<ChatMessage>, window_size: u32, new_messages: Vec<Message>) -> WindowOutcome {
+pub fn assemble(
+    stored: Vec<ChatMessage>,
+    window_size: u32,
+    new_messages: Vec<Message>,
+) -> WindowOutcome {
     let boundary = crate::summary::tail_boundary(&stored, window_size);
     let dropped_messages = boundary as u32;
     let tail = &stored[boundary..];
@@ -57,6 +61,7 @@ mod tests {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_name: None,
+            context_generation: 0,
         }
     }
 
@@ -64,7 +69,10 @@ mod tests {
 
     #[test]
     fn history_shorter_than_window_is_sent_whole() {
-        let stored = vec![message(Role::User, 1, "привет"), message(Role::Assistant, 2, "привет!")];
+        let stored = vec![
+            message(Role::User, 1, "привет"),
+            message(Role::Assistant, 2, "привет!"),
+        ];
         let outcome = assemble(stored, 6, vec![Message::user("как дела?")]);
         assert_eq!(outcome.sent_messages, 2);
         assert_eq!(outcome.dropped_messages, 0);
@@ -110,7 +118,10 @@ mod tests {
 
     #[test]
     fn window_exactly_matches_history_length() {
-        let stored = vec![message(Role::User, 1, "привет"), message(Role::Assistant, 2, "привет!")];
+        let stored = vec![
+            message(Role::User, 1, "привет"),
+            message(Role::Assistant, 2, "привет!"),
+        ];
         let outcome = assemble(stored, 2, vec![Message::user("ещё")]);
         assert_eq!(outcome.dropped_messages, 0);
         assert_eq!(outcome.sent_messages, 2);

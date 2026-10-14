@@ -39,7 +39,10 @@ fn facts_section(facts: &[store::Fact]) -> Option<String> {
     if facts.is_empty() {
         return None;
     }
-    let lines: Vec<String> = facts.iter().map(|f| format!("- {}: {}", f.key, f.value)).collect();
+    let lines: Vec<String> = facts
+        .iter()
+        .map(|f| format!("- {}: {}", f.key, f.value))
+        .collect();
     Some(format!("{FACTS_SECTION_HEADING}\n{}", lines.join("\n")))
 }
 
@@ -86,7 +89,12 @@ pub async fn assemble(
 /// а сборка истории происходит раньше. Вызывающий код (`app.rs`)
 /// подставляет фактический результат в `ContextDto.facts_updated` отдельно.
 pub fn context_dto(outcome: &FactsOutcome) -> ContextDto {
-    ContextDto::for_facts(outcome.sent_messages, outcome.dropped_messages, outcome.facts_applied, false)
+    ContextDto::for_facts(
+        outcome.sent_messages,
+        outcome.dropped_messages,
+        outcome.facts_applied,
+        false,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,7 +111,11 @@ fn update_prompt(existing: &[store::Fact], user_message: &str) -> String {
     let facts_text = if existing.is_empty() {
         "(факты пока не заданы)".to_string()
     } else {
-        existing.iter().map(|f| format!("- {}: {}", f.key, f.value)).collect::<Vec<_>>().join("\n")
+        existing
+            .iter()
+            .map(|f| format!("- {}: {}", f.key, f.value))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     format!(
         "Текущие факты диалога:\n{facts_text}\n\n\
@@ -142,6 +154,7 @@ pub async fn update_after_exchange(
     settings: &ChatSettings,
     user_message: &str,
     through_seq: i64,
+    context_generation: i64,
 ) -> bool {
     let existing = match store::load_facts(&state.db, chat_id).await {
         Ok(facts) => facts,
@@ -160,7 +173,11 @@ pub async fn update_after_exchange(
     facts_settings.thinking = ThinkingMode::Disabled;
     facts_settings.custom_response_mode = false;
 
-    let reply = match state.agent.ask(&[Message::user(prompt)], &facts_settings).await {
+    let reply = match state
+        .agent
+        .ask(&[Message::user(prompt)], &facts_settings)
+        .await
+    {
         Ok(reply) => reply,
         Err(err) => {
             tracing::warn!(chat_id, error = %err, "не удалось обновить факты чата: вызов модели не удался");
@@ -169,7 +186,10 @@ pub async fn update_after_exchange(
     };
 
     let Some(operations) = parse_operations(&reply.content) else {
-        tracing::warn!(chat_id, "не удалось обновить факты чата: ответ модели не разобран как список операций");
+        tracing::warn!(
+            chat_id,
+            "не удалось обновить факты чата: ответ модели не разобран как список операций"
+        );
         return false;
     };
     if operations.is_empty() {
@@ -198,7 +218,16 @@ pub async fn update_after_exchange(
     let mut updated = false;
     for key in &truncated_keys {
         let value = &by_key[key];
-        if let Err(err) = store::set_fact(&state.db, chat_id, key, value, through_seq).await {
+        if let Err(err) = store::set_fact_for_generation(
+            &state.db,
+            chat_id,
+            key,
+            value,
+            through_seq,
+            context_generation,
+        )
+        .await
+        {
             tracing::warn!(chat_id, key, error = %err, "не удалось сохранить факт");
             continue;
         }
@@ -239,6 +268,7 @@ mod tests {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_name: None,
+            context_generation: 0,
         }
     }
 
@@ -249,7 +279,9 @@ mod tests {
         let content = r#"вот ответ: [{"op":"set","key":"budget","value":"200000"},{"op":"delete","key":"old"}]"#;
         let ops = parse_operations(content).expect("операции разобраны");
         assert_eq!(ops.len(), 2);
-        assert!(matches!(&ops[0], FactOp::Set { key, value } if key == "budget" && value == "200000"));
+        assert!(
+            matches!(&ops[0], FactOp::Set { key, value } if key == "budget" && value == "200000")
+        );
         assert!(matches!(&ops[1], FactOp::Delete { key } if key == "old"));
     }
 
@@ -287,7 +319,8 @@ mod tests {
 
     #[test]
     fn facts_section_lists_each_fact() {
-        let section = facts_section(&[fact("budget", "200000"), fact("deadline", "март")]).expect("раздел фактов");
+        let section = facts_section(&[fact("budget", "200000"), fact("deadline", "март")])
+            .expect("раздел фактов");
         assert!(section.contains(FACTS_SECTION_HEADING));
         assert!(section.contains("budget: 200000"));
         assert!(section.contains("deadline: март"));

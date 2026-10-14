@@ -2,8 +2,8 @@
 
 use crate::config::{AgentdConfig, LogFormat, LogTarget};
 use agentcore::logging::{ExchangeKind, ExchangeSink};
-use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 /// Цели записей отладки: по ним фильтр `RUST_LOG` включает или гасит
 /// отдельно обмен с клиентом и обмен с провайдером.
@@ -82,7 +82,9 @@ pub fn init(config: &AgentdConfig) {
         LogTarget::Stdout => BoxMakeWriter::new(std::io::stdout),
         LogTarget::Stderr => BoxMakeWriter::new(std::io::stderr),
     };
-    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_writer(writer);
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer);
     match (config.log_format, config.debug) {
         (LogFormat::Json, _) => builder.json().init(),
         // В отладке компактная раскладка не годится: она повторяет поля
@@ -158,7 +160,11 @@ fn print_banner(config: &AgentdConfig) {
         paint(BOLD, "agentd"),
         paint(DIM, concat!("v", env!("CARGO_PKG_VERSION")))
     );
-    eprintln!("  {} {}", paint(DIM, "адрес:"), paint(CYAN, &config.listen_addr.to_string()));
+    eprintln!(
+        "  {} {}",
+        paint(DIM, "адрес:"),
+        paint(CYAN, &config.listen_addr.to_string())
+    );
     eprintln!("  {} {}", paint(DIM, "модель:"), paint(CYAN, &config.model));
     eprintln!("  {} {auth}", paint(DIM, "аутентификация:"));
     eprintln!(

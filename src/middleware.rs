@@ -3,7 +3,7 @@
 
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::telemetry::{pretty, API_TARGET};
+use crate::telemetry::{API_TARGET, pretty};
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -66,7 +66,9 @@ pub async fn normalize_errors(request: Request, next: Next) -> Response {
     if is_json {
         return response;
     }
-    envelope_for(status).with_request_id(request_id).into_response()
+    envelope_for(status)
+        .with_request_id(request_id)
+        .into_response()
 }
 
 fn envelope_for(status: StatusCode) -> ApiError {
@@ -94,7 +96,11 @@ pub async fn log_bodies(request: Request, next: Next) -> Response {
     let (parts, body) = request.into_parts();
     let bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
-        Err(err) => return read_error(&err.to_string()).with_request_id(request_id).into_response(),
+        Err(err) => {
+            return read_error(&err.to_string())
+                .with_request_id(request_id)
+                .into_response();
+        }
     };
     log_payload(&bytes, |event| {
         tracing::debug!(
@@ -107,7 +113,9 @@ pub async fn log_bodies(request: Request, next: Next) -> Response {
         );
     });
 
-    let response = next.run(Request::from_parts(parts, Body::from(bytes))).await;
+    let response = next
+        .run(Request::from_parts(parts, Body::from(bytes)))
+        .await;
 
     let status = response.status();
     let (parts, body) = response.into_parts();

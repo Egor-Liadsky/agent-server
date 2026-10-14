@@ -134,7 +134,11 @@ impl Limits {
     }
 }
 
-fn check_text_limits(step: Option<&str>, expected_action: Option<&str>, limits: &Limits) -> Result<(), TaskError> {
+fn check_text_limits(
+    step: Option<&str>,
+    expected_action: Option<&str>,
+    limits: &Limits,
+) -> Result<(), TaskError> {
     if let Some(step) = step {
         if step.chars().count() > limits.step_max_chars {
             return Err(TaskError::StepTooLong);
@@ -178,10 +182,27 @@ pub async fn apply_manual_transition(
     let limits = Limits::from_config(&state.config);
     check_text_limits(step, expected_action, &limits)?;
 
-    let updated =
-        store::write_task_transition(&state.db, &current.id, from.as_str(), to.as_str(), step, expected_action, "manual", "")
-            .await?;
-    log_transition(state, chat_id, from.as_str(), to.as_str(), "manual", step, expected_action, "");
+    let updated = store::write_task_transition(
+        &state.db,
+        &current.id,
+        from.as_str(),
+        to.as_str(),
+        step,
+        expected_action,
+        "manual",
+        "",
+    )
+    .await?;
+    log_transition(
+        state,
+        chat_id,
+        from.as_str(),
+        to.as_str(),
+        "manual",
+        step,
+        expected_action,
+        "",
+    );
     Ok(updated)
 }
 
@@ -190,7 +211,11 @@ pub async fn apply_manual_transition(
 /// done завершает задачу»). Завершение идёт отдельным путём через
 /// `store::finish_task`, но правило автомата остаётся здесь, а не в
 /// обработчике HTTP (design.md, решение 3).
-pub async fn check_can_finish(state: &AppState, owner: &str, chat_id: &str) -> Result<(), TaskError> {
+pub async fn check_can_finish(
+    state: &AppState,
+    owner: &str,
+    chat_id: &str,
+) -> Result<(), TaskError> {
     let current = store::load_task_state(&state.db, owner, chat_id).await?;
     if current.paused {
         return Err(TaskError::Paused);
@@ -332,12 +357,23 @@ pub fn build_resume_brief(
 /// (specs/task-state, «Пауза сохраняет состояние», «Пауза не обращается к
 /// модели»). Идемпотентно: повторная пауза перезаписывает бриф новым шагом
 /// (specs/task-state, «Повторная пауза обновляет бриф»).
-pub async fn pause(state: &AppState, owner: &str, chat_id: &str) -> Result<store::TaskState, TaskError> {
+pub async fn pause(
+    state: &AppState,
+    owner: &str,
+    chat_id: &str,
+) -> Result<store::TaskState, TaskError> {
     let current = store::load_task_state(&state.db, owner, chat_id).await?;
-    let working_memory = store::load_working_memory(&state.db, chat_id, &current.id).await.unwrap_or_default();
+    let working_memory = store::load_working_memory(&state.db, chat_id, &current.id)
+        .await
+        .unwrap_or_default();
     let max_chars = state.config.task_resume_brief_max_chars as usize;
-    let brief =
-        build_resume_brief(&current.stage, &current.step, &current.expected_action, &working_memory, max_chars);
+    let brief = build_resume_brief(
+        &current.stage,
+        &current.step,
+        &current.expected_action,
+        &working_memory,
+        max_chars,
+    );
     let updated = store::set_task_paused(&state.db, &current.id, true, Some(&brief)).await?;
     if state.config.log_content {
         tracing::info!(chat_id = %chat_id, stage = %current.stage, resume_brief = %brief, "задача поставлена на паузу");
@@ -349,7 +385,11 @@ pub async fn pause(state: &AppState, owner: &str, chat_id: &str) -> Result<store
 
 /// Снимает задачу с паузы, сохраняя прежний этап, шаг и ожидаемое действие
 /// (specs/task-state, «Снятие с паузы возвращает тот же этап»). Идемпотентно.
-pub async fn resume(state: &AppState, owner: &str, chat_id: &str) -> Result<store::TaskState, TaskError> {
+pub async fn resume(
+    state: &AppState,
+    owner: &str,
+    chat_id: &str,
+) -> Result<store::TaskState, TaskError> {
     let current = store::load_task_state(&state.db, owner, chat_id).await?;
     Ok(store::set_task_paused(&state.db, &current.id, false, None).await?)
 }
@@ -366,10 +406,21 @@ pub fn system_message_section(task: &store::TaskState) -> String {
     let mut lines = vec![
         TASK_SECTION_HEADING.to_string(),
         format!("Этап: {}", task.stage),
-        format!("Шаг: {}", if task.step.is_empty() { "(не задан)" } else { &task.step }),
+        format!(
+            "Шаг: {}",
+            if task.step.is_empty() {
+                "(не задан)"
+            } else {
+                &task.step
+            }
+        ),
         format!(
             "Ожидаемое действие: {}",
-            if task.expected_action.is_empty() { "(не задано)" } else { &task.expected_action }
+            if task.expected_action.is_empty() {
+                "(не задано)"
+            } else {
+                &task.expected_action
+            }
         ),
     ];
     if task.paused {
@@ -384,11 +435,15 @@ pub fn system_message_section(task: &store::TaskState) -> String {
 // --- Операторские умолчания и переопределения на чат (design.md, решение 8) ---
 
 pub fn effective_enabled(state: &AppState, settings: &ChatSettings) -> bool {
-    settings.task_state_enabled.unwrap_or(state.config.task_state_enabled)
+    settings
+        .task_state_enabled
+        .unwrap_or(state.config.task_state_enabled)
 }
 
 pub fn effective_auto_enabled(state: &AppState, settings: &ChatSettings) -> bool {
-    settings.task_state_auto_enabled.unwrap_or(state.config.task_state_auto_enabled)
+    settings
+        .task_state_auto_enabled
+        .unwrap_or(state.config.task_state_auto_enabled)
 }
 
 /// Подмешивает состояние задачи в уже собранный `ContextDto`, на момент
@@ -510,7 +565,11 @@ pub async fn track_after_exchange(
     tracker_settings.thinking = ThinkingMode::Disabled;
     tracker_settings.custom_response_mode = false;
 
-    let reply = match state.agent.ask(&[Message::user(prompt)], &tracker_settings).await {
+    let reply = match state
+        .agent
+        .ask(&[Message::user(prompt)], &tracker_settings)
+        .await
+    {
         Ok(reply) => reply,
         Err(err) => {
             tracing::warn!(chat_id = %chat.id, error = %err, "не удалось запросить предложение трекера состояния задачи: вызов модели не удался");
@@ -557,7 +616,13 @@ pub async fn track_after_exchange(
     // значениях, записанных при входе в этап, и системное сообщение начинает
     // работать против автомата (design.md, решение 2).
     if to == from {
-        if check_text_limits(proposal.step.as_deref(), proposal.expected_action.as_deref(), &limits).is_err() {
+        if check_text_limits(
+            proposal.step.as_deref(),
+            proposal.expected_action.as_deref(),
+            &limits,
+        )
+        .is_err()
+        {
             log_reject("text_too_long");
             outcome.rejected += 1;
             return outcome;
@@ -598,7 +663,13 @@ pub async fn track_after_exchange(
         outcome.rejected += 1;
         return outcome;
     }
-    if check_text_limits(proposal.step.as_deref(), proposal.expected_action.as_deref(), &limits).is_err() {
+    if check_text_limits(
+        proposal.step.as_deref(),
+        proposal.expected_action.as_deref(),
+        &limits,
+    )
+    .is_err()
+    {
         log_reject("text_too_long");
         outcome.rejected += 1;
         return outcome;
@@ -646,9 +717,18 @@ mod tests {
 
     #[test]
     fn all_designed_edges_are_allowed() {
-        assert!(can_transition(TaskStage::Planning, TaskStage::Clarification));
-        assert!(can_transition(TaskStage::Clarification, TaskStage::Execution));
-        assert!(can_transition(TaskStage::Clarification, TaskStage::Planning));
+        assert!(can_transition(
+            TaskStage::Planning,
+            TaskStage::Clarification
+        ));
+        assert!(can_transition(
+            TaskStage::Clarification,
+            TaskStage::Execution
+        ));
+        assert!(can_transition(
+            TaskStage::Clarification,
+            TaskStage::Planning
+        ));
         assert!(can_transition(TaskStage::Execution, TaskStage::Validation));
         assert!(can_transition(TaskStage::Validation, TaskStage::Done));
         assert!(can_transition(TaskStage::Validation, TaskStage::Execution));
@@ -686,13 +766,22 @@ mod tests {
 
     #[test]
     fn step_over_limit_is_rejected() {
-        let limits = Limits { step_max_chars: 5, expected_action_max_chars: 100 };
-        assert_eq!(check_text_limits(Some(&"a".repeat(6)), None, &limits), Err(TaskError::StepTooLong));
+        let limits = Limits {
+            step_max_chars: 5,
+            expected_action_max_chars: 100,
+        };
+        assert_eq!(
+            check_text_limits(Some(&"a".repeat(6)), None, &limits),
+            Err(TaskError::StepTooLong)
+        );
     }
 
     #[test]
     fn expected_action_over_limit_is_rejected() {
-        let limits = Limits { step_max_chars: 100, expected_action_max_chars: 5 };
+        let limits = Limits {
+            step_max_chars: 100,
+            expected_action_max_chars: 5,
+        };
         assert_eq!(
             check_text_limits(None, Some(&"a".repeat(6)), &limits),
             Err(TaskError::ExpectedActionTooLong)
@@ -701,7 +790,10 @@ mod tests {
 
     #[test]
     fn text_within_limit_is_accepted() {
-        let limits = Limits { step_max_chars: 5, expected_action_max_chars: 5 };
+        let limits = Limits {
+            step_max_chars: 5,
+            expected_action_max_chars: 5,
+        };
         assert!(check_text_limits(Some("ok"), Some("ok"), &limits).is_ok());
     }
 
@@ -822,15 +914,24 @@ mod tests {
     #[tokio::test]
     async fn chat_setting_overrides_operator_default_task_state_enabled() {
         let state = AppState::for_tests().await;
-        assert_eq!(effective_enabled(&state, &ChatSettings::default()), state.config.task_state_enabled);
-        let settings = ChatSettings { task_state_enabled: Some(true), ..ChatSettings::default() };
+        assert_eq!(
+            effective_enabled(&state, &ChatSettings::default()),
+            state.config.task_state_enabled
+        );
+        let settings = ChatSettings {
+            task_state_enabled: Some(true),
+            ..ChatSettings::default()
+        };
         assert!(effective_enabled(&state, &settings));
     }
 
     #[tokio::test]
     async fn chat_setting_overrides_operator_default_task_state_auto_enabled() {
         let state = AppState::for_tests().await;
-        let settings = ChatSettings { task_state_auto_enabled: Some(false), ..ChatSettings::default() };
+        let settings = ChatSettings {
+            task_state_auto_enabled: Some(false),
+            ..ChatSettings::default()
+        };
         assert!(!effective_auto_enabled(&state, &settings));
     }
 
@@ -838,7 +939,10 @@ mod tests {
 
     fn captured(f: impl FnOnce()) -> String {
         let capture = crate::telemetry::capture::Capture::default();
-        let subscriber = tracing_subscriber::fmt().json().with_writer(capture.clone()).finish();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(capture.clone())
+            .finish();
         tracing::subscriber::with_default(subscriber, f);
         capture.text()
     }
@@ -849,15 +953,35 @@ mod tests {
         let mut state = runtime.block_on(AppState::for_tests());
         std::sync::Arc::make_mut(&mut state.config).log_content = false;
         let chat = runtime
-            .block_on(store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default()))
+            .block_on(store::create_chat(
+                &state.db,
+                "owner-1",
+                "Чат",
+                &ChatSettings::default(),
+            ))
             .expect("чат");
-        runtime.block_on(store::load_task_state(&state.db, "owner-1", &chat.id)).expect("состояние задачи");
+        runtime
+            .block_on(store::load_task_state(&state.db, "owner-1", &chat.id))
+            .expect("состояние задачи");
 
         let output = captured(|| {
-            let _ = runtime.block_on(apply_manual_transition(&state, "owner-1", &chat.id, "clarification", Some("секретный шаг"), None));
+            let _ = runtime.block_on(apply_manual_transition(
+                &state,
+                "owner-1",
+                &chat.id,
+                "clarification",
+                Some("секретный шаг"),
+                None,
+            ));
         });
-        assert!(output.contains("\"to_stage\":\"clarification\""), "этап должен остаться в журнале: {output}");
-        assert!(!output.contains("секретный шаг"), "текст шага не должен попасть в журнал: {output}");
+        assert!(
+            output.contains("\"to_stage\":\"clarification\""),
+            "этап должен остаться в журнале: {output}"
+        );
+        assert!(
+            !output.contains("секретный шаг"),
+            "текст шага не должен попасть в журнал: {output}"
+        );
     }
 
     #[test]
@@ -866,13 +990,30 @@ mod tests {
         let mut state = runtime.block_on(AppState::for_tests());
         std::sync::Arc::make_mut(&mut state.config).log_content = true;
         let chat = runtime
-            .block_on(store::create_chat(&state.db, "owner-1", "Чат", &ChatSettings::default()))
+            .block_on(store::create_chat(
+                &state.db,
+                "owner-1",
+                "Чат",
+                &ChatSettings::default(),
+            ))
             .expect("чат");
-        runtime.block_on(store::load_task_state(&state.db, "owner-1", &chat.id)).expect("состояние задачи");
+        runtime
+            .block_on(store::load_task_state(&state.db, "owner-1", &chat.id))
+            .expect("состояние задачи");
 
         let output = captured(|| {
-            let _ = runtime.block_on(apply_manual_transition(&state, "owner-1", &chat.id, "clarification", Some("видимый шаг"), None));
+            let _ = runtime.block_on(apply_manual_transition(
+                &state,
+                "owner-1",
+                &chat.id,
+                "clarification",
+                Some("видимый шаг"),
+                None,
+            ));
         });
-        assert!(output.contains("видимый шаг"), "текст шага должен попасть в журнал при AGENTD_LOG_CONTENT=true: {output}");
+        assert!(
+            output.contains("видимый шаг"),
+            "текст шага должен попасть в журнал при AGENTD_LOG_CONTENT=true: {output}"
+        );
     }
 }

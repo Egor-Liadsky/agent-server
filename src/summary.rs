@@ -52,7 +52,11 @@ const TOOL_RESULT_SUMMARY_CHARS: usize = 2_000;
 
 /// Сообщения перед границей хвоста, ещё не вошедшие в сохранённый пересказ
 /// (`seq` больше `through_seq`).
-pub fn pending_messages(messages: &[ChatMessage], boundary: usize, through_seq: i64) -> Vec<&ChatMessage> {
+pub fn pending_messages(
+    messages: &[ChatMessage],
+    boundary: usize,
+    through_seq: i64,
+) -> Vec<&ChatMessage> {
     messages[..boundary]
         .iter()
         .filter(|message| message.seq > through_seq)
@@ -150,6 +154,7 @@ mod tests {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_name: None,
+            context_generation: 0,
         }
     }
 
@@ -222,12 +227,20 @@ mod tests {
         let messages = exchange(&[(1, "в1", "о1"), (3, "в2", "о2"), (5, "в3", "о3")]);
         let boundary = tail_boundary(&messages, 2);
         let pending = pending_messages(&messages, boundary, 0);
-        assert!((pending.len() as u32) < 5, "порог 5 не должен быть достигнут четырьмя сообщениями");
+        assert!(
+            (pending.len() as u32) < 5,
+            "порог 5 не должен быть достигнут четырьмя сообщениями"
+        );
     }
 
     #[test]
     fn pending_at_or_above_step_triggers_rebuild() {
-        let messages = exchange(&[(1, "в1", "о1"), (3, "в2", "о2"), (5, "в3", "о3"), (7, "в4", "о4")]);
+        let messages = exchange(&[
+            (1, "в1", "о1"),
+            (3, "в2", "о2"),
+            (5, "в3", "о3"),
+            (7, "в4", "о4"),
+        ]);
         let boundary = tail_boundary(&messages, 2);
         let pending = pending_messages(&messages, boundary, 0);
         assert!(pending.len() as u32 >= 5);
@@ -239,7 +252,10 @@ mod tests {
         let boundary = tail_boundary(&messages, 0);
         // through_seq = 4: сообщения с seq 1..4 уже пересказаны, остаются 5 и 6.
         let pending = pending_messages(&messages, boundary, 4);
-        assert_eq!(pending.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![5, 6]);
+        assert_eq!(
+            pending.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
     }
 
     // --- 9.4 Усечение пересказа ---

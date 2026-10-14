@@ -34,7 +34,10 @@ mod tests {
             "базовый текст",
             &["раздел один".to_string(), "раздел два".to_string()],
         );
-        assert_eq!(message.content, "базовый текст\n\nраздел один\n\nраздел два");
+        assert_eq!(
+            message.content,
+            "базовый текст\n\nраздел один\n\nраздел два"
+        );
     }
 
     #[test]

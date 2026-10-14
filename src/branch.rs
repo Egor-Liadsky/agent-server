@@ -21,9 +21,20 @@ fn message_from_stored(stored: ChatMessage) -> Message {
 /// цепочке родителей, а не из полной выгрузки чата, которую даёт общий путь
 /// `load_messages` для остальных стратегий (design.md, решение 4 — ветки
 /// влияют на сборку истории только при стратегии `branching`).
-pub async fn assemble(state: &AppState, chat: &store::Chat, _stored: Vec<ChatMessage>, new_messages: Vec<Message>) -> BranchOutcome {
+pub async fn assemble(
+    state: &AppState,
+    chat: &store::Chat,
+    _stored: Vec<ChatMessage>,
+    new_messages: Vec<Message>,
+) -> BranchOutcome {
     let branch_id = chat.active_branch.clone();
-    let history = match store::load_branch_history(&state.db, &chat.id, &branch_id, state.config.max_branch_depth).await
+    let mut history = match store::load_branch_history(
+        &state.db,
+        &chat.id,
+        &branch_id,
+        state.config.max_branch_depth,
+    )
+    .await
     {
         Ok(messages) => messages,
         Err(err) => {
@@ -31,6 +42,7 @@ pub async fn assemble(state: &AppState, chat: &store::Chat, _stored: Vec<ChatMes
             Vec::new()
         }
     };
+    history.retain(|message| message.context_generation == chat.context_generation);
     let sent_messages = history.len() as u32;
     let mut history: Vec<Message> = history.into_iter().map(message_from_stored).collect();
     history.extend(new_messages);

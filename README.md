@@ -38,6 +38,7 @@ git-зависимостью. Оттуда же подключается `agentu
 | `AGENTD_MODEL`               | `deepseek-v4-flash`           | Модель по умолчанию |
 | `AGENTD_ALLOWED_MODELS`      | пусто                     | Список моделей через запятую. Пусто — разрешена только `AGENTD_MODEL` |
 | `AGENTD_OLLAMA_URL`          | —                         | Адрес локального Ollama. Не задан — `provider: "ollama"` в запросе отклоняется |
+| `AGENTD_OLLAMA_ONLY`         | `false`                   | При `true` сервис отклоняет запросы `provider: "cloud"` до вызова облачного провайдера |
 | `AGENTD_CLIENT_TOKENS`       | пусто                     | Клиентские токены через запятую. Пусто — аутентификация выключена |
 | `AGENTD_REQUEST_TIMEOUT_SECS`| `300`                     | Таймаут запроса к провайдеру |
 | `AGENTD_MAX_BODY_BYTES`      | `262144`                  | Предельный размер тела запроса |
@@ -218,6 +219,99 @@ curl -sS -X POST http://127.0.0.1:8080/v1/chat \
 При включённой аутентификации к запросу добавляется заголовок
 `Authorization: Bearer <токен>`.
 
+### Постоянный локальный сервис macOS для частной сети
+
+Сервис слушает только частный адрес сетевого интерфейса, а не `0.0.0.0`.
+Закрепите этот адрес в DHCP роутера и не настраивайте проброс порта из
+интернета. На macOS Ollama уже работает как LaunchAgent приложения; второй
+`ollama serve` запускать не нужно.
+
+Пример первичной настройки из каталога `agent-sever` (замените `en0`, если
+LAN использует другой интерфейс):
+
+```bash
+cargo build --release
+DATA="$HOME/Library/Application Support/agentd"
+mkdir -p "$DATA" "$HOME/Library/LaunchAgents"
+chmod 700 "$DATA"
+umask 077
+openssl rand -hex 32 > "$DATA/client-token"
+LAN_IP="$(ipconfig getifaddr en0)"
+cat > "$DATA/agentd.env" <<EOF
+AGENTD_UPSTREAM_API_KEY=local-only-disabled
+AGENTD_UPSTREAM_BASE_URL=http://127.0.0.1:1
+AGENTD_OLLAMA_ONLY=true
+AGENTD_OLLAMA_URL=http://127.0.0.1:11434
+AGENTD_MODEL=qwen2.5:1.5b
+AGENTD_ALLOWED_MODELS=qwen2.5:1.5b
+AGENTD_LISTEN_ADDR=$LAN_IP:8080
+AGENTD_CLIENT_TOKENS_FILE=$DATA/client-token
+AGENTD_MAX_CONCURRENCY=2
+AGENTD_MAX_CONTEXT_TOKENS=4096
+AGENTD_LOG_CONTENT=false
+AGENTD_DEBUG=false
+AGENTD_DB_PATH=$DATA/agentd.db
+EOF
+chmod 600 "$DATA/agentd.env" "$DATA/client-token"
+cat > "$DATA/run-agentd.sh" <<'EOF'
+#!/bin/sh
+set -a
+. "$HOME/Library/Application Support/agentd/agentd.env"
+set +a
+export AGENTD_CLIENT_TOKENS="$(cat "$AGENTD_CLIENT_TOKENS_FILE")"
+cd "$HOME/Library/Application Support/agentd"
+exec "$HOME/projects/ai/agent-sever/target/release/agentd"
+EOF
+chmod 700 "$DATA/run-agentd.sh"
+```
+
+Создайте `$HOME/Library/LaunchAgents/local.agentd.plist` с `ProgramArguments`
+`["/bin/sh", "$HOME/Library/Application Support/agentd/run-agentd.sh"]`,
+`WorkingDirectory` равным `$HOME/Library/Application Support/agentd`, а также
+`RunAtLoad` и `KeepAlive` равными `true`, затем загрузите его. Рабочий каталог
+данных не позволяет случайно подхватить dev-файл `.env` из репозитория:
+
+```bash
+cat > "$HOME/Library/LaunchAgents/local.agentd.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>local.agentd</string>
+<key>ProgramArguments</key><array><string>/bin/sh</string><string>$HOME/Library/Application Support/agentd/run-agentd.sh</string></array>
+<key>WorkingDirectory</key><string>$HOME/Library/Application Support/agentd</string>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><true/>
+<key>StandardOutPath</key><string>$HOME/Library/Application Support/agentd/agentd.log</string>
+<key>StandardErrorPath</key><string>$HOME/Library/Application Support/agentd/agentd.log</string>
+</dict></plist>
+EOF
+chmod 600 "$HOME/Library/LaunchAgents/local.agentd.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.agentd.plist"
+launchctl kickstart -k "gui/$(id -u)/local.agentd"
+```
+
+Файлы конфигурации и токен находятся вне репозитория с правами `600`, каталог
+— `700`. Передавайте клиентский токен устройствам частным способом; не
+вставляйте его в команды, историю shell или журнал. Для проверки с хоста:
+
+```bash
+LAN_IP="$(ipconfig getifaddr en0)"
+umask 077
+AUTH_CONFIG="$(mktemp)"
+printf 'header = "Authorization: Bearer %s"\n' \
+  "$(cat "$HOME/Library/Application Support/agentd/client-token")" > "$AUTH_CONFIG"
+curl -i "http://$LAN_IP:8080/healthz"
+curl --config "$AUTH_CONFIG" -i "http://$LAN_IP:8080/v1/chat" \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"Привет","settings":{"provider":"ollama","model":"qwen2.5:1.5b","ollama_num_ctx":4096}}'
+rm -f "$AUTH_CONFIG"
+```
+
+Это проверяет доступ только с самой машины. Доступ с другого устройства
+проверяется отдельным запросом из той же LAN. Разрешите входящие подключения
+к `agentd` в системном firewall только для частной сети; не отключайте firewall.
+При смене DHCP-адреса обновите `AGENTD_LISTEN_ADDR` и перезапустите LaunchAgent.
+
 ## Эндпоинты
 
 | Метод и путь            | Назначение |
@@ -228,7 +322,9 @@ curl -sS -X POST http://127.0.0.1:8080/v1/chat \
 | `GET /v1/chats/{id}`     | Чат вместе со страницей его сообщений (`limit`, `after`) |
 | `PATCH /v1/chats/{id}`   | Переименование чата и/или постоянное изменение его настроек |
 | `DELETE /v1/chats/{id}`  | Удаление чата вместе с сообщениями |
+| `POST /v1/chats/{id}/clear` | Очистка содержимого чата с сохранением его настроек и идентификатора |
 | `POST /v1/chats/{id}/messages` | Дозапись готовых сообщений в чат без обращения к провайдеру |
+| `POST /v1/chats/{id}/clear-context` | Сброс контекста с сохранением архива сообщений |
 | `GET /v1/chats/{id}/facts` | Факты чата (стратегия `facts`) |
 | `PUT /v1/chats/{id}/facts/{key}` | Задать значение факта (создаёт ключ или заменяет значение) |
 | `DELETE /v1/chats/{id}/facts/{key}` | Удалить факт. Отсутствующий ключ — `404 fact_not_found` |
@@ -243,6 +339,28 @@ curl -sS -X POST http://127.0.0.1:8080/v1/chat \
 | `GET /v1/models`         | Модели, разрешённые конфигурацией |
 | `GET /healthz`           | Живость процесса, к провайдеру и базе не обращается |
 | `GET /readyz`            | Готовность: 200 при валидной конфигурации и рабочей базе, 503 иначе |
+
+`POST /v1/chats/{id}/clear-context` принимает пустое тело и атомарно увеличивает
+`context_generation`, очищая пересказ и факты. Ответ: `{"context_generation": 1}`.
+Сообщения не удаляются и остаются доступны для просмотра; при сборке контекста
+до применения любой стратегии используются только сообщения текущего поколения.
+Старые ветки не возвращают контекст до сброса. Запрос, начатый до сброса, не
+может дописать сообщения после него и получает `409 context_reset`. Чужой или
+отсутствующий чат отвечает обычным `404` конвертом. Профиль, системные
+инструкции, рабочая и долговременная память и состояние задачи сохраняются и
+могут влиять на следующие ответы.
+
+`POST /v1/chats/{id}/clear` принимает пустое тело и полностью очищает чат:
+удаляет сообщения, ветки, пересказ, факты и состояние задачи, а название
+сбрасывает на «Новый чат». Идентификатор и настройки чата сохраняются,
+`context_generation` увеличивается, поэтому запоздалые записи старых ходов
+отклоняются с `409 context_reset`. Профиль и долговременная память владельца
+остаются общими для его чатов.
+
+Для дозаписи локального обмена `POST /v1/chats/{id}/messages` требует поле
+`context_generation` вместе с `messages`. Устаревшее поколение отклоняется с
+`409 context_reset`; отсутствие поля — `400 invalid_request`. Старые клиенты
+должны обновиться, чтобы продолжать сохранять локальные обмены.
 
 Чат принадлежит клиенту, который его создал (владение определяется
 отпечатком `AGENTD_CLIENT_TOKENS`, см. предупреждение выше). Обращение к
@@ -836,6 +954,13 @@ profile_invalid` до обращения к провайдеру, без мол�
 сообщит об этом явно.
 
 ### Чаты с локальным провайдером
+
+Для развёртывания только с Ollama задайте `AGENTD_OLLAMA_ONLY=true`. Тогда
+запросы с `provider: "cloud"` отклоняются до вызова провайдера. Пока ключ
+`AGENTD_UPSTREAM_API_KEY` обязателен при старте, укажите фиктивное значение,
+а `AGENTD_UPSTREAM_BASE_URL` направьте на закрытый локальный порт, например
+`http://127.0.0.1:1`: это сохраняет запуск совместимым и исключает сетевой
+маршрут к облаку даже при ошибке в проверке.
 
 Чат с настройками `provider: "ollama"` сервис хранит, но не обслуживает:
 ответ в нём даёт Ollama на машине пользователя, а обмен попадает в базу
